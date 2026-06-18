@@ -4,6 +4,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rasteron::Renderer;
 use rasteron::color::{Color, PixelFormat};
 use rasteron::framebuffer::FramebufferInfo;
+use rasteron::pixel::Pixel;
 
 const BENCH_FORMATS: [PixelFormat; 2] = [PixelFormat::Bgr24, PixelFormat::Xrgb8888];
 
@@ -145,6 +146,37 @@ fn bench_clear(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_draw_line(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("draw_line");
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut y = 0usize;
+                b.iter(|| {
+                    let start = Pixel::new(0, y);
+                    let end = Pixel::new(width - 1, y + 16);
+                    unsafe {
+                        renderer.draw_line_unchecked(
+                            black_box(start),
+                            black_box(end),
+                            black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                        );
+                    }
+                    y = (y + 1) % (height - 16);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = criterion_config();
@@ -152,6 +184,7 @@ criterion_group!(
     bench_set_pixel_opaque,
     bench_set_pixel_alpha,
     bench_frame_gradient,
-    bench_clear
+    bench_clear,
+    bench_draw_line
 );
 criterion_main!(benches);

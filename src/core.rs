@@ -1,5 +1,7 @@
 use crate::color::Color;
 use crate::framebuffer::FramebufferInfo;
+use crate::pixel::Pixel;
+use crate::utils::clip_line;
 extern crate alloc;
 use alloc::vec::Vec;
 
@@ -85,6 +87,16 @@ impl<'a> Renderer<'a> {
         unsafe { self.set_pixel_unchecked(x, y, color) };
     }
 
+    #[inline(always)]
+    pub unsafe fn set_pixel_at_unchecked(&mut self, pixel: Pixel, color: Color) {
+        unsafe { self.set_pixel_unchecked(pixel.x, pixel.y, color) };
+    }
+
+    #[inline(always)]
+    pub fn set_pixel_at(&mut self, pixel: Pixel, color: Color) {
+        self.set_pixel(pixel.x, pixel.y, color);
+    }
+
     pub unsafe fn get_pixel_unchecked(&self, x: usize, y: usize) -> Color {
         let offset = self.pixel_offset(x, y);
         let format = self.info.format;
@@ -98,6 +110,16 @@ impl<'a> Renderer<'a> {
             return None;
         }
         Some(unsafe { self.get_pixel_unchecked(x, y) })
+    }
+
+    #[inline(always)]
+    pub unsafe fn get_pixel_at_unchecked(&self, pixel: Pixel) -> Color {
+        unsafe { self.get_pixel_unchecked(pixel.x, pixel.y) }
+    }
+
+    #[inline(always)]
+    pub fn get_pixel_at(&self, pixel: Pixel) -> Option<Color> {
+        self.get_pixel(pixel.x, pixel.y)
     }
 
     pub fn clear(&mut self, color: Color) {
@@ -144,6 +166,55 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Draw a line
+    pub fn draw_line(&mut self, p1: Pixel, p2: Pixel, color: Color) {
+        let cliped = clip_line(p1, p2, self.info.width, self.info.height);
+        if let Some((p1, p2)) = cliped {
+            unsafe {
+                self.draw_line_unchecked(p1, p2, color);
+            }
+        }
+        return;
+    }
+
+    /// Draw a line without per-pixel bounds checks.
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证整条线上的所有像素都落在当前 framebuffer 可见区域内。
+    pub unsafe fn draw_line_unchecked(&mut self, p1: Pixel, p2: Pixel, color: Color) {
+        let dx_abs = (p2.x as i64 - p1.x as i64).unsigned_abs();
+        let dy_abs = (p2.y as i64 - p1.y as i64).unsigned_abs();
+        let steep = dy_abs > dx_abs;
+        let (mut x1, mut y1) = p1.to_coord();
+        let (mut x2, mut y2) = p2.to_coord();
+        if steep {
+            core::mem::swap(&mut x1, &mut y1);
+            core::mem::swap(&mut x2, &mut y2);
+        }
+        if x1 > x2 {
+            core::mem::swap(&mut x1, &mut x2);
+            core::mem::swap(&mut y1, &mut y2);
+        }
+        let dx = x2 - x1;
+        let dy = (y2 as i64 - y1 as i64).unsigned_abs();
+        let mut error = (dx / 2) as i64;
+        let y_step = if y1 < y2 { 1 } else { -1 };
+        let mut y = y1 as i64;
+        for x in x1..=x2 {
+            if steep {
+                self.set_pixel(y as usize, x, color);
+            } else {
+                self.set_pixel(x, y as usize, color);
+            }
+            error -= dy as i64;
+            if error < 0 {
+                y += y_step;
+                error += dx as i64;
+            }
+        }
+    }
+
     /// 如果启用双缓冲，将后台缓冲区交换到前台（即刷新到显存）
     #[cfg(feature = "double_buffer")]
     pub fn swap_buffers(&mut self) {
@@ -167,6 +238,7 @@ mod tests {
     use super::Renderer;
     use crate::color::{Color, PixelFormat};
     use crate::framebuffer::FramebufferInfo;
+    use crate::pixel::Pixel;
 
     #[test]
     fn set_pixel_uses_bgr24_format() {
@@ -253,5 +325,74 @@ mod tests {
             renderer.buffer_mut(),
             &[0x56, 0x34, 0x12, 0x56, 0x34, 0x12, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn pixel_api_wraps_coordinate_api() {
+        let info = FramebufferInfo::new(2, 1, 6, 24, PixelFormat::Bgr24);
+        let mut front = [0u8; 6];
+        let mut renderer = Renderer::new(info, &mut front);
+        let pixel = Pixel::new(1, 0);
+
+        renderer.set_pixel_at(pixel, Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
+
+        assert_eq!(
+            renderer.get_pixel_at(pixel),
+            Some(Color::new(0x12, 0x34, 0x56))
+        );
+    }
+
+    #[test]
+    fn draw_line_renders_diagonal() {
+        let info = FramebufferInfo::new(3, 3, 9, 24, PixelFormat::Bgr24);
+        let mut front = [0u8; 27];
+        let mut renderer = Renderer::new(info, &mut front);
+
+        renderer.draw_line(
+            Pixel::new(0, 0),
+            Pixel::new(2, 2),
+            Color::new(0x12, 0x34, 0x56),
+        );
+
+        assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0x12, 0x34, 0x56)));
+        assert_eq!(renderer.get_pixel(1, 1), Some(Color::new(0x12, 0x34, 0x56)));
+        assert_eq!(renderer.get_pixel(2, 2), Some(Color::new(0x12, 0x34, 0x56)));
+    }
+
+    #[test]
+    fn draw_line_unchecked_matches_safe_path() {
+        let mut front_safe = [0u8; 48];
+        let mut front_unchecked = [0u8; 48];
+        let mut safe = Renderer::new(
+            FramebufferInfo::new(4, 4, 12, 24, PixelFormat::Bgr24),
+            &mut front_safe,
+        );
+        let mut unchecked = Renderer::new(
+            FramebufferInfo::new(4, 4, 12, 24, PixelFormat::Bgr24),
+            &mut front_unchecked,
+        );
+        let start = Pixel::new(0, 1);
+        let end = Pixel::new(3, 2);
+        let color = Color::new(0x12, 0x34, 0x56);
+
+        safe.draw_line(start, end, color);
+        unsafe { unchecked.draw_line_unchecked(start, end, color) };
+
+        assert_eq!(safe.buffer_mut(), unchecked.buffer_mut());
+    }
+
+    #[test]
+    fn draw_line_clips_right_edge() {
+        let info = FramebufferInfo::new(4, 2, 12, 24, PixelFormat::Bgr24);
+        let mut front = [0u8; 24];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(0x12, 0x34, 0x56);
+
+        renderer.draw_line(Pixel::new(2, 0), Pixel::new(6, 0), color);
+
+        assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0, 0, 0)));
+        assert_eq!(renderer.get_pixel(1, 0), Some(Color::new(0, 0, 0)));
+        assert_eq!(renderer.get_pixel(2, 0), Some(color));
+        assert_eq!(renderer.get_pixel(3, 0), Some(color));
     }
 }
