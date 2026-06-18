@@ -32,14 +32,4 @@ impl FramebufferInfo {
     pub fn buffer_size(&self) -> usize {
         self.pitch * self.height
     }
-
-    #[inline(always)]
-    pub fn pixel_size(&self) -> u16 {
-        self.bpp / 8
-    }
-
-    #[inline(always)]
-    pub fn pixel_offset(&self, x: usize, y: usize) -> usize {
-        y * self.pitch + x * self.pixel_size() as usize
-    }
 }

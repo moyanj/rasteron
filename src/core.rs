@@ -40,16 +40,25 @@ impl<'a> Renderer<'a> {
         return &self.front_buffer;
     }
 
-    /// 绘制一个像素
-    pub unsafe fn set_pixel_raw_unchecked(&mut self, x: usize, y: usize, color: Color) {
-        let offset = self.info.pixel_offset(x, y);
+    #[inline(always)]
+    pub fn pixel_size(&self) -> u16 {
+        self.info.bpp / 8
+    }
 
+    #[inline(always)]
+    pub fn pixel_offset(&self, x: usize, y: usize) -> usize {
+        y * self.info.pitch + x * self.pixel_size() as usize
+    }
+
+    /// 绘制一个像素
+    pub unsafe fn set_pixel_unchecked(&mut self, x: usize, y: usize, color: Color) {
         if color.a == 0 {
             // 完全透明，跳过绘制
             return;
         }
         let format = self.info.format;
         let pixel_size = format.bytes_per_pixel();
+        let offset = self.pixel_offset(x, y);
 
         let bytes = if color.a == 255 {
             color.to_bytes(format)
@@ -73,11 +82,11 @@ impl<'a> Renderer<'a> {
         if x >= self.info.width || y >= self.info.height {
             return;
         }
-        unsafe { self.set_pixel_raw_unchecked(x, y, color) };
+        unsafe { self.set_pixel_unchecked(x, y, color) };
     }
 
-    pub unsafe fn get_pixel_raw_unchecked(&self, x: usize, y: usize) -> Color {
-        let offset = self.info.pixel_offset(x, y);
+    pub unsafe fn get_pixel_unchecked(&self, x: usize, y: usize) -> Color {
+        let offset = self.pixel_offset(x, y);
         let format = self.info.format;
         let target = self.current_buffer();
         let src = &target[offset..offset + format.bytes_per_pixel()];
@@ -88,7 +97,51 @@ impl<'a> Renderer<'a> {
         if x >= self.info.width || y >= self.info.height {
             return None;
         }
-        Some(unsafe { self.get_pixel_raw_unchecked(x, y) })
+        Some(unsafe { self.get_pixel_unchecked(x, y) })
+    }
+
+    pub fn clear(&mut self, color: Color) {
+        let format = self.info.format;
+        let pixel_size = format.bytes_per_pixel();
+        let width = self.info.width;
+        let height = self.info.height;
+        let row_len = width * pixel_size;
+
+        if row_len == 0 || height == 0 {
+            return;
+        }
+
+        let bytes = color.to_bytes(format);
+        unsafe { self.clear_unchecked(&bytes[..pixel_size], row_len, height) };
+    }
+
+    /// 用重复像素模式填充当前缓冲区的可见区域。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证 `pattern.len()` 与当前像素大小一致，且 `row_len > 0`。
+    unsafe fn clear_unchecked(&mut self, pattern: &[u8], row_len: usize, height: usize) {
+        let pitch = self.info.pitch;
+        let pixel_size = pattern.len();
+        let buffer = self.current_buffer_mut();
+        let base_ptr = buffer.as_mut_ptr();
+
+        for y in 0..height {
+            let row_ptr = unsafe { base_ptr.add(y * pitch) };
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(pattern.as_ptr(), row_ptr, pixel_size);
+            }
+
+            let mut filled = pixel_size;
+            while filled < row_len {
+                let copy_len = core::cmp::min(filled, row_len - filled);
+                unsafe {
+                    core::ptr::copy(row_ptr, row_ptr.add(filled), copy_len);
+                }
+                filled += copy_len;
+            }
+        }
     }
 
     /// 如果启用双缓冲，将后台缓冲区交换到前台（即刷新到显存）
@@ -170,5 +223,35 @@ mod tests {
         renderer.set_pixel(0, 0, Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
 
         assert_eq!(&renderer.buffer_mut()[..4], &[0x56, 0x34, 0x12, 0x00]);
+    }
+
+    #[test]
+    fn clear_fills_bgr24_rows() {
+        let info = FramebufferInfo::new(2, 2, 6, 24, PixelFormat::Bgr24);
+        let mut front = [0u8; 12];
+        let mut renderer = Renderer::new(info, &mut front);
+
+        renderer.clear(Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
+
+        assert_eq!(
+            renderer.buffer_mut(),
+            &[
+                0x56, 0x34, 0x12, 0x56, 0x34, 0x12, 0x56, 0x34, 0x12, 0x56, 0x34, 0x12
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_respects_pitch_padding() {
+        let info = FramebufferInfo::new(2, 1, 8, 24, PixelFormat::Bgr24);
+        let mut front = [0u8; 8];
+        let mut renderer = Renderer::new(info, &mut front);
+
+        renderer.clear(Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
+
+        assert_eq!(
+            renderer.buffer_mut(),
+            &[0x56, 0x34, 0x12, 0x56, 0x34, 0x12, 0x00, 0x00]
+        );
     }
 }

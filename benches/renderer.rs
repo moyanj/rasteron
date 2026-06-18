@@ -1,8 +1,20 @@
 use core::hint::black_box;
+use core::time::Duration;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rasteron::Renderer;
 use rasteron::color::{Color, PixelFormat};
 use rasteron::framebuffer::FramebufferInfo;
+
+const BENCH_FORMATS: [PixelFormat; 2] = [PixelFormat::Bgr24, PixelFormat::Xrgb8888];
+
+fn criterion_config() -> Criterion {
+    Criterion::default()
+        .warm_up_time(Duration::from_secs(2))
+        .measurement_time(Duration::from_secs(8))
+        .sample_size(200)
+        .noise_threshold(0.02)
+        .significance_level(0.01)
+}
 
 fn make_renderer(
     width: usize,
@@ -23,11 +35,7 @@ fn make_renderer(
 fn bench_set_pixel_opaque(c: &mut Criterion) {
     let mut group = c.benchmark_group("set_pixel_opaque");
 
-    for format in [
-        PixelFormat::Bgr24,
-        PixelFormat::Xrgb8888,
-        PixelFormat::Rgba8888,
-    ] {
+    for format in BENCH_FORMATS {
         let (mut renderer, _front) = make_renderer(640, 480, format);
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{format:?}")),
@@ -57,11 +65,7 @@ fn bench_set_pixel_opaque(c: &mut Criterion) {
 fn bench_set_pixel_alpha(c: &mut Criterion) {
     let mut group = c.benchmark_group("set_pixel_alpha");
 
-    for format in [
-        PixelFormat::Bgr24,
-        PixelFormat::Xrgb8888,
-        PixelFormat::Rgba8888,
-    ] {
+    for format in BENCH_FORMATS {
         let (mut renderer, _front) = make_renderer(640, 480, format);
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{format:?}")),
@@ -95,11 +99,7 @@ fn bench_frame_gradient(c: &mut Criterion) {
     let mut group = c.benchmark_group("frame_gradient");
     group.throughput(Throughput::Elements(pixels));
 
-    for format in [
-        PixelFormat::Bgr24,
-        PixelFormat::Xrgb8888,
-        PixelFormat::Rgba8888,
-    ] {
+    for format in BENCH_FORMATS {
         let (mut renderer, _front) = make_renderer(width, height, format);
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{format:?}")),
@@ -124,10 +124,34 @@ fn bench_frame_gradient(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_clear(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let pixels = (width * height) as u64;
+    let mut group = c.benchmark_group("clear");
+    group.throughput(Throughput::Elements(pixels));
+
+    let (mut renderer, _front) = make_renderer(width, height, PixelFormat::Xrgb8888);
+    group.bench_with_input(
+        BenchmarkId::from_parameter("Xrgb8888"),
+        &PixelFormat::Xrgb8888,
+        |b, _| {
+            b.iter(|| {
+                renderer.clear(black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)));
+            });
+        },
+    );
+
+    group.finish();
+}
+
 criterion_group!(
-    benches,
+    name = benches;
+    config = criterion_config();
+    targets =
     bench_set_pixel_opaque,
     bench_set_pixel_alpha,
-    bench_frame_gradient
+    bench_frame_gradient,
+    bench_clear
 );
 criterion_main!(benches);
