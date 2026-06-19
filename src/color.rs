@@ -198,6 +198,47 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
+    #[inline(always)]
+    fn blend_channel(src: u8, dst: u8, alpha: u16, inv_alpha: u16) -> u8 {
+        ((src as u16 * alpha + dst as u16 * inv_alpha) / 255) as u8
+    }
+
+    #[inline(always)]
+    fn write_color_channels(
+        self,
+        dst: &mut [u8],
+        color: &Color,
+        alpha: u16,
+        inv_alpha: u16,
+        opaque: bool,
+    ) {
+        let bytes = color.to_bytes(self);
+        let bpp = self.bytes_per_pixel();
+        if opaque {
+            dst[..bpp].copy_from_slice(&bytes[..bpp]);
+            if bpp == 4 {
+                dst[3] = self.opaque_alpha_byte();
+            }
+            return;
+        }
+
+        for index in 0..3 {
+            dst[index] = Self::blend_channel(bytes[index], dst[index], alpha, inv_alpha);
+        }
+        if bpp == 4 {
+            dst[3] = self.opaque_alpha_byte();
+        }
+    }
+
+    #[inline(always)]
+    const fn opaque_alpha_byte(self) -> u8 {
+        match self {
+            PixelFormat::Xrgb8888 => 0,
+            PixelFormat::Rgb24 | PixelFormat::Bgr24 => 255,
+            PixelFormat::Argb8888 | PixelFormat::Rgba8888 | PixelFormat::Bgra8888 => 255,
+        }
+    }
+
     /// 红色通道在 32 位小端字中的位移。
     ///
     /// 例如 BGR 布局下 red 在高 16 位，位移为 16。
@@ -264,81 +305,7 @@ impl PixelFormat {
     pub fn write_color(self, dst: &mut [u8], color: &Color) {
         let alpha = color.a as u16;
         let inv_alpha = 255 - alpha;
-        match self {
-            PixelFormat::Rgb24 => {
-                if color.a == 255 {
-                    dst[0] = color.r;
-                    dst[1] = color.g;
-                    dst[2] = color.b;
-                } else {
-                    dst[0] = ((color.r as u16 * alpha + dst[0] as u16 * inv_alpha) / 255) as u8;
-                    dst[1] = ((color.g as u16 * alpha + dst[1] as u16 * inv_alpha) / 255) as u8;
-                    dst[2] = ((color.b as u16 * alpha + dst[2] as u16 * inv_alpha) / 255) as u8;
-                }
-            }
-            PixelFormat::Bgr24 => {
-                if color.a == 255 {
-                    dst[0] = color.b;
-                    dst[1] = color.g;
-                    dst[2] = color.r;
-                } else {
-                    dst[0] = ((color.b as u16 * alpha + dst[0] as u16 * inv_alpha) / 255) as u8;
-                    dst[1] = ((color.g as u16 * alpha + dst[1] as u16 * inv_alpha) / 255) as u8;
-                    dst[2] = ((color.r as u16 * alpha + dst[2] as u16 * inv_alpha) / 255) as u8;
-                }
-            }
-            PixelFormat::Xrgb8888 => {
-                if color.a == 255 {
-                    dst[0] = color.b;
-                    dst[1] = color.g;
-                    dst[2] = color.r;
-                    dst[3] = 0;
-                } else {
-                    dst[0] = ((color.b as u16 * alpha + dst[0] as u16 * inv_alpha) / 255) as u8;
-                    dst[1] = ((color.g as u16 * alpha + dst[1] as u16 * inv_alpha) / 255) as u8;
-                    dst[2] = ((color.r as u16 * alpha + dst[2] as u16 * inv_alpha) / 255) as u8;
-                }
-            }
-            PixelFormat::Argb8888 => {
-                if color.a == 255 {
-                    dst[0] = color.b;
-                    dst[1] = color.g;
-                    dst[2] = color.r;
-                    dst[3] = 255;
-                } else {
-                    dst[0] = ((color.b as u16 * alpha + dst[0] as u16 * inv_alpha) / 255) as u8;
-                    dst[1] = ((color.g as u16 * alpha + dst[1] as u16 * inv_alpha) / 255) as u8;
-                    dst[2] = ((color.r as u16 * alpha + dst[2] as u16 * inv_alpha) / 255) as u8;
-                    dst[3] = 255;
-                }
-            }
-            PixelFormat::Rgba8888 => {
-                if color.a == 255 {
-                    dst[0] = color.r;
-                    dst[1] = color.g;
-                    dst[2] = color.b;
-                    dst[3] = 255;
-                } else {
-                    dst[0] = ((color.r as u16 * alpha + dst[0] as u16 * inv_alpha) / 255) as u8;
-                    dst[1] = ((color.g as u16 * alpha + dst[1] as u16 * inv_alpha) / 255) as u8;
-                    dst[2] = ((color.b as u16 * alpha + dst[2] as u16 * inv_alpha) / 255) as u8;
-                    dst[3] = 255;
-                }
-            }
-            PixelFormat::Bgra8888 => {
-                if color.a == 255 {
-                    dst[0] = color.b;
-                    dst[1] = color.g;
-                    dst[2] = color.r;
-                    dst[3] = 255;
-                } else {
-                    dst[0] = ((color.b as u16 * alpha + dst[0] as u16 * inv_alpha) / 255) as u8;
-                    dst[1] = ((color.g as u16 * alpha + dst[1] as u16 * inv_alpha) / 255) as u8;
-                    dst[2] = ((color.r as u16 * alpha + dst[2] as u16 * inv_alpha) / 255) as u8;
-                    dst[3] = 255;
-                }
-            }
-        }
+        self.write_color_channels(dst, color, alpha, inv_alpha, color.a == 255);
     }
 
     /// 从源缓冲区读取一个像素并解码为颜色。

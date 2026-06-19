@@ -32,14 +32,8 @@ pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(P
         code
     }
 
-    let (mut x1, mut y1) = (
-        saturating_usize_to_i64(p1.x),
-        saturating_usize_to_i64(p1.y),
-    );
-    let (mut x2, mut y2) = (
-        saturating_usize_to_i64(p2.x),
-        saturating_usize_to_i64(p2.y),
-    );
+    let (mut x1, mut y1) = (saturating_usize_to_i64(p1.x), saturating_usize_to_i64(p1.y));
+    let (mut x2, mut y2) = (saturating_usize_to_i64(p2.x), saturating_usize_to_i64(p2.y));
     let mut code1 = compute_code(x1, y1, width, height);
     let mut code2 = compute_code(x2, y2, width, height);
 
@@ -99,4 +93,13 @@ pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(P
 #[inline(always)]
 pub(crate) fn saturating_usize_to_i64(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64
+}
+
+/// 将 `f32` 向下取整后转换为 `usize`。
+///
+/// 负值会被截断为 `0`。用于光栅化坐标转换。
+/// 对于非负值，截断（向零取整）等价于 floor。
+#[inline(always)]
+pub(crate) fn floor_to_usize(value: f32) -> usize {
+    if value < 0.0 { 0 } else { value as usize }
 }

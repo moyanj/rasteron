@@ -1,10 +1,15 @@
 //! programmable — 2D 可编程管线示例。
 //!
 //! 演示 rasteron 的顶点着色器、片元着色器、varying 插值、纹理采样
-//! 和 scissor 裁剪功能，输出 BMP 图片。
+//! 和 scissor / primitive clipping，输出 BMP 图片。
 //!
 //! 运行:
 //!   cargo run --example programmable --features programmable
+//!
+//! 坐标约定：
+//! - `ProgramVertex.position` / `Vertex2D.position` 使用 `[0, 1]` 的 normalized viewport 坐标
+//! - `[0, 0]` 是 viewport 左上角，`[1, 1]` 是 viewport 右下角
+//! - 超出范围的 line / triangle 会先做几何裁剪，再进入光栅化
 
 #![cfg(feature = "programmable")]
 
@@ -13,8 +18,8 @@ use rasteron::color::{BLACK, BLUE, Color, GREEN, RED, WHITE};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::pixel::Pixel;
 use rasteron::programmable::{
-    FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState, PrimitiveType,
-    ScissorRect, Texture2D, Vertex2D, VertexShader, Viewport,
+    FilterMode, FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState,
+    PrimitiveType, Sampler2D, ScissorRect, Texture2D, Vertex2D, VertexShader, Viewport, WrapMode,
 };
 
 #[path = "../shared/bmp.rs"]
@@ -98,6 +103,18 @@ impl FragmentShader for DiscardRightFs {
     }
 }
 
+// ───────── 辅助:固体色片元着色器 ─────────
+
+struct SolidFs;
+
+impl FragmentShader for SolidFs {
+    type Varying = Color;
+
+    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
+        FragmentOutput::Color(*varying)
+    }
+}
+
 fn main() {
     let width = 640;
     let height = 480;
@@ -170,7 +187,14 @@ fn main() {
         type Varying = [f32; 2];
 
         fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-            FragmentOutput::Color(self.tex.sample_nearest(*varying))
+            FragmentOutput::Color(self.tex.sample(
+                *varying,
+                Sampler2D {
+                    wrap_u: WrapMode::Clamp,
+                    wrap_v: WrapMode::Clamp,
+                    filter: FilterMode::Bilinear,
+                },
+            ))
         }
     }
 
@@ -326,16 +350,4 @@ fn main() {
     )
     .expect("failed to write BMP");
     println!("{output}");
-}
-
-// ───────── 辅助：固体色片元着色器 ─────────
-
-struct SolidFs;
-
-impl FragmentShader for SolidFs {
-    type Varying = Color;
-
-    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-        FragmentOutput::Color(*varying)
-    }
 }

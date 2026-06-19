@@ -1,11 +1,6 @@
 use crate::color::Color;
 use crate::framebuffer::{FramebufferInfo, PixelFormat};
 use crate::pixel::Pixel;
-#[cfg(feature = "programmable")]
-use crate::programmable::{
-    BlendMode, FragmentOutput, FragmentShader, Interpolate, Pipeline, PrimitiveType, ProgramVertex,
-    ScissorRect, VertexShader, Viewport,
-};
 use crate::utils::{clip_line, saturating_usize_to_i64};
 extern crate alloc;
 use alloc::vec::Vec;
@@ -56,387 +51,6 @@ fn integer_sqrt(n: usize) -> usize {
 }
 
 impl<'a> Renderer<'a> {
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn framebuffer_viewport(&self) -> Viewport {
-        Viewport::new(0, 0, self.info.width, self.info.height)
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn ndc_to_screen(position: [f32; 2], viewport: Viewport) -> [f32; 2] {
-        let vx = viewport.x as f32;
-        let vy = viewport.y as f32;
-        let vw = viewport.width.max(1) as f32;
-        let vh = viewport.height.max(1) as f32;
-        let x = vx + position[0].clamp(0.0, 1.0) * (vw - 1.0);
-        let y = vy + position[1].clamp(0.0, 1.0) * (vh - 1.0);
-        [x, y]
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn edge_function(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
-        (p[0] - a[0]) * (b[1] - a[1]) - (p[1] - a[1]) * (b[0] - a[0])
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn floor_to_usize(value: f32) -> usize {
-        if value <= 0.0 { 0 } else { value as usize }
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn ceil_to_usize(value: f32) -> usize {
-        if value <= 0.0 {
-            return 0;
-        }
-        let truncated = value as usize;
-        if truncated as f32 == value {
-            truncated
-        } else {
-            truncated.saturating_add(1)
-        }
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn round_to_usize(value: f32) -> usize {
-        Self::floor_to_usize(value + 0.5)
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn viewport_intersection(&self, viewport: Viewport) -> Option<(usize, usize, usize, usize)> {
-        let fb = self.framebuffer_viewport();
-        let min_x = viewport.x.max(fb.x);
-        let min_y = viewport.y.max(fb.y);
-        let max_x = viewport
-            .x
-            .saturating_add(viewport.width)
-            .min(fb.x.saturating_add(fb.width));
-        let max_y = viewport
-            .y
-            .saturating_add(viewport.height)
-            .min(fb.y.saturating_add(fb.height));
-        if min_x >= max_x || min_y >= max_y {
-            return None;
-        }
-        Some((min_x, min_y, max_x, max_y))
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn scissor_contains(rect: Option<ScissorRect>, x: usize, y: usize) -> bool {
-        match rect {
-            Some(rect) => {
-                let x_max = rect.x.saturating_add(rect.width);
-                let y_max = rect.y.saturating_add(rect.height);
-                x >= rect.x && y >= rect.y && x < x_max && y < y_max
-            }
-            None => true,
-        }
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn write_color_raw_at_offset(&mut self, offset: usize, color: &Color) {
-        let format = self.info.format;
-        let target = self.current_buffer_mut();
-        let bpp = format.bytes_per_pixel();
-        let dst = &mut target[offset..offset + bpp];
-        let bytes = color.to_bytes(format);
-        dst.copy_from_slice(&bytes[..bpp]);
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn write_fragment_color(&mut self, x: usize, y: usize, color: &Color, blend: BlendMode) {
-        if let Some(offset) = self.try_pixel_offset_i64(x as i64, y as i64) {
-            match blend {
-                BlendMode::None => self.write_color_raw_at_offset(offset, color),
-                BlendMode::Alpha => self.write_color_at_offset(offset, color),
-            }
-        }
-    }
-
-    #[cfg(feature = "programmable")]
-    #[inline(always)]
-    fn shade_vertex_point<V, FS>(
-        &mut self,
-        vertex: ProgramVertex<V>,
-        pipeline: &Pipeline<impl VertexShader<Input = impl Copy, Varying = V>, FS>,
-    ) where
-        V: Copy,
-        FS: FragmentShader<Varying = V>,
-    {
-        let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) =
-            self.viewport_intersection(pipeline.state.viewport)
-        else {
-            return;
-        };
-
-        let point = Self::ndc_to_screen(vertex.position, pipeline.state.viewport);
-        let x = point[0].clamp(clip_min_x as f32, (clip_max_x - 1) as f32) as usize;
-        let y = point[1].clamp(clip_min_y as f32, (clip_max_y - 1) as f32) as usize;
-        if !Self::scissor_contains(pipeline.state.scissor, x, y) {
-            return;
-        }
-
-        if let FragmentOutput::Color(color) = pipeline.fragment_shader.shade_fragment(&vertex.varying)
-        {
-            self.write_fragment_color(x, y, &color, pipeline.state.blend);
-        }
-    }
-
-    #[cfg(feature = "programmable")]
-    fn rasterize_line<V, FS>(
-        &mut self,
-        vertices: [ProgramVertex<V>; 2],
-        pipeline: &Pipeline<impl VertexShader<Input = impl Copy, Varying = V>, FS>,
-    ) where
-        V: Interpolate + Copy,
-        FS: FragmentShader<Varying = V>,
-    {
-        let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) =
-            self.viewport_intersection(pipeline.state.viewport)
-        else {
-            return;
-        };
-
-        let p0 = Self::ndc_to_screen(vertices[0].position, pipeline.state.viewport);
-        let p1 = Self::ndc_to_screen(vertices[1].position, pipeline.state.viewport);
-        let dx = p1[0] - p0[0];
-        let dy = p1[1] - p0[1];
-        let steps = Self::ceil_to_usize(dx.abs().max(dy.abs()));
-
-        if steps == 0 {
-            self.shade_vertex_point(vertices[0], pipeline);
-            return;
-        }
-
-        for step in 0..=steps {
-            let t = step as f32 / steps as f32;
-            let x = p0[0] + dx * t;
-            let y = p0[1] + dy * t;
-            let px = Self::round_to_usize(x.clamp(clip_min_x as f32, (clip_max_x - 1) as f32));
-            let py = Self::round_to_usize(y.clamp(clip_min_y as f32, (clip_max_y - 1) as f32));
-            if !Self::scissor_contains(pipeline.state.scissor, px, py) {
-                continue;
-            }
-
-            let varying = V::interpolate(
-                vertices[0].varying,
-                vertices[1].varying,
-                vertices[1].varying,
-                1.0 - t,
-                t,
-                0.0,
-            );
-
-            if let FragmentOutput::Color(color) = pipeline.fragment_shader.shade_fragment(&varying) {
-                self.write_fragment_color(px, py, &color, pipeline.state.blend);
-            }
-        }
-    }
-
-    #[cfg(feature = "programmable")]
-    fn rasterize_triangle<V, FS>(
-        &mut self,
-        vertices: [ProgramVertex<V>; 3],
-        pipeline: &Pipeline<impl VertexShader<Input = impl Copy, Varying = V>, FS>,
-    ) where
-        V: Interpolate + Copy,
-        FS: FragmentShader<Varying = V>,
-    {
-        let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) =
-            self.viewport_intersection(pipeline.state.viewport)
-        else {
-            return;
-        };
-
-        let p0 = Self::ndc_to_screen(vertices[0].position, pipeline.state.viewport);
-        let p1 = Self::ndc_to_screen(vertices[1].position, pipeline.state.viewport);
-        let p2 = Self::ndc_to_screen(vertices[2].position, pipeline.state.viewport);
-
-        let min_x = p0[0]
-            .min(p1[0])
-            .min(p2[0])
-            .max(clip_min_x as f32);
-        let min_y = p0[1]
-            .min(p1[1])
-            .min(p2[1])
-            .max(clip_min_y as f32);
-        let max_x = p0[0]
-            .max(p1[0])
-            .max(p2[0])
-            .min((clip_max_x - 1) as f32);
-        let max_y = p0[1]
-            .max(p1[1])
-            .max(p2[1])
-            .min((clip_max_y - 1) as f32);
-
-        let min_x = Self::floor_to_usize(min_x);
-        let min_y = Self::floor_to_usize(min_y);
-        let max_x = Self::ceil_to_usize(max_x);
-        let max_y = Self::ceil_to_usize(max_y);
-
-        if min_x > max_x || min_y > max_y {
-            return;
-        }
-
-        let area = Self::edge_function(p0, p1, p2);
-        if area.abs() <= f32::EPSILON {
-            return;
-        }
-
-        let sign = if area < 0.0 { -1.0 } else { 1.0 };
-        let inv_area = 1.0 / area.abs();
-
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                if !Self::scissor_contains(pipeline.state.scissor, x, y) {
-                    continue;
-                }
-
-                let sample = [x as f32 + 0.5, y as f32 + 0.5];
-                let w0 = Self::edge_function(p1, p2, sample) * sign;
-                let w1 = Self::edge_function(p2, p0, sample) * sign;
-                let w2 = Self::edge_function(p0, p1, sample) * sign;
-                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                    continue;
-                }
-
-                let varying = V::interpolate(
-                    vertices[0].varying,
-                    vertices[1].varying,
-                    vertices[2].varying,
-                    w0 * inv_area,
-                    w1 * inv_area,
-                    w2 * inv_area,
-                );
-
-                match pipeline.fragment_shader.shade_fragment(&varying) {
-                    FragmentOutput::Color(color) => {
-                        self.write_fragment_color(x, y, &color, pipeline.state.blend);
-                    }
-                    FragmentOutput::Discard => {}
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "programmable")]
-    pub fn draw_arrays<VS, FS>(
-        &mut self,
-        primitive: PrimitiveType,
-        vertices: &[VS::Input],
-        pipeline: &Pipeline<VS, FS>,
-    ) where
-        VS: VertexShader,
-        VS::Input: Copy,
-        VS::Varying: Interpolate + Copy,
-        FS: FragmentShader<Varying = VS::Varying>,
-    {
-        match primitive {
-            PrimitiveType::Points => {
-                for vertex in vertices {
-                    let shaded = pipeline.vertex_shader.shade_vertex(vertex);
-                    self.shade_vertex_point(shaded, pipeline);
-                }
-            }
-            PrimitiveType::Lines => {
-                let mut index = 0usize;
-                while index + 1 < vertices.len() {
-                    let segment = [
-                        pipeline.vertex_shader.shade_vertex(&vertices[index]),
-                        pipeline.vertex_shader.shade_vertex(&vertices[index + 1]),
-                    ];
-                    self.rasterize_line(segment, pipeline);
-                    index += 2;
-                }
-            }
-            PrimitiveType::Triangles => {
-                let mut index = 0usize;
-                while index + 2 < vertices.len() {
-                    let tri = [
-                        pipeline.vertex_shader.shade_vertex(&vertices[index]),
-                        pipeline.vertex_shader.shade_vertex(&vertices[index + 1]),
-                        pipeline.vertex_shader.shade_vertex(&vertices[index + 2]),
-                    ];
-                    self.rasterize_triangle(tri, pipeline);
-                    index += 3;
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "programmable")]
-    pub fn draw_indexed<VS, FS>(
-        &mut self,
-        primitive: PrimitiveType,
-        vertices: &[VS::Input],
-        indices: &[u16],
-        pipeline: &Pipeline<VS, FS>,
-    ) where
-        VS: VertexShader,
-        VS::Input: Copy,
-        VS::Varying: Interpolate + Copy,
-        FS: FragmentShader<Varying = VS::Varying>,
-    {
-        match primitive {
-            PrimitiveType::Points => {
-                for index in indices {
-                    let vertex_index = *index as usize;
-                    if vertex_index >= vertices.len() {
-                        continue;
-                    }
-                    let shaded = pipeline.vertex_shader.shade_vertex(&vertices[vertex_index]);
-                    self.shade_vertex_point(shaded, pipeline);
-                }
-            }
-            PrimitiveType::Lines => {
-                let mut index = 0usize;
-                while index + 1 < indices.len() {
-                    let i0 = indices[index] as usize;
-                    let i1 = indices[index + 1] as usize;
-                    if i0 >= vertices.len() || i1 >= vertices.len() {
-                        index += 2;
-                        continue;
-                    }
-
-                    let segment = [
-                        pipeline.vertex_shader.shade_vertex(&vertices[i0]),
-                        pipeline.vertex_shader.shade_vertex(&vertices[i1]),
-                    ];
-                    self.rasterize_line(segment, pipeline);
-                    index += 2;
-                }
-            }
-            PrimitiveType::Triangles => {
-                let mut index = 0usize;
-                while index + 2 < indices.len() {
-                    let i0 = indices[index] as usize;
-                    let i1 = indices[index + 1] as usize;
-                    let i2 = indices[index + 2] as usize;
-                    if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
-                        index += 3;
-                        continue;
-                    }
-
-                    let tri = [
-                        pipeline.vertex_shader.shade_vertex(&vertices[i0]),
-                        pipeline.vertex_shader.shade_vertex(&vertices[i1]),
-                        pipeline.vertex_shader.shade_vertex(&vertices[i2]),
-                    ];
-                    self.rasterize_triangle(tri, pipeline);
-                    index += 3;
-                }
-            }
-        }
-    }
-
     /// 创建新的渲染器。
     ///
     /// * `info` — 帧缓冲布局描述。
@@ -458,7 +72,7 @@ impl<'a> Renderer<'a> {
     ///
     /// 双缓冲模式下返回 `back_buffer`，否则返回 `front_buffer`。
     #[inline(always)]
-    fn current_buffer_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn current_buffer_mut(&mut self) -> &mut [u8] {
         #[cfg(feature = "double_buffer")]
         return &mut self.back_buffer;
         #[cfg(not(feature = "double_buffer"))]
@@ -467,7 +81,7 @@ impl<'a> Renderer<'a> {
 
     /// 返回当前可读取的缓冲区切片（内部使用）。
     #[inline(always)]
-    fn current_buffer(&self) -> &[u8] {
+    pub(crate) fn current_buffer(&self) -> &[u8] {
         #[cfg(feature = "double_buffer")]
         return &self.back_buffer;
         #[cfg(not(feature = "double_buffer"))]
@@ -490,7 +104,7 @@ impl<'a> Renderer<'a> {
 
     /// 计算像素 `(x, y)` 在缓冲区中的字节偏移（不执行边界检查，内部使用）。
     #[inline(always)]
-    fn pixel_offset_unchecked(&self, x: usize, y: usize) -> usize {
+    pub(crate) fn pixel_offset_unchecked(&self, x: usize, y: usize) -> usize {
         y * self.info.pitch + x * self.info.bytes_per_pixel()
     }
 
@@ -498,7 +112,7 @@ impl<'a> Renderer<'a> {
     ///
     /// 接受 `i64` 坐标，用于插值计算后安全转换。
     #[inline(always)]
-    fn try_pixel_offset_i64(&self, x: i64, y: i64) -> Option<usize> {
+    pub(crate) fn try_pixel_offset_i64(&self, x: i64, y: i64) -> Option<usize> {
         if x < 0 || y < 0 {
             return None;
         }
@@ -515,7 +129,7 @@ impl<'a> Renderer<'a> {
     ///
     /// 如果 `color.a == 0`，直接返回，不执行任何写入。
     #[inline(always)]
-    fn write_color_at_offset(&mut self, offset: usize, color: &Color) {
+    pub(crate) fn write_color_at_offset(&mut self, offset: usize, color: &Color) {
         if color.a == 0 {
             return;
         }
@@ -579,7 +193,7 @@ impl<'a> Renderer<'a> {
             let visible_cols = width.min(fb_width - dst_x);
             let copy_bytes = visible_cols * bpp;
             let src_start = row * src_pitch;
-            let dst_offset = dy * self.info.pitch + dst_x * bpp;
+            let dst_offset = self.pixel_offset_unchecked(dst_x, dy);
             self.current_buffer_mut()[dst_offset..dst_offset + copy_bytes]
                 .copy_from_slice(&src[src_start..src_start + copy_bytes]);
         }
@@ -622,7 +236,7 @@ impl<'a> Renderer<'a> {
             }
             let visible_cols = width.min(fb_width - dst_x);
             let row_mask_off = row * mask_pitch;
-            let base_off = dy * self.info.pitch + dst_x * bpp;
+            let base_off = self.pixel_offset_unchecked(dst_x, dy);
 
             for col in 0..visible_cols {
                 let alpha = mask[row_mask_off + col];
@@ -644,36 +258,35 @@ impl<'a> Renderer<'a> {
     /// 倍增循环中源和目标区域不存在重叠，因此使用 `copy_nonoverlapping` 替代
     /// `copy_within` 以消除切片边界检查开销。
     #[inline(always)]
-    fn fill_span_opaque(&mut self, x_start: usize, x_end: usize, y: usize, color: &Color) {
+    pub(crate) fn fill_span_opaque(
+        &mut self,
+        x_start: usize,
+        x_end: usize,
+        y: usize,
+        color: &Color,
+    ) {
         let format = self.info.format;
-        let pitch = self.info.pitch;
         let pixel_size = format.bytes_per_pixel();
-        let start = y * pitch + x_start * pixel_size;
+        let start = self.pixel_offset_unchecked(x_start, y);
         let row_len = (x_end - x_start + 1) * pixel_size;
         let target = self.current_buffer_mut();
         let row = &mut target[start..start + row_len];
 
         format.write_color(&mut row[..pixel_size], color);
-
-        let base = row.as_mut_ptr();
-        let mut filled = pixel_size;
-        while filled < row_len {
-            let copy_len = core::cmp::min(filled, row_len - filled);
-            // Safety: 倍增模式保证 filled > copy_len（末次迭代例外但也满足
-            // filled >= copy_len），即 src [0..copy_len) 与 dst [filled..)
-            // 不重叠。且 filled < row_len 保证 dst 在 row 范围内。
-            unsafe {
-                core::ptr::copy_nonoverlapping(base, base.add(filled), copy_len);
-            }
-            filled += copy_len;
-        }
+        Self::doubling_fill(row, pixel_size, row_len);
     }
 
     /// 在可见区域内填充水平跨度。自动裁剪到帧缓冲边界。
     ///
     /// 不透明颜色使用 `fill_span_opaque` 快速填充，否则逐像素写入。
     #[inline(always)]
-    fn fill_visible_horizontal_span(&mut self, start_x: i64, end_x: i64, y: i64, color: &Color) {
+    pub(crate) fn fill_visible_horizontal_span(
+        &mut self,
+        start_x: i64,
+        end_x: i64,
+        y: i64,
+        color: &Color,
+    ) {
         if y < 0 || y >= self.info.height as i64 {
             return;
         }
@@ -821,15 +434,46 @@ impl<'a> Renderer<'a> {
             unsafe {
                 core::ptr::copy_nonoverlapping(pattern.as_ptr(), row_ptr, pixel_size);
             }
+            let row = unsafe { core::slice::from_raw_parts_mut(row_ptr, row_len) };
+            Self::doubling_fill(row, pixel_size, row_len);
+        }
+    }
 
-            let mut filled = pixel_size;
-            while filled < row_len {
-                let copy_len = core::cmp::min(filled, row_len - filled);
-                unsafe {
-                    core::ptr::copy(row_ptr, row_ptr.add(filled), copy_len);
-                }
-                filled += copy_len;
+    #[inline(always)]
+    fn doubling_fill(row: &mut [u8], pattern_len: usize, len: usize) {
+        let base = row.as_mut_ptr();
+        let mut filled = pattern_len;
+        while filled < len {
+            let copy_len = core::cmp::min(filled, len - filled);
+            unsafe {
+                core::ptr::copy_nonoverlapping(base, base.add(filled), copy_len);
             }
+            filled += copy_len;
+        }
+    }
+
+    #[inline(always)]
+    fn walk_circle_points(
+        &mut self,
+        center: Pixel,
+        radius: usize,
+        mut visit: impl FnMut(&mut Self, i64, i64, i64, i64),
+    ) {
+        let cx = saturating_usize_to_i64(center.x);
+        let cy = saturating_usize_to_i64(center.y);
+        let mut x = 0i64;
+        let mut y = radius as i64;
+        let mut d = 3 - 2 * radius as i64;
+
+        while x <= y {
+            visit(self, cx, cy, x, y);
+            if d < 0 {
+                d += 4 * x + 6;
+            } else {
+                d += 4 * (x - y) + 10;
+                y -= 1;
+            }
+            x += 1;
         }
     }
 
@@ -999,15 +643,9 @@ impl<'a> Renderer<'a> {
                 self.fill_span_opaque(x_start, x_max - 1, y, &color);
             }
         } else {
-            let pitch = self.info.pitch;
-            let bpp = self.info.format.bytes_per_pixel();
-            let format = self.info.format;
-            let fb = self.current_buffer_mut();
             for y in y_start..y_max {
-                let row_base = y * pitch;
                 for x in x_start..x_max {
-                    let offset = row_base + x * bpp;
-                    format.write_color(&mut fb[offset..offset + bpp], &color);
+                    self.write_color_at_offset(self.pixel_offset_unchecked(x, y), &color);
                 }
             }
         }
@@ -1021,15 +659,7 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        let (cx, cy) = center.to_coord();
-        let mut x = 0i64;
-        let mut y = radius as i64;
-        let mut d = 3 - 2 * radius as i64;
-        let cx = saturating_usize_to_i64(cx);
-        let cy = saturating_usize_to_i64(cy);
-
-        while x <= y {
-            // Draw 8 symmetric points
+        self.walk_circle_points(center, radius, |renderer, cx, cy, x, y| {
             for (px, py) in [
                 (cx + x, cy + y),
                 (cx + x, cy - y),
@@ -1041,18 +671,10 @@ impl<'a> Renderer<'a> {
                 (cx - y, cy - x),
             ] {
                 if px >= 0 && py >= 0 {
-                    self.set_pixel(px as usize, py as usize, color);
+                    renderer.set_pixel(px as usize, py as usize, color);
                 }
             }
-
-            if d < 0 {
-                d = d + 4 * x + 6;
-            } else {
-                d = d + 4 * (x - y) + 10;
-                y -= 1;
-            }
-            x += 1;
-        }
+        });
     }
 
     /// 使用中点圆算法填充圆形区域。
@@ -1064,29 +686,16 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        let cx = saturating_usize_to_i64(center.x);
-        let cy = saturating_usize_to_i64(center.y);
-        let mut x = 0i64;
-        let mut y = radius as i64;
-        let mut d = 3 - 2 * radius as i64;
-
-        while x <= y {
+        self.walk_circle_points(center, radius, |renderer, cx, cy, x, y| {
             for (sx, ex, py) in [
                 (cx - x, cx + x, cy + y),
                 (cx - x, cx + x, cy - y),
                 (cx - y, cx + y, cy + x),
                 (cx - y, cx + y, cy - x),
             ] {
-                self.fill_visible_horizontal_span(sx, ex, py, &color);
+                renderer.fill_visible_horizontal_span(sx, ex, py, &color);
             }
-            if d < 0 {
-                d += 4 * x + 6;
-            } else {
-                d += 4 * (x - y) + 10;
-                y -= 1;
-            }
-            x += 1;
-        }
+        });
     }
 
     /// 使用中心矩形 + 整数中点圆弧扫描线填充圆角矩形。
@@ -1195,7 +804,7 @@ impl<'a> Renderer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{integer_sqrt, Renderer};
+    use super::{Renderer, integer_sqrt};
     use crate::color::{Color, PixelFormat};
     use crate::framebuffer::FramebufferInfo;
     use crate::pixel::Pixel;
