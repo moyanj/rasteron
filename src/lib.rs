@@ -23,9 +23,10 @@ pub mod color;
 pub mod core;
 pub mod framebuffer;
 pub mod pixel;
+#[cfg(feature = "simd")]
+pub mod simd;
 mod utils;
 #[cfg(feature = "programmable")]
 pub mod vertex;
-
 pub use core::Renderer;
 pub use pixel::Pixel;
