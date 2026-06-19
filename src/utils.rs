@@ -1,11 +1,21 @@
 use crate::Pixel;
 
+/// Cohen–Sutherland 线段裁剪算法，针对矩形视口。
+///
+/// 当线段部分或完全可见时，返回裁剪后的端点 `(Pixel, Pixel)` 对；
+/// 当整条线段位于视口之外时，返回 `None`。
+///
+/// # 坐标系
+///
+/// Y 轴向下递增（行优先帧缓冲约定）。`(0, 0)` 为左上角。
+/// 可见区域 X 范围为 `[0, width)`，Y 范围为 `[0, height)`。
 pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(Pixel, Pixel)> {
+    // Cohen–Sutherland 算法的区域码。
     const INSIDE: u8 = 0; // 0000
     const LEFT: u8 = 1; // 0001
     const RIGHT: u8 = 2; // 0010
-    const BOTTOM: u8 = 4; // 0100
-    const TOP: u8 = 8; // 1000
+    const BOTTOM: u8 = 4; // 0100  (Y 在左上角以下 → 0)
+    const TOP: u8 = 8; // 1000    (Y 在底部以上)
 
     fn compute_code(x: i64, y: i64, width: usize, height: usize) -> u8 {
         let mut code = INSIDE;
@@ -15,7 +25,7 @@ pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(P
             code |= RIGHT;
         }
         if y < 0 {
-            code |= BOTTOM; // 或 TOP，取决于你坐标轴方向，这里假设 y 向下为正
+            code |= BOTTOM;
         } else if y >= height as i64 {
             code |= TOP;
         }
@@ -82,6 +92,10 @@ pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(P
     }
 }
 
+/// 饱和转换：从 `usize` 转换为 `i64`。
+///
+/// 超过 [`i64::MAX`] 的值会被截断为 [`i64::MAX`]。
+/// 内部用于在插值运算中避免负数。
 #[inline(always)]
 pub(crate) fn saturating_usize_to_i64(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64

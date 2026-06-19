@@ -1,3 +1,8 @@
+//! 演示二进制文件 — 生成测试 BMP 图像。
+//!
+//! 创建一个 1280 × 720 的 BGR24 帧缓冲，绘制一条线段后将结果写入
+//! `rasteron-test.bmp`。
+
 use rasteron::color::{BLACK, BLUE, PixelFormat};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::{Renderer, pixel};
@@ -25,6 +30,9 @@ fn main() {
     println!("{}", output);
 }
 
+/// 将原始 BGR24 像素缓冲区写入磁盘，生成 24 位 BMP 文件。
+///
+/// BMP 采用自底向上写入（标准 BMP 约定）。每行填充到 4 字节对齐。
 fn write_bmp(path: &Path, width: usize, height: usize, pixels: &[u8]) -> std::io::Result<()> {
     let row_stride = width * 3;
     let row_padding = (4 - (row_stride % 4)) % 4;

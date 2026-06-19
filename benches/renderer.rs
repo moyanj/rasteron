@@ -6,14 +6,14 @@ use rasteron::color::{Color, PixelFormat};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::pixel::Pixel;
 
-const BENCH_FORMATS: [PixelFormat; 2] = [PixelFormat::Bgr24, PixelFormat::Xrgb8888];
+const BENCH_FORMATS: [PixelFormat; 1] = [PixelFormat::Bgr24];
 
 fn criterion_config() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(8))
-        .sample_size(200)
-        .noise_threshold(0.02)
+        .warm_up_time(Duration::from_secs(4))
+        .measurement_time(Duration::from_secs(10))
+        .sample_size(500)
+        .noise_threshold(0.025)
         .significance_level(0.01)
 }
 
@@ -177,6 +177,151 @@ fn bench_draw_line(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_draw_triangle(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("draw_triangle");
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut y = 0usize;
+                b.iter(|| {
+                    let p1 = Pixel::new(width / 2, y);
+                    let p2 = Pixel::new(0, (y + 64).min(height - 1));
+                    let p3 = Pixel::new(width - 1, (y + 64).min(height - 1));
+                    renderer.draw_triangle(
+                        black_box(p1),
+                        black_box(p2),
+                        black_box(p3),
+                        black_box(&Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
+                    y = (y + 16) % (height - 64);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_fill_triangle(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("fill_triangle");
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut y = 0usize;
+                b.iter(|| {
+                    let p1 = Pixel::new(width / 2, y);
+                    let p2 = Pixel::new(0, (y + 64).min(height - 1));
+                    let p3 = Pixel::new(width - 1, (y + 64).min(height - 1));
+                    renderer.fill_triangle(
+                        black_box(p1),
+                        black_box(p2),
+                        black_box(p3),
+                        black_box(&Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
+                    y = (y + 16) % (height - 64);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_draw_rect(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("draw_rect");
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut y = 0usize;
+                b.iter(|| {
+                    renderer.draw_rect(
+                        black_box(Pixel::new(16, y)),
+                        black_box(width - 32),
+                        black_box(64usize),
+                        black_box(&Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
+                    y = (y + 16) % (height - 64);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_fill_rect(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("fill_rect");
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut y = 0usize;
+                b.iter(|| {
+                    renderer.fill_rect(
+                        black_box(Pixel::new(16, y)),
+                        black_box(width - 32),
+                        black_box(64usize),
+                        black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
+                    y = (y + 16) % (height - 64);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_draw_circle(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("draw_circle");
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut radius = 8usize;
+                b.iter(|| {
+                    renderer.draw_circle(
+                        black_box(Pixel::new(width / 2, height / 2)),
+                        black_box(radius),
+                        black_box(&Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
+                    radius = (radius + 4) % 128 + 8;
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = criterion_config();
@@ -185,6 +330,11 @@ criterion_group!(
     bench_set_pixel_alpha,
     bench_frame_gradient,
     bench_clear,
-    bench_draw_line
+    bench_draw_line,
+    bench_draw_triangle,
+    bench_fill_triangle,
+    bench_draw_rect,
+    bench_fill_rect,
+    bench_draw_circle
 );
 criterion_main!(benches);

@@ -5,6 +5,29 @@ use crate::utils::{clip_line, saturating_usize_to_i64};
 extern crate alloc;
 use alloc::vec::Vec;
 
+/// 软件光栅化渲染器，操作原始帧缓冲字节切片。
+///
+/// `Renderer` 将绘制命令（像素、线段、三角形、矩形、圆形）直接写入
+/// 帧缓冲内存。支持可选的[双缓冲](index.html#feature-flags)和
+/// Alpha 混合。
+///
+/// # 类型参数
+///
+/// * `'a` — 帧缓冲切片的生命周期。
+///
+/// # 示例
+///
+/// ```
+/// # use rasteron::Renderer;
+/// # use rasteron::framebuffer::FramebufferInfo;
+/// # use rasteron::color::{PixelFormat, Color};
+/// # use rasteron::Pixel;
+/// let info = FramebufferInfo::new(320, 240, 960, PixelFormat::Bgr24);
+/// let mut fb = vec![0u8; info.buffer_size()];
+/// let mut renderer = Renderer::new(info, &mut fb);
+///
+/// renderer.set_pixel(10, 10, &Color::new(255, 0, 0));
+/// ```
 pub struct Renderer<'a> {
     info: FramebufferInfo,
     front_buffer: &'a mut [u8],
@@ -13,7 +36,12 @@ pub struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    /// 创建渲染器
+    /// 创建新的渲染器。
+    ///
+    /// * `info` — 帧缓冲布局描述。
+    /// * `front_buffer` — 前端帧缓冲的可变引用。
+    ///
+    /// 当启用 `double_buffer` 特性时，会自动分配后端缓冲区。
     pub fn new(info: FramebufferInfo, front_buffer: &'a mut [u8]) -> Self {
         #[cfg(feature = "double_buffer")]
         let buffer_size = info.buffer_size();
@@ -25,7 +53,9 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// 获取当前可写入的缓冲区切片（内部使用）
+    /// 返回当前可写入的缓冲区切片（内部使用）。
+    ///
+    /// 双缓冲模式下返回 `back_buffer`，否则返回 `front_buffer`。
     #[inline(always)]
     fn current_buffer_mut(&mut self) -> &mut [u8] {
         #[cfg(feature = "double_buffer")]
@@ -34,6 +64,7 @@ impl<'a> Renderer<'a> {
         return &mut self.front_buffer;
     }
 
+    /// 返回当前可读取的缓冲区切片（内部使用）。
     #[inline(always)]
     fn current_buffer(&self) -> &[u8] {
         #[cfg(feature = "double_buffer")]
@@ -42,21 +73,29 @@ impl<'a> Renderer<'a> {
         return &self.front_buffer;
     }
 
+    /// 每个像素占用的字节数。
     #[inline(always)]
     pub fn pixel_size(&self) -> u16 {
         self.info.bytes_per_pixel() as u16
     }
 
+    /// 计算像素 `(x, y)` 在缓冲区中的字节偏移。
+    ///
+    /// 不执行边界检查。
     #[inline(always)]
     pub fn pixel_offset(&self, x: usize, y: usize) -> usize {
         self.pixel_offset_unchecked(x, y)
     }
 
+    /// 计算像素 `(x, y)` 在缓冲区中的字节偏移（不执行边界检查，内部使用）。
     #[inline(always)]
     fn pixel_offset_unchecked(&self, x: usize, y: usize) -> usize {
         y * self.info.pitch + x * self.info.bytes_per_pixel()
     }
 
+    /// 尝试计算像素 `(x, y)` 的字节偏移，在越界时返回 `None`。
+    ///
+    /// 接受 `i64` 坐标，用于插值计算后安全转换。
     #[inline(always)]
     fn try_pixel_offset_i64(&self, x: i64, y: i64) -> Option<usize> {
         if x < 0 || y < 0 {
@@ -71,6 +110,9 @@ impl<'a> Renderer<'a> {
         Some(self.pixel_offset_unchecked(x, y))
     }
 
+    /// 在指定字节偏移处写入颜色（支持 Alpha 混合）。
+    ///
+    /// 如果 `color.a == 0`，直接返回，不执行任何写入。
     #[inline(always)]
     fn write_color_at_offset(&mut self, offset: usize, color: &Color) {
         if color.a == 0 {
@@ -78,20 +120,12 @@ impl<'a> Renderer<'a> {
         }
 
         let format = self.info.format;
-        let pixel_size = format.bytes_per_pixel();
-        let bytes = if color.a == 255 {
-            color.to_bytes(format)
-        } else {
-            let target = self.current_buffer_mut();
-            let dst = &mut target[offset..offset + pixel_size];
-            let existing_color = Color::from_bytes(format, dst);
-            color.mix(&existing_color, color.a).to_bytes(format)
-        };
-
         let target = self.current_buffer_mut();
-        target[offset..offset + pixel_size].copy_from_slice(&bytes[..pixel_size]);
+        let dst = &mut target[offset..offset + format.bytes_per_pixel()];
+        format.write_color(dst, color);
     }
 
+    /// 在可见的 `(x, y)` 坐标处写入颜色；如果坐标越界则忽略。
     #[inline(always)]
     fn write_color_if_visible_i64(&mut self, x: i64, y: i64, color: &Color) {
         if let Some(offset) = self.try_pixel_offset_i64(x, y) {
@@ -99,6 +133,34 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// 用不透明颜色快速填充一行中的水平跨度。
+    ///
+    /// 使用倍增复制策略（先写入一个像素，然后不断将已填充部分复制到
+    /// 未填充区域），以最小化逐个像素写入的开销。
+    #[inline(always)]
+    fn fill_span_opaque(&mut self, x_start: usize, x_end: usize, y: usize, color: &Color) {
+        let format = self.info.format;
+        let pitch = self.info.pitch;
+        let pixel_size = format.bytes_per_pixel();
+        let start = y * pitch + x_start * pixel_size;
+        let row_len = (x_end - x_start + 1) * pixel_size;
+        let target = self.current_buffer_mut();
+        let row = &mut target[start..start + row_len];
+
+        format.write_color(&mut row[..pixel_size], color);
+
+        let mut filled = pixel_size;
+        while filled < row_len {
+            let copy_len = core::cmp::min(filled, row_len - filled);
+            row.copy_within(0..copy_len, filled);
+            filled += copy_len;
+        }
+    }
+
+    /// 扫描线插值：给定基坐标 `base_x`、增量 `delta_x` / `delta_y` 和
+    /// 垂直偏移 `offset_y`，计算对应的 X 坐标。
+    ///
+    /// 使用 `i128` 中间运算以避免溢出，并进行饱和钳位。
     #[inline(always)]
     fn interpolate_scan_x(base_x: i64, delta_x: i64, delta_y: i64, offset_y: i64) -> i64 {
         if delta_y == 0 {
@@ -111,12 +173,19 @@ impl<'a> Renderer<'a> {
         value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
-    /// 绘制一个像素
+    /// 在指定坐标处写入像素，**不执行边界检查**。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证 `(x, y)` 在帧缓冲范围内。
     pub unsafe fn set_pixel_unchecked(&mut self, x: usize, y: usize, color: &Color) {
         let offset = self.pixel_offset(x, y);
         self.write_color_at_offset(offset, color);
     }
 
+    /// 在指定坐标处写入像素（安全版本，执行边界检查）。
+    ///
+    /// 如果坐标越界，调用被安全忽略。
     #[inline(always)]
     pub fn set_pixel(&mut self, x: usize, y: usize, color: &Color) {
         if x >= self.info.width || y >= self.info.height {
@@ -125,24 +194,38 @@ impl<'a> Renderer<'a> {
         unsafe { self.set_pixel_unchecked(x, y, color) };
     }
 
+    /// 使用 [`Pixel`] 坐标写入像素，**不执行边界检查**。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证像素坐标在帧缓冲范围内。
     #[inline(always)]
     pub unsafe fn set_pixel_at_unchecked(&mut self, pixel: Pixel, color: &Color) {
         unsafe { self.set_pixel_unchecked(pixel.x, pixel.y, color) };
     }
 
+    /// 使用 [`Pixel`] 坐标写入像素（安全版本）。
     #[inline(always)]
     pub fn set_pixel_at(&mut self, pixel: Pixel, color: &Color) {
         self.set_pixel(pixel.x, pixel.y, color);
     }
 
+    /// 读取指定坐标处的像素颜色，**不执行边界检查**。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证 `(x, y)` 在帧缓冲范围内。
     pub unsafe fn get_pixel_unchecked(&self, x: usize, y: usize) -> Color {
         let offset = self.pixel_offset(x, y);
         let format = self.info.format;
         let target = self.current_buffer();
         let src = &target[offset..offset + format.bytes_per_pixel()];
-        Color::from_bytes(format, src)
+        format.read_color(src)
     }
 
+    /// 读取指定坐标处的像素颜色（安全版本）。
+    ///
+    /// 坐标越界时返回 `None`。
     pub fn get_pixel(&self, x: usize, y: usize) -> Option<Color> {
         if x >= self.info.width || y >= self.info.height {
             return None;
@@ -150,16 +233,23 @@ impl<'a> Renderer<'a> {
         Some(unsafe { self.get_pixel_unchecked(x, y) })
     }
 
+    /// 使用 [`Pixel`] 坐标读取像素颜色，**不执行边界检查**。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证像素坐标在帧缓冲范围内。
     #[inline(always)]
     pub unsafe fn get_pixel_at_unchecked(&self, pixel: Pixel) -> Color {
         unsafe { self.get_pixel_unchecked(pixel.x, pixel.y) }
     }
 
+    /// 使用 [`Pixel`] 坐标读取像素颜色（安全版本）。
     #[inline(always)]
     pub fn get_pixel_at(&self, pixel: Pixel) -> Option<Color> {
         self.get_pixel(pixel.x, pixel.y)
     }
 
+    /// 用指定颜色清空整个帧缓冲。
     pub fn clear(&mut self, color: Color) {
         let format = self.info.format;
         let pixel_size = format.bytes_per_pixel();
@@ -176,6 +266,8 @@ impl<'a> Renderer<'a> {
     }
 
     /// 用重复像素模式填充当前缓冲区的可见区域。
+    ///
+    /// 使用倍增复制策略逐行填充。
     ///
     /// # Safety
     ///
@@ -204,7 +296,7 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// Draw a line
+    /// 使用 Bresenham 算法绘制线段，自动裁剪到帧缓冲边界。
     pub fn draw_line(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
         if clip_line(p1, p2, self.info.width, self.info.height).is_none() {
             return;
@@ -213,11 +305,14 @@ impl<'a> Renderer<'a> {
         unsafe { self.draw_line_unchecked(p1, p2, color) };
     }
 
-    /// Draw a line while clipping writes against the framebuffer bounds.
+    /// Bresenham 线段算法，**不进行裁剪检查**。
+    ///
+    /// 仅通过 `write_color_if_visible_i64` 进行逐个像素的边界保护，
+    /// 不会通过 `clip_line` 提前拒绝整条线段。
     ///
     /// # Safety
     ///
-    /// 调用方必须保证 renderer 绑定的 framebuffer 有效。
+    /// 调用方必须保证渲染器绑定的帧缓冲有效。
     pub unsafe fn draw_line_unchecked(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
         let (mut x1, mut y1) = (saturating_usize_to_i64(p1.x), saturating_usize_to_i64(p1.y));
         let (mut x2, mut y2) = (saturating_usize_to_i64(p2.x), saturating_usize_to_i64(p2.y));
@@ -248,14 +343,15 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// 如果启用双缓冲，将后台缓冲区交换到前台（即刷新到显存）
+    /// 如果启用双缓冲，将后台缓冲区交换到前台（即刷新到显存）。
+    ///
+    /// 单缓冲模式下此方法不可用。
     #[cfg(feature = "double_buffer")]
     pub fn swap_buffers(&mut self) {
-        // 直接拷贝整个后台到前台，或使用 DMA（此处留接口）
         self.front_buffer.copy_from_slice(&self.back_buffer);
     }
 
-    /// 绘制三角形轮廓
+    /// 绘制三角形轮廓（由三条线段组成）。
     #[inline]
     pub fn draw_triangle(&mut self, p1: Pixel, p2: Pixel, p3: Pixel, color: &Color) {
         self.draw_line(p1, p2, color);
@@ -263,13 +359,31 @@ impl<'a> Renderer<'a> {
         self.draw_line(p3, p1, color);
     }
 
-    /// 填充三角形（扫描线算法）
+    /// 使用扫描线算法填充三角形。
     ///
-    /// 使用重心坐标和扫描线填充，性能敏感场景下直接操作缓冲区。
+    /// 将三角形按 Y 坐标拆分为上下两部分，对每行扫描线进行插值填充。
+    /// 不透明颜色使用 `fill_span_opaque` 快速填充，否则逐像素写入。
+    ///
+    /// # 算法
+    ///
+    /// 1. 按 Y 对三个顶点排序。
+    /// 2. 将三角形在中间顶点处分为上下两部分。
+    /// 3. 对每行扫描线，计算与三角形两条边的交点并填充。
     #[inline]
     pub fn fill_triangle(&mut self, p1: Pixel, p2: Pixel, p3: Pixel, color: &Color) {
+        if self.info.width == 0 || self.info.height == 0 {
+            return;
+        }
+
+        let max_x = self.info.width - 1;
+        let max_y = self.info.height - 1;
+
         // 按 Y 坐标排序三个顶点
-        let mut pts = [p1, p2, p3];
+        let mut pts = [
+            Pixel::new(p1.x.min(max_x), p1.y.min(max_y)),
+            Pixel::new(p2.x.min(max_x), p2.y.min(max_y)),
+            Pixel::new(p3.x.min(max_x), p3.y.min(max_y)),
+        ];
         if pts[0].y > pts[1].y {
             pts.swap(0, 1);
         }
@@ -311,18 +425,26 @@ impl<'a> Renderer<'a> {
             if sx > ex {
                 core::mem::swap(&mut sx, &mut ex);
             }
+            if color.a == 255 {
+                self.fill_span_opaque(sx as usize, ex as usize, y as usize, color);
+                return;
+            }
             for x in sx..=ex {
-                self.write_color_if_visible_i64(x, y, color);
+                self.write_color_at_offset(self.pixel_offset_unchecked(x as usize, y as usize), color);
             }
         };
 
         let long_dx = x3 - x1;
         let long_dy = y3 - y1;
+        let visible_y_min = 0i64;
+        let visible_y_max = height - 1;
 
         // 上半部分三角形 (p1 -> p2)
         let upper_dx = x2 - x1;
         let upper_dy = y2 - y1;
-        for y in y1..=y2 {
+        let upper_start = y1.max(visible_y_min);
+        let upper_end = y2.min(visible_y_max);
+        for y in upper_start..=upper_end {
             let dy = y - y1;
             let x_long = Self::interpolate_scan_x(x1, long_dx, long_dy, dy);
             let x_upper = Self::interpolate_scan_x(x1, upper_dx, upper_dy, dy);
@@ -332,7 +454,9 @@ impl<'a> Renderer<'a> {
         // 下半部分三角形 (p2 -> p3)
         let lower_dx = x3 - x2;
         let lower_dy = y3 - y2;
-        for y in y2..=y3 {
+        let lower_start = y2.max(visible_y_min);
+        let lower_end = y3.min(visible_y_max);
+        for y in lower_start..=lower_end {
             let dy_long = y - y1;
             let dy_lower = y - y2;
             let x_long = Self::interpolate_scan_x(x1, long_dx, long_dy, dy_long);
@@ -341,7 +465,7 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// 绘制矩形轮廓
+    /// 绘制矩形轮廓（由四条线段组成）。
     #[inline]
     pub fn draw_rect(&mut self, top_left: Pixel, width: usize, height: usize, color: &Color) {
         let (x, y) = top_left.to_coord();
@@ -353,9 +477,10 @@ impl<'a> Renderer<'a> {
         self.draw_line(Pixel::new(x, y2), Pixel::new(x, y), color);
     }
 
-    /// 填充矩形
+    /// 填充矩形区域。
     ///
-    /// 性能优化版本：直接操作内存缓冲区，避免逐像素边界检查开销。
+    /// 不透明颜色使用 `fill_span_opaque` 快速填充，否则逐像素写入。
+    /// 自动裁剪到帧缓冲边界。
     #[inline]
     pub fn fill_rect(&mut self, top_left: Pixel, width: usize, height: usize, color: Color) {
         let (x_min, y_min) = top_left.to_coord();
@@ -368,24 +493,22 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        let format = self.info.format;
-        let pixel_size = format.bytes_per_pixel();
-        let bytes = color.to_bytes(format);
-        let pattern = &bytes[..pixel_size];
-        let pitch = self.info.pitch;
-
-        // 优化：逐行填充，使用 copy 重复模式
-        let buffer = self.current_buffer_mut();
         for y in y_start..y_max {
-            let row_offset = y * pitch;
-            for x in x_start..x_max {
-                let offset = row_offset + x * pixel_size;
-                buffer[offset..offset + pixel_size].copy_from_slice(pattern);
+            if color.a == 255 {
+                self.fill_span_opaque(x_start, x_max - 1, y, &color);
+            } else {
+                let row_offset = y * self.info.pitch;
+                for x in x_start..x_max {
+                    let offset = row_offset + x * self.info.format.bytes_per_pixel();
+                    self.write_color_at_offset(offset, &color);
+                }
             }
         }
     }
 
-    /// Draw circle
+    /// 使用中点圆算法绘制圆形轮廓。
+    ///
+    /// 利用八对称性绘制所有对称点，自动忽略超出帧缓冲边界的像素。
     pub fn draw_circle(&mut self, center: Pixel, radius: usize, color: &Color) {
         if radius == 0 {
             return;
@@ -425,12 +548,15 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// 可选：绘制大批量像素时，直接获取当前缓冲区指针，减少调用开销
+    /// 获取当前缓冲区的可变引用。
+    ///
+    /// 在需要直接操作缓冲区的大批量像素绘制场景中使用。
     #[inline(always)]
     pub fn buffer_mut(&mut self) -> &mut [u8] {
         self.current_buffer_mut()
     }
 
+    /// 返回帧缓冲布局信息的引用。
     pub fn info(&self) -> &FramebufferInfo {
         &self.info
     }
