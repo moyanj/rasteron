@@ -125,12 +125,6 @@ impl<'a> Renderer<'a> {
         Some(self.pixel_offset_unchecked(x, y))
     }
 
-    /// 检查像素 `(x, y)` 是否在帧缓冲可见区域内。
-    #[inline(always)]
-    fn pixel_visible(&self, x: usize, y: usize) -> bool {
-        x < self.info.width && y < self.info.height
-    }
-
     /// 在指定字节偏移处写入颜色（支持 Alpha 混合）。
     ///
     /// 如果 `color.a == 0`，直接返回，不执行任何写入。
@@ -184,21 +178,24 @@ impl<'a> Renderer<'a> {
             return;
         }
         let bpp = self.info.format.bytes_per_pixel();
+        let fb_width = self.info.width;
+        let dst_x = dst_top_left.x;
+
         for row in 0..height {
             let dy = dst_top_left.y + row;
             if dy >= self.info.height {
                 break;
             }
-            for col in 0..width {
-                let dx = dst_top_left.x + col;
-                if !self.pixel_visible(dx, dy) {
-                    continue;
-                }
-                let src_offset = row * src_pitch + col * bpp;
-                let dst_offset = self.pixel_offset_unchecked(dx, dy);
-                self.current_buffer_mut()[dst_offset..dst_offset + bpp]
-                    .copy_from_slice(&src[src_offset..src_offset + bpp]);
+            // Row-level clipping: skip if entire row is outside the framebuffer
+            if dst_x >= fb_width {
+                continue;
             }
+            let visible_cols = width.min(fb_width - dst_x);
+            let copy_bytes = visible_cols * bpp;
+            let src_start = row * src_pitch;
+            let dst_offset = dy * self.info.pitch + dst_x * bpp;
+            self.current_buffer_mut()[dst_offset..dst_offset + copy_bytes]
+                .copy_from_slice(&src[src_start..src_start + copy_bytes]);
         }
     }
 
@@ -223,22 +220,31 @@ impl<'a> Renderer<'a> {
         if mask.len() < mask_pitch.saturating_mul(height) {
             return;
         }
+        let fb_width = self.info.width;
+        let fb_height = self.info.height;
+        let dst_x = dst_top_left.x;
+        let bpp = self.info.format.bytes_per_pixel();
+
         for row in 0..height {
             let dy = dst_top_left.y + row;
-            if dy >= self.info.height {
+            if dy >= fb_height {
                 break;
             }
-            for col in 0..width {
-                let dx = dst_top_left.x + col;
-                if !self.pixel_visible(dx, dy) {
-                    continue;
-                }
-                let alpha = mask[row * mask_pitch + col];
+            // Row-level clipping
+            if dst_x >= fb_width {
+                continue;
+            }
+            let visible_cols = width.min(fb_width - dst_x);
+            let row_mask_off = row * mask_pitch;
+            let base_off = dy * self.info.pitch + dst_x * bpp;
+
+            for col in 0..visible_cols {
+                let alpha = mask[row_mask_off + col];
                 if alpha == 0 {
                     continue;
                 }
                 let shaded = Color::with_alpha(color.r, color.g, color.b, alpha);
-                let offset = self.pixel_offset_unchecked(dx, dy);
+                let offset = base_off + col * bpp;
                 self.write_color_at_offset(offset, &shaded);
             }
         }
@@ -248,6 +254,9 @@ impl<'a> Renderer<'a> {
     ///
     /// 使用倍增复制策略（先写入一个像素，然后不断将已填充部分复制到
     /// 未填充区域），以最小化逐个像素写入的开销。
+    ///
+    /// 倍增循环中源和目标区域不存在重叠，因此使用 `copy_nonoverlapping` 替代
+    /// `copy_within` 以消除切片边界检查开销。
     #[inline(always)]
     fn fill_span_opaque(&mut self, x_start: usize, x_end: usize, y: usize, color: &Color) {
         let format = self.info.format;
@@ -260,10 +269,16 @@ impl<'a> Renderer<'a> {
 
         format.write_color(&mut row[..pixel_size], color);
 
+        let base = row.as_mut_ptr();
         let mut filled = pixel_size;
         while filled < row_len {
             let copy_len = core::cmp::min(filled, row_len - filled);
-            row.copy_within(0..copy_len, filled);
+            // Safety: 倍增模式保证 filled > copy_len（末次迭代例外但也满足
+            // filled >= copy_len），即 src [0..copy_len) 与 dst [filled..)
+            // 不重叠。且 filled < row_len 保证 dst 在 row 范围内。
+            unsafe {
+                core::ptr::copy_nonoverlapping(base, base.add(filled), copy_len);
+            }
             filled += copy_len;
         }
     }
@@ -593,14 +608,20 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        for y in y_start..y_max {
-            if color.a == 255 {
+        if color.a == 255 {
+            for y in y_start..y_max {
                 self.fill_span_opaque(x_start, x_max - 1, y, &color);
-            } else {
-                let row_offset = y * self.info.pitch;
+            }
+        } else {
+            let pitch = self.info.pitch;
+            let bpp = self.info.format.bytes_per_pixel();
+            let format = self.info.format;
+            let fb = self.current_buffer_mut();
+            for y in y_start..y_max {
+                let row_base = y * pitch;
                 for x in x_start..x_max {
-                    let offset = row_offset + x * self.info.format.bytes_per_pixel();
-                    self.write_color_at_offset(offset, &color);
+                    let offset = row_base + x * bpp;
+                    format.write_color(&mut fb[offset..offset + bpp], &color);
                 }
             }
         }
@@ -703,18 +724,42 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        // Center vertical strip (full height, excluding corner x-ranges)
+        let core_w = width - radius * 2;
+        let core_h = height - radius * 2;
+
+        // Center body (no overlap with edge strips)
         self.fill_rect(
-            Pixel::new(top_left.x + radius, top_left.y),
-            width - radius * 2,
-            height,
+            Pixel::new(top_left.x + radius, top_left.y + radius),
+            core_w,
+            core_h,
             color,
         );
-        // Center horizontal strip (full width, excluding corner y-ranges)
+        // Top edge strip (between top-left and top-right corner arcs)
+        self.fill_rect(
+            Pixel::new(top_left.x + radius, top_left.y),
+            core_w,
+            radius,
+            color,
+        );
+        // Bottom edge strip
+        self.fill_rect(
+            Pixel::new(top_left.x + radius, top_left.y + height - radius),
+            core_w,
+            radius,
+            color,
+        );
+        // Left edge strip
         self.fill_rect(
             Pixel::new(top_left.x, top_left.y + radius),
-            width,
-            height - radius * 2,
+            radius,
+            core_h,
+            color,
+        );
+        // Right edge strip
+        self.fill_rect(
+            Pixel::new(top_left.x + width - radius, top_left.y + radius),
+            radius,
+            core_h,
             color,
         );
 
