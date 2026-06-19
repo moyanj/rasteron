@@ -2,6 +2,8 @@ use crate::color::Color;
 use crate::framebuffer::{FramebufferInfo, PixelFormat};
 use crate::pixel::Pixel;
 use crate::utils::{clip_line, saturating_usize_to_i64};
+#[cfg(feature = "simd")]
+use crate::simd;
 extern crate alloc;
 use alloc::vec::Vec;
 
@@ -194,8 +196,14 @@ impl<'a> Renderer<'a> {
             let copy_bytes = visible_cols * bpp;
             let src_start = row * src_pitch;
             let dst_offset = self.pixel_offset_unchecked(dst_x, dy);
-            self.current_buffer_mut()[dst_offset..dst_offset + copy_bytes]
-                .copy_from_slice(&src[src_start..src_start + copy_bytes]);
+            let dst_ptr = &mut self.current_buffer_mut()[dst_offset..dst_offset + copy_bytes];
+            let src_ptr = &src[src_start..src_start + copy_bytes];
+            #[cfg(feature = "simd")]
+            unsafe {
+                simd::memcpy(dst_ptr.as_mut_ptr(), src_ptr.as_ptr(), copy_bytes);
+            }
+            #[cfg(not(feature = "simd"))]
+            dst_ptr.copy_from_slice(src_ptr);
         }
     }
 
@@ -432,6 +440,9 @@ impl<'a> Renderer<'a> {
             let row_ptr = unsafe { base_ptr.add(y * pitch) };
 
             unsafe {
+                #[cfg(feature = "simd")]
+                simd::memcpy(row_ptr, pattern.as_ptr(), pixel_size);
+                #[cfg(not(feature = "simd"))]
                 core::ptr::copy_nonoverlapping(pattern.as_ptr(), row_ptr, pixel_size);
             }
             let row = unsafe { core::slice::from_raw_parts_mut(row_ptr, row_len) };
@@ -446,6 +457,9 @@ impl<'a> Renderer<'a> {
         while filled < len {
             let copy_len = core::cmp::min(filled, len - filled);
             unsafe {
+                #[cfg(feature = "simd")]
+                simd::memcpy(base.add(filled), base, copy_len);
+                #[cfg(not(feature = "simd"))]
                 core::ptr::copy_nonoverlapping(base, base.add(filled), copy_len);
             }
             filled += copy_len;
