@@ -21,6 +21,7 @@
 //! |------|------|
 //! | `double_buffer` | 分配后台缓冲区，调用 [`Renderer::swap_buffers`] 交换到前台。 |
 //! | `programmable`  | 启用完整的 2D 可编程管线。 |
+//! | `simd`          | 启用 SIMD 优化，提升内存操作性能。支持 AVX-512、AVX2、SSE2、NEON 和 RISC-V 向量扩展。 |
 //!
 //! # 可编程管线示例
 //!
@@ -76,6 +77,5 @@ pub mod simd;
 mod utils;
 #[cfg(feature = "programmable")]
 pub mod programmable;
-pub mod vertex;
 pub use core::Renderer;
 pub use pixel::Pixel;
