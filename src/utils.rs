@@ -22,8 +22,14 @@ pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(P
         code
     }
 
-    let (mut x1, mut y1) = (p1.x as i64, p1.y as i64);
-    let (mut x2, mut y2) = (p2.x as i64, p2.y as i64);
+    let (mut x1, mut y1) = (
+        saturating_usize_to_i64(p1.x),
+        saturating_usize_to_i64(p1.y),
+    );
+    let (mut x2, mut y2) = (
+        saturating_usize_to_i64(p2.x),
+        saturating_usize_to_i64(p2.y),
+    );
     let mut code1 = compute_code(x1, y1, width, height);
     let mut code2 = compute_code(x2, y2, width, height);
 
@@ -74,4 +80,9 @@ pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(P
             code2 = compute_code(x2, y2, width, height);
         }
     }
+}
+
+#[inline(always)]
+pub(crate) fn saturating_usize_to_i64(value: usize) -> i64 {
+    value.min(i64::MAX as usize) as i64
 }

@@ -10,7 +10,7 @@ fn main() {
     let width = 1280usize;
     let height = 720usize;
     let pitch = width * 3;
-    let info = FramebufferInfo::new(width, height, pitch, 24, PixelFormat::Bgr24);
+    let info = FramebufferInfo::new(width, height, pitch, PixelFormat::Bgr24);
     let mut front_buffer = vec![0u8; info.buffer_size()];
     let mut renderer = Renderer::new(info, &mut front_buffer);
 

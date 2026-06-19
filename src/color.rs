@@ -17,36 +17,43 @@ impl Color {
         Self { r, g, b, a }
     }
 
-    pub fn from_hex(hex: &str) -> Self {
+    pub fn from_hex(hex: &str) -> Result<Self, ColorParseError> {
         let hex = hex.trim_start_matches('#');
-        let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
-        let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(255);
-        let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(255);
+
+        if hex.len() != 6 && hex.len() != 8 {
+            return Err(ColorParseError::InvalidLength);
+        }
+
+        fn parse_channel(hex: &str) -> Result<u8, ColorParseError> {
+            u8::from_str_radix(hex, 16).map_err(|_| ColorParseError::InvalidDigit)
+        }
+
+        let r = parse_channel(&hex[0..2])?;
+        let g = parse_channel(&hex[2..4])?;
+        let b = parse_channel(&hex[4..6])?;
 
         if hex.len() == 8 {
-            let a = u8::from_str_radix(&hex[6..8], 16).unwrap_or(255);
-            Self::with_alpha(r, g, b, a)
+            let a = parse_channel(&hex[6..8])?;
+            Ok(Self::with_alpha(r, g, b, a))
         } else {
-            Self::new(r, g, b)
+            Ok(Self::new(r, g, b))
         }
     }
 
-    pub fn to_u32(&self, include_alpha: bool) -> u32 {
+    pub fn to_rgba_u32(&self) -> u32 {
         let r = self.r as u32;
         let g = self.g as u32;
         let b = self.b as u32;
-        if include_alpha {
-            let a = self.a as u32;
-            return (a << 24) | (r << 16) | (g << 8) | b;
-        }
-        (r << 24) | (g << 16) | (b << 8)
+        let a = self.a as u32;
+        (r << 24) | (g << 16) | (b << 8) | a
     }
 
-    pub fn from_u32(color: u32) -> Self {
-        let r = (color >> 24) & 0xFF;
-        let g = (color >> 16) & 0xFF;
-        let b = (color >> 8) & 0xFF;
-        Self::new(r as u8, g as u8, b as u8)
+    pub fn from_rgba_u32(color: u32) -> Self {
+        let r = ((color >> 24) & 0xFF) as u8;
+        let g = ((color >> 16) & 0xFF) as u8;
+        let b = ((color >> 8) & 0xFF) as u8;
+        let a = (color & 0xFF) as u8;
+        Self::with_alpha(r, g, b, a)
     }
 
     #[inline(always)]
@@ -106,6 +113,12 @@ impl Color {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorParseError {
+    InvalidLength,
+    InvalidDigit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     Rgb24,
     Bgr24,
@@ -156,6 +169,10 @@ impl PixelFormat {
             | PixelFormat::Bgra8888 => 4,
         }
     }
+
+    pub const fn bits_per_pixel(self) -> usize {
+        self.bytes_per_pixel() * 8
+    }
 }
 
 #[macro_export]
@@ -172,7 +189,7 @@ macro_rules! color {
 
     // 十六进制颜色码 (支持 #RRGGBB 和 #RRGGBBAA)
     (#$hex:expr) => {
-        Color::from_hex($hex)
+        Color::from_hex($hex).expect("invalid hex color literal")
     };
 }
 
@@ -191,7 +208,38 @@ pub const GRAY: Color = color!(128, 128, 128);
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, PixelFormat};
+    use super::{Color, ColorParseError, PixelFormat};
+
+    #[test]
+    fn from_hex_parses_rgb_and_defaults_alpha_to_opaque() {
+        assert_eq!(Color::from_hex("#123456"), Ok(Color::new(0x12, 0x34, 0x56)));
+    }
+
+    #[test]
+    fn from_hex_parses_rgba() {
+        assert_eq!(
+            Color::from_hex("#12345678"),
+            Ok(Color::with_alpha(0x12, 0x34, 0x56, 0x78))
+        );
+    }
+
+    #[test]
+    fn from_hex_rejects_invalid_length() {
+        assert_eq!(Color::from_hex("#12345"), Err(ColorParseError::InvalidLength));
+    }
+
+    #[test]
+    fn from_hex_rejects_invalid_digits() {
+        assert_eq!(Color::from_hex("#12GG56"), Err(ColorParseError::InvalidDigit));
+    }
+
+    #[test]
+    fn rgba_u32_roundtrip_preserves_alpha() {
+        let color = Color::with_alpha(0x12, 0x34, 0x56, 0x78);
+
+        assert_eq!(color.to_rgba_u32(), 0x12345678);
+        assert_eq!(Color::from_rgba_u32(0x12345678), color);
+    }
 
     #[test]
     fn rgb24_roundtrip_preserves_rgb() {

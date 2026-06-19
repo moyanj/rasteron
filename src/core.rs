@@ -1,7 +1,7 @@
 use crate::color::Color;
 use crate::framebuffer::FramebufferInfo;
 use crate::pixel::Pixel;
-use crate::utils::clip_line;
+use crate::utils::{clip_line, saturating_usize_to_i64};
 extern crate alloc;
 use alloc::vec::Vec;
 
@@ -44,39 +44,77 @@ impl<'a> Renderer<'a> {
 
     #[inline(always)]
     pub fn pixel_size(&self) -> u16 {
-        self.info.bpp / 8
+        self.info.bytes_per_pixel() as u16
     }
 
     #[inline(always)]
     pub fn pixel_offset(&self, x: usize, y: usize) -> usize {
-        y * self.info.pitch + x * self.pixel_size() as usize
+        self.pixel_offset_unchecked(x, y)
+    }
+
+    #[inline(always)]
+    fn pixel_offset_unchecked(&self, x: usize, y: usize) -> usize {
+        y * self.info.pitch + x * self.info.bytes_per_pixel()
+    }
+
+    #[inline(always)]
+    fn try_pixel_offset_i64(&self, x: i64, y: i64) -> Option<usize> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+
+        let (x, y) = (x as usize, y as usize);
+        if x >= self.info.width || y >= self.info.height {
+            return None;
+        }
+
+        Some(self.pixel_offset_unchecked(x, y))
+    }
+
+    #[inline(always)]
+    fn write_color_at_offset(&mut self, offset: usize, color: &Color) {
+        if color.a == 0 {
+            return;
+        }
+
+        let format = self.info.format;
+        let pixel_size = format.bytes_per_pixel();
+        let bytes = if color.a == 255 {
+            color.to_bytes(format)
+        } else {
+            let target = self.current_buffer_mut();
+            let dst = &mut target[offset..offset + pixel_size];
+            let existing_color = Color::from_bytes(format, dst);
+            color.mix(&existing_color, color.a).to_bytes(format)
+        };
+
+        let target = self.current_buffer_mut();
+        target[offset..offset + pixel_size].copy_from_slice(&bytes[..pixel_size]);
+    }
+
+    #[inline(always)]
+    fn write_color_if_visible_i64(&mut self, x: i64, y: i64, color: &Color) {
+        if let Some(offset) = self.try_pixel_offset_i64(x, y) {
+            self.write_color_at_offset(offset, color);
+        }
+    }
+
+    #[inline(always)]
+    fn interpolate_scan_x(base_x: i64, delta_x: i64, delta_y: i64, offset_y: i64) -> i64 {
+        if delta_y == 0 {
+            return base_x;
+        }
+
+        let value = base_x as i128
+            + ((delta_x as i128 * offset_y as i128) + (delta_y as i128 / 2)) / delta_y as i128;
+
+        value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
     /// 绘制一个像素
     pub unsafe fn set_pixel_unchecked(&mut self, x: usize, y: usize, color: &Color) {
-        if color.a == 0 {
-            // 完全透明，跳过绘制
-            return;
-        }
-        let format = self.info.format;
-        let pixel_size = format.bytes_per_pixel();
         let offset = self.pixel_offset(x, y);
-
-        let bytes = if color.a == 255 {
-            color.to_bytes(format)
-        } else {
-            // 半透明，进行 alpha 混合
-            let target = self.current_buffer_mut();
-            let dst = &mut target[offset..offset + pixel_size];
-            let existing_color = Color::from_bytes(format, dst);
-            let blended = color.mix(&existing_color, color.a);
-            blended.to_bytes(format)
-        };
-
-        unsafe {
-            let dst_ptr = self.back_buffer.as_mut_ptr().add(offset);
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst_ptr, pixel_size);
-        }
+        self.write_color_at_offset(offset, color);
     }
 
     #[inline(always)]
@@ -181,8 +219,8 @@ impl<'a> Renderer<'a> {
     ///
     /// 调用方必须保证 renderer 绑定的 framebuffer 有效。
     pub unsafe fn draw_line_unchecked(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
-        let (mut x1, mut y1) = (p1.x as i64, p1.y as i64);
-        let (mut x2, mut y2) = (p2.x as i64, p2.y as i64);
+        let (mut x1, mut y1) = (saturating_usize_to_i64(p1.x), saturating_usize_to_i64(p1.y));
+        let (mut x2, mut y2) = (saturating_usize_to_i64(p2.x), saturating_usize_to_i64(p2.y));
         let dx_abs = (x2 - x1).unsigned_abs();
         let dy_abs = (y2 - y1).unsigned_abs();
         let steep = dy_abs > dx_abs;
@@ -201,13 +239,7 @@ impl<'a> Renderer<'a> {
         let mut y = y1;
         for x in x1..=x2 {
             let (px, py) = if steep { (y, x) } else { (x, y) };
-            if px >= 0
-                && py >= 0
-                && (px as usize) < self.info.width
-                && (py as usize) < self.info.height
-            {
-                unsafe { self.set_pixel_unchecked(px as usize, py as usize, color) };
-            }
+            self.write_color_if_visible_i64(px, py, color);
             error -= dy as i64;
             if error < 0 {
                 y += y_step;
@@ -248,20 +280,29 @@ impl<'a> Renderer<'a> {
             pts.swap(0, 1);
         }
 
-        let (x1, y1) = (pts[0].x as i32, pts[0].y as i32);
-        let (x2, y2) = (pts[1].x as i32, pts[1].y as i32);
-        let (x3, y3) = (pts[2].x as i32, pts[2].y as i32);
+        let (x1, y1) = (
+            saturating_usize_to_i64(pts[0].x),
+            saturating_usize_to_i64(pts[0].y),
+        );
+        let (x2, y2) = (
+            saturating_usize_to_i64(pts[1].x),
+            saturating_usize_to_i64(pts[1].y),
+        );
+        let (x3, y3) = (
+            saturating_usize_to_i64(pts[2].x),
+            saturating_usize_to_i64(pts[2].y),
+        );
 
         // 如果三个点的 Y 坐标相同，不绘制
         if y1 == y3 {
             return;
         }
 
-        let width = self.info.width as i32;
-        let height = self.info.height as i32;
+        let width = self.info.width as i64;
+        let height = self.info.height as i64;
 
         // 水平线填充闭包
-        let mut fill_h_line = |start_x: i32, end_x: i32, y: i32| {
+        let mut fill_h_line = |start_x: i64, end_x: i64, y: i64| {
             if y < 0 || y >= height {
                 return;
             }
@@ -271,48 +312,31 @@ impl<'a> Renderer<'a> {
                 core::mem::swap(&mut sx, &mut ex);
             }
             for x in sx..=ex {
-                // SAFETY: sx/ex 已被裁剪到 [0, width-1]，y 已检查在 [0, height-1] 内
-                unsafe { self.set_pixel_unchecked(x as usize, y as usize, color) };
+                self.write_color_if_visible_i64(x, y, color);
             }
         };
 
-        let long_dx = (x3 - x1) as i64;
-        let long_dy = (y3 - y1) as i64;
+        let long_dx = x3 - x1;
+        let long_dy = y3 - y1;
 
         // 上半部分三角形 (p1 -> p2)
-        let upper_dx = (x2 - x1) as i64;
-        let upper_dy = (y2 - y1) as i64;
+        let upper_dx = x2 - x1;
+        let upper_dy = y2 - y1;
         for y in y1..=y2 {
-            let dy = (y - y1) as i64;
-            let x_long = if long_dy != 0 {
-                (x1 as i64 + (long_dx * dy + long_dy / 2) / long_dy) as i32
-            } else {
-                x1
-            };
-            let x_upper = if upper_dy != 0 {
-                (x1 as i64 + (upper_dx * dy + upper_dy / 2) / upper_dy) as i32
-            } else {
-                x1
-            };
+            let dy = y - y1;
+            let x_long = Self::interpolate_scan_x(x1, long_dx, long_dy, dy);
+            let x_upper = Self::interpolate_scan_x(x1, upper_dx, upper_dy, dy);
             fill_h_line(x_long, x_upper, y);
         }
 
         // 下半部分三角形 (p2 -> p3)
-        let lower_dx = (x3 - x2) as i64;
-        let lower_dy = (y3 - y2) as i64;
+        let lower_dx = x3 - x2;
+        let lower_dy = y3 - y2;
         for y in y2..=y3 {
-            let dy_long = (y - y1) as i64;
-            let dy_lower = (y - y2) as i64;
-            let x_long = if long_dy != 0 {
-                (x1 as i64 + (long_dx * dy_long + long_dy / 2) / long_dy) as i32
-            } else {
-                x1
-            };
-            let x_lower = if lower_dy != 0 {
-                (x2 as i64 + (lower_dx * dy_lower + lower_dy / 2) / lower_dy) as i32
-            } else {
-                x2
-            };
+            let dy_long = y - y1;
+            let dy_lower = y - y2;
+            let x_long = Self::interpolate_scan_x(x1, long_dx, long_dy, dy_long);
+            let x_lower = Self::interpolate_scan_x(x2, lower_dx, lower_dy, dy_lower);
             fill_h_line(x_long, x_lower, y);
         }
     }
@@ -321,8 +345,8 @@ impl<'a> Renderer<'a> {
     #[inline]
     pub fn draw_rect(&mut self, top_left: Pixel, width: usize, height: usize, color: &Color) {
         let (x, y) = top_left.to_coord();
-        let x2 = x + width;
-        let y2 = y + height;
+        let x2 = x.saturating_add(width);
+        let y2 = y.saturating_add(height);
         self.draw_line(Pixel::new(x, y), Pixel::new(x2, y), color);
         self.draw_line(Pixel::new(x2, y), Pixel::new(x2, y2), color);
         self.draw_line(Pixel::new(x2, y2), Pixel::new(x, y2), color);
@@ -335,8 +359,8 @@ impl<'a> Renderer<'a> {
     #[inline]
     pub fn fill_rect(&mut self, top_left: Pixel, width: usize, height: usize, color: Color) {
         let (x_min, y_min) = top_left.to_coord();
-        let x_max = (x_min + width).min(self.info.width);
-        let y_max = (y_min + height).min(self.info.height);
+        let x_max = x_min.saturating_add(width).min(self.info.width);
+        let y_max = y_min.saturating_add(height).min(self.info.height);
         let x_start = x_min;
         let y_start = y_min;
 
@@ -362,7 +386,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// Draw circle
-    pub fn draw_circle(&mut self, center: Pixel, radius: u64, color: &Color) {
+    pub fn draw_circle(&mut self, center: Pixel, radius: usize, color: &Color) {
         if radius == 0 {
             return;
         }
@@ -371,17 +395,25 @@ impl<'a> Renderer<'a> {
         let mut x = 0i64;
         let mut y = radius as i64;
         let mut d = 3 - 2 * radius as i64;
+        let cx = saturating_usize_to_i64(cx);
+        let cy = saturating_usize_to_i64(cy);
 
         while x <= y {
             // Draw 8 symmetric points
-            self.set_pixel((cx as i64 + x) as usize, (cy as i64 + y) as usize, color);
-            self.set_pixel((cx as i64 + x) as usize, (cy as i64 - y) as usize, color);
-            self.set_pixel((cx as i64 - x) as usize, (cy as i64 + y) as usize, color);
-            self.set_pixel((cx as i64 - x) as usize, (cy as i64 - y) as usize, color);
-            self.set_pixel((cx as i64 + y) as usize, (cy as i64 + x) as usize, color);
-            self.set_pixel((cx as i64 + y) as usize, (cy as i64 - x) as usize, color);
-            self.set_pixel((cx as i64 - y) as usize, (cy as i64 + x) as usize, color);
-            self.set_pixel((cx as i64 - y) as usize, (cy as i64 - x) as usize, color);
+            for (px, py) in [
+                (cx + x, cy + y),
+                (cx + x, cy - y),
+                (cx - x, cy + y),
+                (cx - x, cy - y),
+                (cx + y, cy + x),
+                (cx + y, cy - x),
+                (cx - y, cy + x),
+                (cx - y, cy - x),
+            ] {
+                if px >= 0 && py >= 0 {
+                    self.set_pixel(px as usize, py as usize, color);
+                }
+            }
 
             if d < 0 {
                 d = d + 4 * x + 6;
@@ -413,7 +445,7 @@ mod tests {
 
     #[test]
     fn set_pixel_uses_bgr24_format() {
-        let info = FramebufferInfo::new(2, 1, 6, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(2, 1, 6, PixelFormat::Bgr24);
         let mut front = [0u8; 6];
         let mut renderer = Renderer::new(info, &mut front);
 
@@ -424,7 +456,7 @@ mod tests {
 
     #[test]
     fn set_pixel_uses_rgba8888_format() {
-        let info = FramebufferInfo::new(1, 1, 4, 32, PixelFormat::Rgba8888);
+        let info = FramebufferInfo::new(1, 1, 4, PixelFormat::Rgba8888);
         let mut front = [0u8; 4];
         let mut renderer = Renderer::new(info, &mut front);
 
@@ -435,7 +467,7 @@ mod tests {
 
     #[test]
     fn set_pixel_alpha_blends_into_bgr24_buffer() {
-        let info = FramebufferInfo::new(1, 1, 3, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(1, 1, 3, PixelFormat::Bgr24);
         let mut front = [0u8; 3];
         let mut renderer = Renderer::new(info, &mut front);
 
@@ -447,7 +479,7 @@ mod tests {
 
     #[test]
     fn set_pixel_alpha_blends_into_rgba8888_buffer() {
-        let info = FramebufferInfo::new(1, 1, 4, 32, PixelFormat::Rgba8888);
+        let info = FramebufferInfo::new(1, 1, 4, PixelFormat::Rgba8888);
         let mut front = [0u8; 4];
         let mut renderer = Renderer::new(info, &mut front);
 
@@ -459,7 +491,7 @@ mod tests {
 
     #[test]
     fn set_pixel_uses_shift_based_xrgb8888_layout() {
-        let info = FramebufferInfo::new(1, 1, 4, 32, PixelFormat::Xrgb8888);
+        let info = FramebufferInfo::new(1, 1, 4, PixelFormat::Xrgb8888);
         let mut front = [0u8; 4];
         let mut renderer = Renderer::new(info, &mut front);
 
@@ -470,7 +502,7 @@ mod tests {
 
     #[test]
     fn clear_fills_bgr24_rows() {
-        let info = FramebufferInfo::new(2, 2, 6, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(2, 2, 6, PixelFormat::Bgr24);
         let mut front = [0u8; 12];
         let mut renderer = Renderer::new(info, &mut front);
 
@@ -486,7 +518,7 @@ mod tests {
 
     #[test]
     fn clear_respects_pitch_padding() {
-        let info = FramebufferInfo::new(2, 1, 8, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(2, 1, 8, PixelFormat::Bgr24);
         let mut front = [0u8; 8];
         let mut renderer = Renderer::new(info, &mut front);
 
@@ -500,7 +532,7 @@ mod tests {
 
     #[test]
     fn pixel_api_wraps_coordinate_api() {
-        let info = FramebufferInfo::new(2, 1, 6, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(2, 1, 6, PixelFormat::Bgr24);
         let mut front = [0u8; 6];
         let mut renderer = Renderer::new(info, &mut front);
         let pixel = Pixel::new(1, 0);
@@ -515,7 +547,7 @@ mod tests {
 
     #[test]
     fn draw_line_renders_diagonal() {
-        let info = FramebufferInfo::new(3, 3, 9, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(3, 3, 9, PixelFormat::Bgr24);
         let mut front = [0u8; 27];
         let mut renderer = Renderer::new(info, &mut front);
 
@@ -535,11 +567,11 @@ mod tests {
         let mut front_safe = [0u8; 48];
         let mut front_unchecked = [0u8; 48];
         let mut safe = Renderer::new(
-            FramebufferInfo::new(4, 4, 12, 24, PixelFormat::Bgr24),
+            FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24),
             &mut front_safe,
         );
         let mut unchecked = Renderer::new(
-            FramebufferInfo::new(4, 4, 12, 24, PixelFormat::Bgr24),
+            FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24),
             &mut front_unchecked,
         );
         let start = Pixel::new(0, 1);
@@ -554,7 +586,7 @@ mod tests {
 
     #[test]
     fn draw_line_clips_right_edge() {
-        let info = FramebufferInfo::new(4, 2, 12, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(4, 2, 12, PixelFormat::Bgr24);
         let mut front = [0u8; 24];
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0x12, 0x34, 0x56);
@@ -569,7 +601,7 @@ mod tests {
 
     #[test]
     fn draw_line_preserves_bresenham_coverage_when_end_is_below_screen() {
-        let info = FramebufferInfo::new(4, 4, 12, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
         let mut front = [0u8; 48];
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0x12, 0x34, 0x56);
@@ -585,7 +617,7 @@ mod tests {
 
     #[test]
     fn draw_triangle_renders_outline() {
-        let info = FramebufferInfo::new(4, 4, 12, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
         let mut front = [0u8; 48];
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0xFF, 0x00, 0x00);
@@ -602,7 +634,7 @@ mod tests {
 
     #[test]
     fn fill_triangle_fills_interior() {
-        let info = FramebufferInfo::new(5, 5, 15, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(5, 5, 15, PixelFormat::Bgr24);
         let mut front = [0u8; 75];
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0x00, 0xFF, 0x00);
@@ -622,7 +654,7 @@ mod tests {
 
     #[test]
     fn draw_rect_renders_outline() {
-        let info = FramebufferInfo::new(5, 5, 15, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(5, 5, 15, PixelFormat::Bgr24);
         let mut front = [0u8; 75];
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0x00, 0x00, 0xFF);
@@ -653,7 +685,7 @@ mod tests {
 
     #[test]
     fn fill_rect_fills_interior() {
-        let info = FramebufferInfo::new(4, 4, 12, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
         let mut front = [0u8; 48];
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0xFF, 0xFF, 0x00);
@@ -673,7 +705,7 @@ mod tests {
 
     #[test]
     fn fill_rect_clips_to_bounds() {
-        let info = FramebufferInfo::new(4, 4, 12, 24, PixelFormat::Bgr24);
+        let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
         let mut front = [0u8; 48];
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0xFF, 0x00, 0xFF);
@@ -688,5 +720,53 @@ mod tests {
         assert_eq!(renderer.get_pixel(3, 3), Some(color));
         // 不可见部分保持黑色
         assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn fill_rect_saturates_large_dimensions() {
+        let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 48];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(0xAA, 0xBB, 0xCC);
+
+        renderer.fill_rect(Pixel::new(3, 3), usize::MAX, usize::MAX, color);
+
+        assert_eq!(renderer.get_pixel(3, 3), Some(color));
+        assert_eq!(renderer.get_pixel(2, 3), Some(Color::new(0, 0, 0)));
+        assert_eq!(renderer.get_pixel(3, 2), Some(Color::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn draw_circle_clips_points_with_negative_intermediates() {
+        let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 48];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(0x12, 0x34, 0x56);
+
+        renderer.draw_circle(Pixel::new(0, 0), 2usize, &color);
+
+        assert_eq!(renderer.get_pixel(0, 2), Some(color));
+        assert_eq!(renderer.get_pixel(2, 0), Some(color));
+        assert_eq!(renderer.get_pixel(3, 3), Some(Color::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn fill_triangle_handles_large_usize_vertices_without_i32_narrowing() {
+        let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 48];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(0x66, 0x77, 0x88);
+        let huge = usize::MAX;
+
+        renderer.fill_triangle(
+            Pixel::new(1, 1),
+            Pixel::new(huge, 1),
+            Pixel::new(1, huge),
+            &color,
+        );
+
+        assert_eq!(renderer.get_pixel(1, 1), Some(color));
+        assert_eq!(renderer.get_pixel(2, 2), Some(color));
+        assert_eq!(renderer.get_pixel(3, 3), Some(Color::new(0, 0, 0)));
     }
 }

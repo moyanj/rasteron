@@ -24,7 +24,7 @@ fn make_renderer(
 ) -> (Renderer<'static>, Box<[u8]>) {
     let pixel_size = format.bytes_per_pixel();
     let pitch = width * pixel_size;
-    let info = FramebufferInfo::new(width, height, pitch, (pixel_size * 8) as u16, format);
+    let info = FramebufferInfo::new(width, height, pitch, format);
     let mut front = vec![0u8; info.buffer_size()].into_boxed_slice();
     let ptr = front.as_mut_ptr();
     let len = front.len();
