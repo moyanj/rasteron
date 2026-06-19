@@ -72,6 +72,15 @@ impl Interpolate for f32 {
     }
 }
 
+impl Interpolate for [f32; 2] {
+    fn interpolate(a: Self, b: Self, c: Self, w0: f32, w1: f32, w2: f32) -> Self {
+        [
+            a[0] * w0 + b[0] * w1 + c[0] * w2,
+            a[1] * w0 + b[1] * w1 + c[1] * w2,
+        ]
+    }
+}
+
 impl Interpolate for [f32; 4] {
     fn interpolate(a: Self, b: Self, c: Self, w0: f32, w1: f32, w2: f32) -> Self {
         [
@@ -304,15 +313,6 @@ mod tests {
             } else {
                 FragmentOutput::Color(Color::new(255, 255, 255))
             }
-        }
-    }
-
-    impl Interpolate for [f32; 2] {
-        fn interpolate(a: Self, b: Self, c: Self, w0: f32, w1: f32, w2: f32) -> Self {
-            [
-                a[0] * w0 + b[0] * w1 + c[0] * w2,
-                a[1] * w0 + b[1] * w1 + c[1] * w2,
-            ]
         }
     }
 
