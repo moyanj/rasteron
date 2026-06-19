@@ -15,7 +15,7 @@ fn main() {
     let mut renderer = Renderer::new(info, &mut front_buffer);
 
     renderer.clear(BLUE);
-    renderer.draw_line(pixel!(1, 0), pixel!(1000, 200), BLACK);
+    renderer.draw_line(pixel!(1, 0), pixel!(1000, 200), &BLACK);
 
     #[cfg(feature = "double_buffer")]
     renderer.swap_buffers();

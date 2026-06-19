@@ -53,7 +53,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// 绘制一个像素
-    pub unsafe fn set_pixel_unchecked(&mut self, x: usize, y: usize, color: Color) {
+    pub unsafe fn set_pixel_unchecked(&mut self, x: usize, y: usize, color: &Color) {
         if color.a == 0 {
             // 完全透明，跳过绘制
             return;
@@ -80,7 +80,7 @@ impl<'a> Renderer<'a> {
     }
 
     #[inline(always)]
-    pub fn set_pixel(&mut self, x: usize, y: usize, color: Color) {
+    pub fn set_pixel(&mut self, x: usize, y: usize, color: &Color) {
         if x >= self.info.width || y >= self.info.height {
             return;
         }
@@ -88,12 +88,12 @@ impl<'a> Renderer<'a> {
     }
 
     #[inline(always)]
-    pub unsafe fn set_pixel_at_unchecked(&mut self, pixel: Pixel, color: Color) {
+    pub unsafe fn set_pixel_at_unchecked(&mut self, pixel: Pixel, color: &Color) {
         unsafe { self.set_pixel_unchecked(pixel.x, pixel.y, color) };
     }
 
     #[inline(always)]
-    pub fn set_pixel_at(&mut self, pixel: Pixel, color: Color) {
+    pub fn set_pixel_at(&mut self, pixel: Pixel, color: &Color) {
         self.set_pixel(pixel.x, pixel.y, color);
     }
 
@@ -167,7 +167,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// Draw a line
-    pub fn draw_line(&mut self, p1: Pixel, p2: Pixel, color: Color) {
+    pub fn draw_line(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
         if clip_line(p1, p2, self.info.width, self.info.height).is_none() {
             return;
         }
@@ -180,7 +180,7 @@ impl<'a> Renderer<'a> {
     /// # Safety
     ///
     /// 调用方必须保证 renderer 绑定的 framebuffer 有效。
-    pub unsafe fn draw_line_unchecked(&mut self, p1: Pixel, p2: Pixel, color: Color) {
+    pub unsafe fn draw_line_unchecked(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
         let (mut x1, mut y1) = (p1.x as i64, p1.y as i64);
         let (mut x2, mut y2) = (p2.x as i64, p2.y as i64);
         let dx_abs = (x2 - x1).unsigned_abs();
@@ -225,7 +225,7 @@ impl<'a> Renderer<'a> {
 
     /// 绘制三角形轮廓
     #[inline]
-    pub fn draw_triangle(&mut self, p1: Pixel, p2: Pixel, p3: Pixel, color: Color) {
+    pub fn draw_triangle(&mut self, p1: Pixel, p2: Pixel, p3: Pixel, color: &Color) {
         self.draw_line(p1, p2, color);
         self.draw_line(p2, p3, color);
         self.draw_line(p3, p1, color);
@@ -235,7 +235,7 @@ impl<'a> Renderer<'a> {
     ///
     /// 使用重心坐标和扫描线填充，性能敏感场景下直接操作缓冲区。
     #[inline]
-    pub fn fill_triangle(&mut self, p1: Pixel, p2: Pixel, p3: Pixel, color: Color) {
+    pub fn fill_triangle(&mut self, p1: Pixel, p2: Pixel, p3: Pixel, color: &Color) {
         // 按 Y 坐标排序三个顶点
         let mut pts = [p1, p2, p3];
         if pts[0].y > pts[1].y {
@@ -319,7 +319,7 @@ impl<'a> Renderer<'a> {
 
     /// 绘制矩形轮廓
     #[inline]
-    pub fn draw_rect(&mut self, top_left: Pixel, width: usize, height: usize, color: Color) {
+    pub fn draw_rect(&mut self, top_left: Pixel, width: usize, height: usize, color: &Color) {
         let (x, y) = top_left.to_coord();
         let x2 = x + width;
         let y2 = y + height;
@@ -361,6 +361,38 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Draw circle
+    pub fn draw_circle(&mut self, center: Pixel, radius: u64, color: &Color) {
+        if radius == 0 {
+            return;
+        }
+
+        let (cx, cy) = center.to_coord();
+        let mut x = 0i64;
+        let mut y = radius as i64;
+        let mut d = 3 - 2 * radius as i64;
+
+        while x <= y {
+            // Draw 8 symmetric points
+            self.set_pixel((cx as i64 + x) as usize, (cy as i64 + y) as usize, color);
+            self.set_pixel((cx as i64 + x) as usize, (cy as i64 - y) as usize, color);
+            self.set_pixel((cx as i64 - x) as usize, (cy as i64 + y) as usize, color);
+            self.set_pixel((cx as i64 - x) as usize, (cy as i64 - y) as usize, color);
+            self.set_pixel((cx as i64 + y) as usize, (cy as i64 + x) as usize, color);
+            self.set_pixel((cx as i64 + y) as usize, (cy as i64 - x) as usize, color);
+            self.set_pixel((cx as i64 - y) as usize, (cy as i64 + x) as usize, color);
+            self.set_pixel((cx as i64 - y) as usize, (cy as i64 - x) as usize, color);
+
+            if d < 0 {
+                d = d + 4 * x + 6;
+            } else {
+                d = d + 4 * (x - y) + 10;
+                y -= 1;
+            }
+            x += 1;
+        }
+    }
+
     /// 可选：绘制大批量像素时，直接获取当前缓冲区指针，减少调用开销
     #[inline(always)]
     pub fn buffer_mut(&mut self) -> &mut [u8] {
@@ -385,7 +417,7 @@ mod tests {
         let mut front = [0u8; 6];
         let mut renderer = Renderer::new(info, &mut front);
 
-        renderer.set_pixel(1, 0, Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
+        renderer.set_pixel(1, 0, &Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
 
         assert_eq!(&renderer.buffer_mut()[3..6], &[0x56, 0x34, 0x12]);
     }
@@ -396,7 +428,7 @@ mod tests {
         let mut front = [0u8; 4];
         let mut renderer = Renderer::new(info, &mut front);
 
-        renderer.set_pixel(0, 0, Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
+        renderer.set_pixel(0, 0, &Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
 
         assert_eq!(&renderer.buffer_mut()[..4], &[0x12, 0x34, 0x56, 0xFF]);
     }
@@ -407,8 +439,8 @@ mod tests {
         let mut front = [0u8; 3];
         let mut renderer = Renderer::new(info, &mut front);
 
-        renderer.set_pixel(0, 0, Color::new(10, 20, 30));
-        renderer.set_pixel(0, 0, Color::with_alpha(110, 120, 130, 128));
+        renderer.set_pixel(0, 0, &Color::new(10, 20, 30));
+        renderer.set_pixel(0, 0, &Color::with_alpha(110, 120, 130, 128));
 
         assert_eq!(&renderer.buffer_mut()[..3], &[80, 70, 60]);
     }
@@ -419,8 +451,8 @@ mod tests {
         let mut front = [0u8; 4];
         let mut renderer = Renderer::new(info, &mut front);
 
-        renderer.set_pixel(0, 0, Color::with_alpha(20, 40, 60, 255));
-        renderer.set_pixel(0, 0, Color::with_alpha(120, 140, 160, 128));
+        renderer.set_pixel(0, 0, &Color::with_alpha(20, 40, 60, 255));
+        renderer.set_pixel(0, 0, &Color::with_alpha(120, 140, 160, 128));
 
         assert_eq!(&renderer.buffer_mut()[..4], &[70, 90, 110, 255]);
     }
@@ -431,7 +463,7 @@ mod tests {
         let mut front = [0u8; 4];
         let mut renderer = Renderer::new(info, &mut front);
 
-        renderer.set_pixel(0, 0, Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
+        renderer.set_pixel(0, 0, &Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
 
         assert_eq!(&renderer.buffer_mut()[..4], &[0x56, 0x34, 0x12, 0x00]);
     }
@@ -473,7 +505,7 @@ mod tests {
         let mut renderer = Renderer::new(info, &mut front);
         let pixel = Pixel::new(1, 0);
 
-        renderer.set_pixel_at(pixel, Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
+        renderer.set_pixel_at(pixel, &Color::with_alpha(0x12, 0x34, 0x56, 0xFF));
 
         assert_eq!(
             renderer.get_pixel_at(pixel),
@@ -490,7 +522,7 @@ mod tests {
         renderer.draw_line(
             Pixel::new(0, 0),
             Pixel::new(2, 2),
-            Color::new(0x12, 0x34, 0x56),
+            &Color::new(0x12, 0x34, 0x56),
         );
 
         assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0x12, 0x34, 0x56)));
@@ -514,8 +546,8 @@ mod tests {
         let end = Pixel::new(3, 2);
         let color = Color::new(0x12, 0x34, 0x56);
 
-        safe.draw_line(start, end, color);
-        unsafe { unchecked.draw_line_unchecked(start, end, color) };
+        safe.draw_line(start, end, &color);
+        unsafe { unchecked.draw_line_unchecked(start, end, &color) };
 
         assert_eq!(safe.buffer_mut(), unchecked.buffer_mut());
     }
@@ -527,7 +559,7 @@ mod tests {
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0x12, 0x34, 0x56);
 
-        renderer.draw_line(Pixel::new(2, 0), Pixel::new(6, 0), color);
+        renderer.draw_line(Pixel::new(2, 0), Pixel::new(6, 0), &color);
 
         assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0, 0, 0)));
         assert_eq!(renderer.get_pixel(1, 0), Some(Color::new(0, 0, 0)));
@@ -542,7 +574,7 @@ mod tests {
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0x12, 0x34, 0x56);
 
-        renderer.draw_line(Pixel::new(0, 0), Pixel::new(1, 4), color);
+        renderer.draw_line(Pixel::new(0, 0), Pixel::new(1, 4), &color);
 
         assert_eq!(renderer.get_pixel(0, 0), Some(color));
         assert_eq!(renderer.get_pixel(0, 1), Some(color));
@@ -558,7 +590,7 @@ mod tests {
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0xFF, 0x00, 0x00);
 
-        renderer.draw_triangle(Pixel::new(0, 0), Pixel::new(3, 0), Pixel::new(1, 3), color);
+        renderer.draw_triangle(Pixel::new(0, 0), Pixel::new(3, 0), Pixel::new(1, 3), &color);
 
         // 验证三条边都被绘制
         assert_eq!(renderer.get_pixel(0, 0), Some(color));
@@ -576,7 +608,7 @@ mod tests {
         let color = Color::new(0x00, 0xFF, 0x00);
 
         // 等边三角形
-        renderer.fill_triangle(Pixel::new(2, 0), Pixel::new(0, 4), Pixel::new(4, 4), color);
+        renderer.fill_triangle(Pixel::new(2, 0), Pixel::new(0, 4), Pixel::new(4, 4), &color);
 
         // 验证顶点被填充
         assert_eq!(renderer.get_pixel(2, 0), Some(color));
@@ -595,7 +627,7 @@ mod tests {
         let mut renderer = Renderer::new(info, &mut front);
         let color = Color::new(0x00, 0x00, 0xFF);
 
-        renderer.draw_rect(Pixel::new(0, 0), 3, 3, color);
+        renderer.draw_rect(Pixel::new(0, 0), 3, 3, &color);
 
         // 验证四条边
         // 上边: (0,0) -> (3,0)

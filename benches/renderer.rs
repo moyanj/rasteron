@@ -48,7 +48,7 @@ fn bench_set_pixel_opaque(c: &mut Criterion) {
                     renderer.set_pixel(
                         black_box(x),
                         black_box(y),
-                        black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                        black_box(&Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
                     );
                     x += 1;
                     if x == 640 {
@@ -78,7 +78,7 @@ fn bench_set_pixel_alpha(c: &mut Criterion) {
                     renderer.set_pixel(
                         black_box(x),
                         black_box(y),
-                        black_box(Color::with_alpha(0x90, 0x70, 0x50, 0x80)),
+                        black_box(&Color::with_alpha(0x90, 0x70, 0x50, 0x80)),
                     );
                     x += 1;
                     if x == 640 {
@@ -114,7 +114,7 @@ fn bench_frame_gradient(c: &mut Criterion) {
                             let b = 255u8.saturating_sub(
                                 ((x + y) * 255 / ((width - 1) + (height - 1))) as u8,
                             );
-                            renderer.set_pixel(x, y, black_box(Color::with_alpha(r, g, b, 0xFF)));
+                            renderer.set_pixel(x, y, black_box(&Color::with_alpha(r, g, b, 0xFF)));
                         }
                     }
                 });
@@ -165,7 +165,7 @@ fn bench_draw_line(c: &mut Criterion) {
                         renderer.draw_line_unchecked(
                             black_box(start),
                             black_box(end),
-                            black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                            black_box(&Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
                         );
                     }
                     y = (y + 1) % (height - 16);
