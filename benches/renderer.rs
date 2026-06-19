@@ -322,6 +322,133 @@ fn bench_draw_circle(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_fill_circle(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("fill_circle");
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut radius = 8usize;
+                b.iter(|| {
+                    renderer.fill_circle(
+                        black_box(Pixel::new(width / 2, height / 2)),
+                        black_box(radius),
+                        black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
+                    radius = (radius + 4) % 128 + 8;
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_fill_rounded_rect(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("fill_rounded_rect");
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut x = 16usize;
+                b.iter(|| {
+                    renderer.fill_rounded_rect(
+                        black_box(Pixel::new(x, 32)),
+                        black_box(width - 48),
+                        black_box(96usize),
+                        black_box(16usize),
+                        black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
+                    x = (x + 32) % 128 + 16;
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_blit(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("blit");
+    group.throughput(Throughput::Elements(64 * 64));
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        let bpp = format.bytes_per_pixel();
+        let src_w = 64usize;
+        let src_h = 64usize;
+        let src_pitch = src_w * bpp;
+        let src = vec![0xABu8; src_pitch * src_h];
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut x = 0usize;
+                b.iter(|| {
+                    renderer.blit(
+                        black_box(Pixel::new(x, 32)),
+                        black_box(src_w),
+                        black_box(src_h),
+                        black_box(format),
+                        black_box(&src),
+                        black_box(src_pitch),
+                    );
+                    x = (x + 32) % (width - src_w - 16) + 8;
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_blit_mask(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("blit_mask");
+    group.throughput(Throughput::Elements(64 * 64));
+
+    for format in BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        let src_w = 64usize;
+        let src_h = 64usize;
+        let mask_pitch = src_w;
+        let mask = vec![128u8; mask_pitch * src_h];
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut x = 0usize;
+                b.iter(|| {
+                    renderer.blit_mask(
+                        black_box(Pixel::new(x, 32)),
+                        black_box(src_w),
+                        black_box(src_h),
+                        black_box(&mask),
+                        black_box(mask_pitch),
+                        black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
+                    x = (x + 32) % (width - src_w - 16) + 8;
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = criterion_config();
@@ -335,6 +462,10 @@ criterion_group!(
     bench_fill_triangle,
     bench_draw_rect,
     bench_fill_rect,
-    bench_draw_circle
+    bench_draw_circle,
+    bench_fill_circle,
+    bench_fill_rounded_rect,
+    bench_blit,
+    bench_blit_mask
 );
 criterion_main!(benches);

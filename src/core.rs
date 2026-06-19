@@ -1,5 +1,5 @@
 use crate::color::Color;
-use crate::framebuffer::FramebufferInfo;
+use crate::framebuffer::{FramebufferInfo, PixelFormat};
 use crate::pixel::Pixel;
 use crate::utils::{clip_line, saturating_usize_to_i64};
 extern crate alloc;
@@ -33,6 +33,21 @@ pub struct Renderer<'a> {
     front_buffer: &'a mut [u8],
     #[cfg(feature = "double_buffer")]
     back_buffer: Vec<u8>,
+}
+
+/// 整数平方根（牛顿法），用于纯整数圆弧计算。
+#[inline(always)]
+fn integer_sqrt(n: usize) -> usize {
+    if n <= 1 {
+        return n;
+    }
+    let mut x = n;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (y + n / y) / 2;
+    }
+    x
 }
 
 impl<'a> Renderer<'a> {
@@ -110,6 +125,12 @@ impl<'a> Renderer<'a> {
         Some(self.pixel_offset_unchecked(x, y))
     }
 
+    /// 检查像素 `(x, y)` 是否在帧缓冲可见区域内。
+    #[inline(always)]
+    fn pixel_visible(&self, x: usize, y: usize) -> bool {
+        x < self.info.width && y < self.info.height
+    }
+
     /// 在指定字节偏移处写入颜色（支持 Alpha 混合）。
     ///
     /// 如果 `color.a == 0`，直接返回，不执行任何写入。
@@ -121,7 +142,13 @@ impl<'a> Renderer<'a> {
 
         let format = self.info.format;
         let target = self.current_buffer_mut();
-        let dst = &mut target[offset..offset + format.bytes_per_pixel()];
+        let bpp = format.bytes_per_pixel();
+        debug_assert!(
+            offset + bpp <= target.len(),
+            "write_color_at_offset: offset {offset} + bpp {bpp} exceeds buffer length {}",
+            target.len()
+        );
+        let dst = &mut target[offset..offset + bpp];
         format.write_color(dst, color);
     }
 
@@ -130,6 +157,90 @@ impl<'a> Renderer<'a> {
     fn write_color_if_visible_i64(&mut self, x: i64, y: i64, color: &Color) {
         if let Some(offset) = self.try_pixel_offset_i64(x, y) {
             self.write_color_at_offset(offset, color);
+        }
+    }
+
+    /// 将同格式像素数据块 blit（原始拷贝）到渲染目标。
+    ///
+    /// `dst_top_left` 指定目标区域左上角，`src` 为源像素数据（格式必须与帧缓冲相同）。
+    /// 使用源数据的 pith（每行字节数）来正确换行。
+    /// 自动裁剪到帧缓冲可见区域。
+    ///
+    /// 当 `src_format` 与帧缓冲格式不匹配、`width`/`height` 为 0、或 `src` 切片长度
+    /// 不足以容纳 `pitch × height` 字节时，静默返回，不写入任何像素。
+    pub fn blit(
+        &mut self,
+        dst_top_left: Pixel,
+        width: usize,
+        height: usize,
+        src_format: PixelFormat,
+        src: &[u8],
+        src_pitch: usize,
+    ) {
+        if src_format != self.info.format || width == 0 || height == 0 {
+            return;
+        }
+        if src.len() < src_pitch.saturating_mul(height) {
+            return;
+        }
+        let bpp = self.info.format.bytes_per_pixel();
+        for row in 0..height {
+            let dy = dst_top_left.y + row;
+            if dy >= self.info.height {
+                break;
+            }
+            for col in 0..width {
+                let dx = dst_top_left.x + col;
+                if !self.pixel_visible(dx, dy) {
+                    continue;
+                }
+                let src_offset = row * src_pitch + col * bpp;
+                let dst_offset = self.pixel_offset_unchecked(dx, dy);
+                self.current_buffer_mut()[dst_offset..dst_offset + bpp]
+                    .copy_from_slice(&src[src_offset..src_offset + bpp]);
+            }
+        }
+    }
+
+    /// 使用 8bpp 的 mask 将指定颜色绘制到渲染目标。
+    ///
+    /// `mask` 中每个字节代表对应像素的不透明度（0=透明，255=完全不透明）。
+    /// 适用于文本渲染/精灵绘制的前置能力。
+    ///
+    /// 当 `width` 或 `height` 为 0，或 `mask` 切片长度不足时，静默返回。
+    pub fn blit_mask(
+        &mut self,
+        dst_top_left: Pixel,
+        width: usize,
+        height: usize,
+        mask: &[u8],
+        mask_pitch: usize,
+        color: Color,
+    ) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        if mask.len() < mask_pitch.saturating_mul(height) {
+            return;
+        }
+        for row in 0..height {
+            let dy = dst_top_left.y + row;
+            if dy >= self.info.height {
+                break;
+            }
+            for col in 0..width {
+                let dx = dst_top_left.x + col;
+                if !self.pixel_visible(dx, dy) {
+                    continue;
+                }
+                let alpha = mask[row * mask_pitch + col];
+                if alpha == 0 {
+                    continue;
+                }
+                let shaded = Color::with_alpha(color.r, color.g, color.b, alpha);
+                let offset = self.pixel_offset_unchecked(dx, dy);
+                self.write_color_at_offset(offset, &shaded);
+            }
         }
     }
 
@@ -154,6 +265,31 @@ impl<'a> Renderer<'a> {
             let copy_len = core::cmp::min(filled, row_len - filled);
             row.copy_within(0..copy_len, filled);
             filled += copy_len;
+        }
+    }
+
+    /// 在可见区域内填充水平跨度。自动裁剪到帧缓冲边界。
+    ///
+    /// 不透明颜色使用 `fill_span_opaque` 快速填充，否则逐像素写入。
+    #[inline(always)]
+    fn fill_visible_horizontal_span(&mut self, start_x: i64, end_x: i64, y: i64, color: &Color) {
+        if y < 0 || y >= self.info.height as i64 {
+            return;
+        }
+        let mut sx = start_x.max(0);
+        let mut ex = end_x.min(self.info.width.saturating_sub(1) as i64);
+        if sx > ex {
+            core::mem::swap(&mut sx, &mut ex);
+        }
+        if color.a == 255 {
+            self.fill_span_opaque(sx as usize, ex as usize, y as usize, color);
+        } else {
+            for x in sx..=ex {
+                self.write_color_at_offset(
+                    self.pixel_offset_unchecked(x as usize, y as usize),
+                    color,
+                );
+            }
         }
     }
 
@@ -338,17 +474,9 @@ impl<'a> Renderer<'a> {
             error -= dy as i64;
             if error < 0 {
                 y += y_step;
-                error += dx as i64;
+                error += dx;
             }
         }
-    }
-
-    /// 如果启用双缓冲，将后台缓冲区交换到前台（即刷新到显存）。
-    ///
-    /// 单缓冲模式下此方法不可用。
-    #[cfg(feature = "double_buffer")]
-    pub fn swap_buffers(&mut self) {
-        self.front_buffer.copy_from_slice(&self.back_buffer);
     }
 
     /// 绘制三角形轮廓（由三条线段组成）。
@@ -412,56 +540,28 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        let width = self.info.width as i64;
-        let height = self.info.height as i64;
-
-        // 水平线填充闭包
-        let mut fill_h_line = |start_x: i64, end_x: i64, y: i64| {
-            if y < 0 || y >= height {
-                return;
-            }
-            let mut sx = start_x.max(0).min(width - 1);
-            let mut ex = end_x.max(0).min(width - 1);
-            if sx > ex {
-                core::mem::swap(&mut sx, &mut ex);
-            }
-            if color.a == 255 {
-                self.fill_span_opaque(sx as usize, ex as usize, y as usize, color);
-                return;
-            }
-            for x in sx..=ex {
-                self.write_color_at_offset(self.pixel_offset_unchecked(x as usize, y as usize), color);
-            }
-        };
-
         let long_dx = x3 - x1;
         let long_dy = y3 - y1;
-        let visible_y_min = 0i64;
-        let visible_y_max = height - 1;
 
         // 上半部分三角形 (p1 -> p2)
         let upper_dx = x2 - x1;
         let upper_dy = y2 - y1;
-        let upper_start = y1.max(visible_y_min);
-        let upper_end = y2.min(visible_y_max);
-        for y in upper_start..=upper_end {
+        for y in y1..=y2 {
             let dy = y - y1;
             let x_long = Self::interpolate_scan_x(x1, long_dx, long_dy, dy);
             let x_upper = Self::interpolate_scan_x(x1, upper_dx, upper_dy, dy);
-            fill_h_line(x_long, x_upper, y);
+            self.fill_visible_horizontal_span(x_long, x_upper, y, color);
         }
 
         // 下半部分三角形 (p2 -> p3)
         let lower_dx = x3 - x2;
         let lower_dy = y3 - y2;
-        let lower_start = y2.max(visible_y_min);
-        let lower_end = y3.min(visible_y_max);
-        for y in lower_start..=lower_end {
+        for y in y2..=y3 {
             let dy_long = y - y1;
             let dy_lower = y - y2;
             let x_long = Self::interpolate_scan_x(x1, long_dx, long_dy, dy_long);
             let x_lower = Self::interpolate_scan_x(x2, lower_dx, lower_dy, dy_lower);
-            fill_h_line(x_long, x_lower, y);
+            self.fill_visible_horizontal_span(x_long, x_lower, y, color);
         }
     }
 
@@ -548,6 +648,106 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// 使用中点圆算法填充圆形区域。
+    ///
+    /// 利用八对称性生成水平跨度，通过 `fill_visible_horizontal_span` 写入。
+    /// 自动裁剪到帧缓冲边界。
+    pub fn fill_circle(&mut self, center: Pixel, radius: usize, color: Color) {
+        if radius == 0 || self.info.width == 0 || self.info.height == 0 {
+            return;
+        }
+
+        let cx = saturating_usize_to_i64(center.x);
+        let cy = saturating_usize_to_i64(center.y);
+        let mut x = 0i64;
+        let mut y = radius as i64;
+        let mut d = 3 - 2 * radius as i64;
+
+        while x <= y {
+            for (sx, ex, py) in [
+                (cx - x, cx + x, cy + y),
+                (cx - x, cx + x, cy - y),
+                (cx - y, cx + y, cy + x),
+                (cx - y, cx + y, cy - x),
+            ] {
+                self.fill_visible_horizontal_span(sx, ex, py, &color);
+            }
+            if d < 0 {
+                d += 4 * x + 6;
+            } else {
+                d += 4 * (x - y) + 10;
+                y -= 1;
+            }
+            x += 1;
+        }
+    }
+
+    /// 使用中心矩形 + 整数中点圆弧扫描线填充圆角矩形。
+    ///
+    /// 先用两个贯穿矩形填充中心区域，再逐行计算四角的圆弧边界。
+    /// 自动裁剪到帧缓冲边界。
+    pub fn fill_rounded_rect(
+        &mut self,
+        top_left: Pixel,
+        width: usize,
+        height: usize,
+        radius: usize,
+        color: Color,
+    ) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let radius = radius.min(width / 2).min(height / 2);
+        if radius == 0 {
+            self.fill_rect(top_left, width, height, color);
+            return;
+        }
+
+        // Center vertical strip (full height, excluding corner x-ranges)
+        self.fill_rect(
+            Pixel::new(top_left.x + radius, top_left.y),
+            width - radius * 2,
+            height,
+            color,
+        );
+        // Center horizontal strip (full width, excluding corner y-ranges)
+        self.fill_rect(
+            Pixel::new(top_left.x, top_left.y + radius),
+            width,
+            height - radius * 2,
+            color,
+        );
+
+        let bottom = top_left.y.saturating_add(height).saturating_sub(1);
+        let r_sq = radius * radius;
+
+        for dy in 0..radius {
+            // vertical distance from the center of the corner arc
+            let dist_y = radius - dy;
+            // compute x² on the circle boundary at this distance
+            let x_sq = r_sq - dist_y * dist_y;
+            // integer square root: how far from corner center to the arc edge
+            let x_edge = integer_sqrt(x_sq);
+            // pixels to cut from the corner edge at this scanline
+            let inset = radius - x_edge;
+
+            let sx = (top_left.x + inset) as i64;
+            let ex = (top_left.x + width - 1 - inset) as i64;
+            let y_top = (top_left.y + dy) as i64;
+            let y_bottom = bottom as i64 - dy as i64;
+            self.fill_visible_horizontal_span(sx, ex, y_top, &color);
+            self.fill_visible_horizontal_span(sx, ex, y_bottom, &color);
+        }
+    }
+
+    /// 如果启用双缓冲，将后台缓冲区交换到前台（即刷新到显存）。
+    ///
+    /// 单缓冲模式下此方法不可用。
+    #[cfg(feature = "double_buffer")]
+    pub fn swap_buffers(&mut self) {
+        self.front_buffer.copy_from_slice(&self.back_buffer);
+    }
+
     /// 获取当前缓冲区的可变引用。
     ///
     /// 在需要直接操作缓冲区的大批量像素绘制场景中使用。
@@ -564,7 +764,7 @@ impl<'a> Renderer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::Renderer;
+    use super::{integer_sqrt, Renderer};
     use crate::color::{Color, PixelFormat};
     use crate::framebuffer::FramebufferInfo;
     use crate::pixel::Pixel;
@@ -876,6 +1076,78 @@ mod tests {
         assert_eq!(renderer.get_pixel(3, 3), Some(Color::new(0, 0, 0)));
     }
 
+    // ── fill_rounded_rect ──
+
+    #[test]
+    fn fill_rounded_rect_preserves_corner_cut_and_fills_body() {
+        let info = FramebufferInfo::new(8, 6, 24, PixelFormat::Bgr24);
+        let mut front = [0u8; 144];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(80, 160, 240);
+
+        renderer.fill_rounded_rect(Pixel::new(1, 1), 6, 4, 2, color);
+
+        assert_eq!(renderer.get_pixel(1, 1), Some(Color::new(0, 0, 0)));
+        assert_eq!(renderer.get_pixel(3, 1), Some(color));
+        assert_eq!(renderer.get_pixel(1, 3), Some(Color::new(0, 0, 0)));
+        assert_eq!(renderer.get_pixel(6, 4), Some(Color::new(0, 0, 0)));
+        assert_eq!(renderer.get_pixel(4, 3), Some(color));
+    }
+
+    // ── fill_circle ──
+
+    #[test]
+    fn fill_circle_fills_center_and_cardinal_points() {
+        let info = FramebufferInfo::new(7, 7, 21, PixelFormat::Bgr24);
+        let mut front = [0u8; 147];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(200, 100, 50);
+
+        renderer.fill_circle(Pixel::new(3, 3), 2, color);
+
+        assert_eq!(renderer.get_pixel(3, 3), Some(color));
+        assert_eq!(renderer.get_pixel(3, 1), Some(color));
+        assert_eq!(renderer.get_pixel(3, 5), Some(color));
+        assert_eq!(renderer.get_pixel(1, 3), Some(color));
+        assert_eq!(renderer.get_pixel(5, 3), Some(color));
+        assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0, 0, 0)));
+    }
+
+    // ── blit ──
+
+    #[test]
+    fn blit_copies_source_pixels_into_destination() {
+        let info = FramebufferInfo::new(4, 2, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 24];
+        let mut renderer = Renderer::new(info, &mut front);
+        let src = [
+            0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+        ];
+
+        renderer.blit(Pixel::new(1, 0), 2, 2, PixelFormat::Bgr24, &src, 6);
+
+        assert_eq!(renderer.get_pixel(1, 0), Some(Color::new(255, 0, 0)));
+        assert_eq!(renderer.get_pixel(2, 1), Some(Color::new(255, 255, 255)));
+    }
+
+    // ── blit_mask ──
+
+    #[test]
+    fn blit_mask_applies_foreground_only_on_non_zero_mask() {
+        let info = FramebufferInfo::new(4, 1, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 12];
+        let mut renderer = Renderer::new(info, &mut front);
+        let blue = Color::new(0, 0, 255);
+        let mask = [0u8, 255, 16, 0];
+
+        renderer.blit_mask(Pixel::new(0, 0), 4, 1, &mask, 4, blue);
+
+        assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0, 0, 0)));
+        assert_eq!(renderer.get_pixel(1, 0), Some(blue));
+        // 16/255 alpha of blue over black → B channel = 255 * 16 / 255 = 16, opaque
+        assert_eq!(renderer.get_pixel(2, 0), Some(Color::new(0, 0, 16)));
+    }
+
     #[test]
     fn fill_triangle_handles_large_usize_vertices_without_i32_narrowing() {
         let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
@@ -894,5 +1166,110 @@ mod tests {
         assert_eq!(renderer.get_pixel(1, 1), Some(color));
         assert_eq!(renderer.get_pixel(2, 2), Some(color));
         assert_eq!(renderer.get_pixel(3, 3), Some(Color::new(0, 0, 0)));
+    }
+
+    // ── integer_sqrt ──
+
+    #[test]
+    fn integer_sqrt_basics() {
+        assert_eq!(integer_sqrt(0), 0);
+        assert_eq!(integer_sqrt(1), 1);
+        assert_eq!(integer_sqrt(4), 2);
+        assert_eq!(integer_sqrt(9), 3);
+        assert_eq!(integer_sqrt(16), 4);
+        assert_eq!(integer_sqrt(25), 5);
+    }
+
+    #[test]
+    fn integer_sqrt_rounds_down() {
+        assert_eq!(integer_sqrt(2), 1);
+        assert_eq!(integer_sqrt(8), 2);
+        assert_eq!(integer_sqrt(15), 3);
+    }
+
+    // ── blit edge cases ──
+
+    #[test]
+    fn blit_format_mismatch_does_nothing() {
+        let info = FramebufferInfo::new(4, 2, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 24];
+        let mut renderer = Renderer::new(info, &mut front);
+        // Pre-fill a pixel to verify it's not overwritten
+        renderer.set_pixel(1, 0, &Color::new(255, 255, 255));
+        let src = [0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF];
+
+        // Rgb24 ≠ Bgr24 → silent return
+        renderer.blit(Pixel::new(0, 0), 2, 1, PixelFormat::Rgb24, &src, 6);
+
+        assert_eq!(renderer.get_pixel(1, 0), Some(Color::new(255, 255, 255)));
+    }
+
+    #[test]
+    fn blit_undersized_source_does_nothing() {
+        let info = FramebufferInfo::new(4, 2, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 24];
+        let mut renderer = Renderer::new(info, &mut front);
+        renderer.set_pixel(1, 0, &Color::new(255, 255, 255));
+        // 2 bytes is not enough for pitch=6, height=1
+        let src = [0x00, 0x00];
+
+        renderer.blit(Pixel::new(0, 0), 2, 1, PixelFormat::Bgr24, &src, 6);
+
+        assert_eq!(renderer.get_pixel(1, 0), Some(Color::new(255, 255, 255)));
+    }
+
+    // ── fill_rounded_rect edge cases ──
+
+    #[test]
+    fn fill_rounded_rect_zero_radius_delegates_to_fill_rect() {
+        let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 48];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(100, 150, 200);
+
+        // radius=0 should be equivalent to fill_rect
+        renderer.fill_rounded_rect(Pixel::new(0, 0), 3, 3, 0, color);
+
+        for y in 0..3 {
+            for x in 0..3 {
+                assert_eq!(renderer.get_pixel(x, y), Some(color));
+            }
+        }
+    }
+
+    #[test]
+    fn fill_rounded_rect_clamps_large_radius() {
+        let info = FramebufferInfo::new(6, 6, 18, PixelFormat::Bgr24);
+        let mut front = [0u8; 108];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(100, 150, 200);
+
+        // width=4, height=4 → max radius = 2, so radius=10 gets clamped to 2
+        renderer.fill_rounded_rect(Pixel::new(1, 1), 4, 4, 10, color);
+
+        // Center pixel should be filled (not cut by oversized radius)
+        assert_eq!(renderer.get_pixel(3, 3), Some(color));
+        // Corner should be cut
+        assert_eq!(renderer.get_pixel(1, 1), Some(Color::new(0, 0, 0)));
+    }
+
+    // ── fill_rect alpha path ──
+
+    #[test]
+    fn fill_rect_alpha_blends_correctly() {
+        let info = FramebufferInfo::new(2, 1, 6, PixelFormat::Bgr24);
+        let mut front = [0u8; 6];
+        let mut renderer = Renderer::new(info, &mut front);
+        // Fill with white first
+        renderer.set_pixel(0, 0, &Color::new(255, 255, 255));
+        renderer.set_pixel(1, 0, &Color::new(255, 255, 255));
+
+        // Overlay 50% red → each channel = (255 + 0) / 2 ≈ 127 for R, but R=255 → R=255*128/255+0*127/255
+        // Actually: src=(255,0,0) a=128, dst=(255,255,255)
+        // R = (255*128 + 255*127)/255 = 255, G = (0*128 + 255*127)/255 = 127, B = (0*128 + 255*127)/255 = 127
+        renderer.fill_rect(Pixel::new(0, 0), 2, 1, Color::with_alpha(255, 0, 0, 128));
+
+        assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(255, 127, 127)));
+        assert_eq!(renderer.get_pixel(1, 0), Some(Color::new(255, 127, 127)));
     }
 }

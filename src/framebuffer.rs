@@ -40,10 +40,10 @@ impl FramebufferInfo {
             "pitch must be at least width * bytes_per_pixel"
         );
         FramebufferInfo {
-            width: width,
-            height: height,
-            pitch: pitch,
-            format: format,
+            width,
+            height,
+            pitch,
+            format,
         }
     }
 
