@@ -1,6 +1,6 @@
-use rasteron::Renderer;
-use rasteron::color::{Color, PixelFormat};
+use rasteron::color::{BLACK, BLUE, PixelFormat};
 use rasteron::framebuffer::FramebufferInfo;
+use rasteron::{Renderer, pixel};
 use std::fs;
 use std::path::Path;
 
@@ -14,14 +14,8 @@ fn main() {
     let mut front_buffer = vec![0u8; info.buffer_size()];
     let mut renderer = Renderer::new(info, &mut front_buffer);
 
-    for y in 0..height {
-        for x in 0..width {
-            let r = ((x * 255) / (width - 1)) as u8;
-            let g = ((y * 255) / (height - 1)) as u8;
-            let b = 255u8.saturating_sub(((x + y) * 255 / ((width - 1) + (height - 1))) as u8);
-            renderer.set_pixel(x, y, Color::with_alpha(r, g, b, 255));
-        }
-    }
+    renderer.clear(BLUE);
+    renderer.draw_line(pixel!(1, 0), pixel!(1000, 200), BLACK);
 
     #[cfg(feature = "double_buffer")]
     renderer.swap_buffers();
