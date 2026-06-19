@@ -5,6 +5,10 @@ use rasteron::Renderer;
 use rasteron::color::{Color, PixelFormat};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::pixel::Pixel;
+use rasteron::programmable::{
+    FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState, PrimitiveType,
+    Texture2D, Vertex2D, VertexShader, Viewport,
+};
 
 const BENCH_FORMATS: [PixelFormat; 1] = [PixelFormat::Bgr24];
 
@@ -31,6 +35,51 @@ fn make_renderer(
     let front_slice = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
     let renderer = Renderer::new(info, front_slice);
     (renderer, front)
+}
+
+#[derive(Clone, Copy)]
+struct UvVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+}
+
+struct UvVs;
+
+impl VertexShader for UvVs {
+    type Input = UvVertex;
+    type Varying = [f32; 2];
+
+    fn shade_vertex(
+        &self,
+        input: &Self::Input,
+    ) -> rasteron::programmable::ProgramVertex<Self::Varying> {
+        rasteron::programmable::ProgramVertex {
+            position: input.position,
+            varying: input.uv,
+        }
+    }
+}
+
+struct SolidFs;
+
+impl FragmentShader for SolidFs {
+    type Varying = Color;
+
+    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
+        FragmentOutput::Color(*varying)
+    }
+}
+
+struct TextureFs<'a> {
+    texture: Texture2D<'a>,
+}
+
+impl FragmentShader for TextureFs<'_> {
+    type Varying = [f32; 2];
+
+    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
+        FragmentOutput::Color(self.texture.sample_nearest(*varying))
+    }
 }
 
 fn bench_set_pixel_opaque(c: &mut Criterion) {
@@ -449,6 +498,105 @@ fn bench_blit_mask(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_programmable_draw_indexed_triangles(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("programmable_draw_indexed_triangles");
+    group.throughput(Throughput::Elements((width * height) as u64));
+
+    let (mut renderer, _front) = make_renderer(width, height, PixelFormat::Rgba8888);
+    let vertices = [
+        Vertex2D {
+            position: [0.0, 0.0],
+            varying: Color::new(255, 0, 0),
+        },
+        Vertex2D {
+            position: [1.0, 0.0],
+            varying: Color::new(0, 255, 0),
+        },
+        Vertex2D {
+            position: [1.0, 1.0],
+            varying: Color::new(0, 0, 255),
+        },
+        Vertex2D {
+            position: [0.0, 1.0],
+            varying: Color::new(255, 255, 0),
+        },
+    ];
+    let indices = [0u16, 1, 2, 0, 2, 3];
+    let pipeline = Pipeline::new(
+        Passthrough2D::new(),
+        SolidFs,
+        PipelineState::alpha_blend(Viewport::new(0, 0, width, height)),
+    );
+
+    group.bench_function("Rgba8888/fullscreen_quad", |b| {
+        b.iter(|| {
+            renderer.draw_indexed(
+                black_box(PrimitiveType::Triangles),
+                black_box(&vertices),
+                black_box(&indices),
+                black_box(&pipeline),
+            );
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_programmable_textured_triangles(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("programmable_textured_triangles");
+    group.throughput(Throughput::Elements((width * height) as u64));
+
+    let (mut renderer, _front) = make_renderer(width, height, PixelFormat::Rgba8888);
+    let vertices = [
+        UvVertex {
+            position: [0.0, 0.0],
+            uv: [0.0, 0.0],
+        },
+        UvVertex {
+            position: [1.0, 0.0],
+            uv: [1.0, 0.0],
+        },
+        UvVertex {
+            position: [1.0, 1.0],
+            uv: [1.0, 1.0],
+        },
+        UvVertex {
+            position: [0.0, 1.0],
+            uv: [0.0, 1.0],
+        },
+    ];
+    let indices = [0u16, 1, 2, 0, 2, 3];
+    let texels = [
+        Color::new(255, 0, 0),
+        Color::new(0, 255, 0),
+        Color::new(0, 0, 255),
+        Color::new(255, 255, 255),
+    ];
+    let texture = Texture2D::new(2, 2, &texels);
+    let pipeline = Pipeline::new(
+        UvVs,
+        TextureFs { texture },
+        PipelineState::alpha_blend(Viewport::new(0, 0, width, height)),
+    );
+
+    group.bench_function("Rgba8888/nearest_quad", |b| {
+        b.iter(|| {
+            renderer.draw_indexed(
+                black_box(PrimitiveType::Triangles),
+                black_box(&vertices),
+                black_box(&indices),
+                black_box(&pipeline),
+            );
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = criterion_config();
@@ -466,6 +614,8 @@ criterion_group!(
     bench_fill_circle,
     bench_fill_rounded_rect,
     bench_blit,
-    bench_blit_mask
+    bench_blit_mask,
+    bench_programmable_draw_indexed_triangles,
+    bench_programmable_textured_triangles
 );
 criterion_main!(benches);

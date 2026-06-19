@@ -227,10 +227,7 @@ impl Default for Sampler2D {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextureError {
     DimensionOverflow,
-    LengthMismatch {
-        expected: usize,
-        actual: usize,
-    },
+    LengthMismatch { expected: usize, actual: usize },
 }
 
 /// 2D 纹理。
@@ -306,7 +303,9 @@ impl<'a> Texture2D<'a> {
         }
 
         match sampler.filter {
-            FilterMode::Nearest => self.sample_nearest_with_wrap(uv, sampler.wrap_u, sampler.wrap_v),
+            FilterMode::Nearest => {
+                self.sample_nearest_with_wrap(uv, sampler.wrap_u, sampler.wrap_v)
+            }
             FilterMode::Bilinear => {
                 self.sample_bilinear_with_wrap(uv, sampler.wrap_u, sampler.wrap_v)
             }
@@ -321,12 +320,7 @@ impl<'a> Texture2D<'a> {
         self.texel(x, y)
     }
 
-    fn sample_bilinear_with_wrap(
-        &self,
-        uv: [f32; 2],
-        wrap_u: WrapMode,
-        wrap_v: WrapMode,
-    ) -> Color {
+    fn sample_bilinear_with_wrap(&self, uv: [f32; 2], wrap_u: WrapMode, wrap_v: WrapMode) -> Color {
         let u = self.wrap_coord(uv[0], wrap_u) * self.width.saturating_sub(1) as f32;
         let v = self.wrap_coord(uv[1], wrap_v) * self.height.saturating_sub(1) as f32;
         let x0 = floor_to_usize(u);
@@ -551,18 +545,25 @@ impl<'a> Renderer<'a> {
     }
 
     #[inline(always)]
-    fn scissor_contains(rect: Option<ScissorRect>, x: usize, y: usize) -> bool {
-        match rect {
-            Some(rect) => {
-                let x_max = rect.x.saturating_add(rect.width);
-                let y_max = rect.y.saturating_add(rect.height);
-                x >= rect.x && y >= rect.y && x < x_max && y < y_max
-            }
-            None => true,
+    fn clip_bounds_with_scissor(
+        bounds: (usize, usize, usize, usize),
+        scissor: Option<ScissorRect>,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = bounds;
+        if let Some(rect) = scissor {
+            min_x = min_x.max(rect.x);
+            min_y = min_y.max(rect.y);
+            max_x = max_x.min(rect.x.saturating_add(rect.width));
+            max_y = max_y.min(rect.y.saturating_add(rect.height));
+        }
+
+        if min_x >= max_x || min_y >= max_y {
+            None
+        } else {
+            Some((min_x, min_y, max_x, max_y))
         }
     }
 
-    #[inline(always)]
     fn write_color_raw_at_offset(&mut self, offset: usize, color: &Color) {
         let format = self.info().format;
         let bpp = format.bytes_per_pixel();
@@ -572,9 +573,21 @@ impl<'a> Renderer<'a> {
 
     #[inline(always)]
     fn read_color_at_offset(&self, offset: usize) -> Color {
-        let format = self.info().format;
-        let bpp = format.bytes_per_pixel();
-        Color::from_bytes(format, &self.current_buffer()[offset..offset + bpp])
+        let src = &self.current_buffer()[offset..offset + self.info().format.bytes_per_pixel()];
+        match self.info().format {
+            crate::color::PixelFormat::Rgb24 => Color::new(src[0], src[1], src[2]),
+            crate::color::PixelFormat::Bgr24 => Color::new(src[2], src[1], src[0]),
+            crate::color::PixelFormat::Xrgb8888 => Color::new(src[2], src[1], src[0]),
+            crate::color::PixelFormat::Argb8888 => {
+                Color::with_alpha(src[2], src[1], src[0], src[3])
+            }
+            crate::color::PixelFormat::Rgba8888 => {
+                Color::with_alpha(src[0], src[1], src[2], src[3])
+            }
+            crate::color::PixelFormat::Bgra8888 => {
+                Color::with_alpha(src[2], src[1], src[0], src[3])
+            }
+        }
     }
 
     #[inline(always)]
@@ -604,10 +617,14 @@ impl<'a> Renderer<'a> {
             BlendMode::PremultipliedAlpha => {
                 let inv_alpha = 255 - src.a;
                 Color::with_alpha(
-                    src.r.saturating_add((dst.r as u16 * inv_alpha as u16 / 255) as u8),
-                    src.g.saturating_add((dst.g as u16 * inv_alpha as u16 / 255) as u8),
-                    src.b.saturating_add((dst.b as u16 * inv_alpha as u16 / 255) as u8),
-                    src.a.saturating_add((dst.a as u16 * inv_alpha as u16 / 255) as u8),
+                    src.r
+                        .saturating_add((dst.r as u16 * inv_alpha as u16 / 255) as u8),
+                    src.g
+                        .saturating_add((dst.g as u16 * inv_alpha as u16 / 255) as u8),
+                    src.b
+                        .saturating_add((dst.b as u16 * inv_alpha as u16 / 255) as u8),
+                    src.a
+                        .saturating_add((dst.a as u16 * inv_alpha as u16 / 255) as u8),
                 )
             }
         }
@@ -615,13 +632,12 @@ impl<'a> Renderer<'a> {
 
     #[inline(always)]
     fn write_fragment_color(&mut self, x: usize, y: usize, color: &Color, blend: BlendMode) {
-        if let Some(offset) = self.try_pixel_offset_i64(x as i64, y as i64) {
-            match blend {
-                BlendMode::None => self.write_color_raw_at_offset(offset, color),
-                _ => {
-                    let dst = self.read_color_at_offset(offset);
-                    self.write_color_raw_at_offset(offset, &Self::blend_pixel(*color, dst, blend));
-                }
+        let offset = self.pixel_offset_unchecked(x, y);
+        match blend {
+            BlendMode::None => self.write_color_raw_at_offset(offset, color),
+            _ => {
+                let dst = self.read_color_at_offset(offset);
+                self.write_color_raw_at_offset(offset, &Self::blend_pixel(*color, dst, blend));
             }
         }
     }
@@ -800,8 +816,9 @@ impl<'a> Renderer<'a> {
         V: Copy,
         FS: FragmentShader<Varying = V>,
     {
-        let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) =
-            self.viewport_intersection(pipeline.state.viewport)
+        let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) = self
+            .viewport_intersection(pipeline.state.viewport)
+            .and_then(|bounds| Self::clip_bounds_with_scissor(bounds, pipeline.state.scissor))
         else {
             return;
         };
@@ -815,11 +832,9 @@ impl<'a> Renderer<'a> {
         if x < clip_min_x || x >= clip_max_x || y < clip_min_y || y >= clip_max_y {
             return;
         }
-        if !Self::scissor_contains(pipeline.state.scissor, x, y) {
-            return;
-        }
 
-        if let FragmentOutput::Color(color) = pipeline.fragment_shader.shade_fragment(&vertex.varying)
+        if let FragmentOutput::Color(color) =
+            pipeline.fragment_shader.shade_fragment(&vertex.varying)
         {
             self.write_fragment_color(x, y, &color, pipeline.state.blend);
         }
@@ -836,8 +851,9 @@ impl<'a> Renderer<'a> {
         let Some(clipped) = Self::clip_line_segment(vertices) else {
             return;
         };
-        let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) =
-            self.viewport_intersection(pipeline.state.viewport)
+        let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) = self
+            .viewport_intersection(pipeline.state.viewport)
+            .and_then(|bounds| Self::clip_bounds_with_scissor(bounds, pipeline.state.scissor))
         else {
             return;
         };
@@ -859,12 +875,10 @@ impl<'a> Renderer<'a> {
             if px < clip_min_x || px >= clip_max_x || py < clip_min_y || py >= clip_max_y {
                 continue;
             }
-            if !Self::scissor_contains(pipeline.state.scissor, px, py) {
-                continue;
-            }
 
             let varying = V::lerp(clipped.start.varying, clipped.end.varying, t);
-            if let FragmentOutput::Color(color) = pipeline.fragment_shader.shade_fragment(&varying) {
+            if let FragmentOutput::Color(color) = pipeline.fragment_shader.shade_fragment(&varying)
+            {
                 self.write_fragment_color(px, py, &color, pipeline.state.blend);
             }
         }
@@ -881,8 +895,9 @@ impl<'a> Renderer<'a> {
         let Some(clipped_tris) = Self::clip_triangle(vertices) else {
             return;
         };
-        let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) =
-            self.viewport_intersection(pipeline.state.viewport)
+        let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) = self
+            .viewport_intersection(pipeline.state.viewport)
+            .and_then(|bounds| Self::clip_bounds_with_scissor(bounds, pipeline.state.scissor))
         else {
             return;
         };
@@ -895,8 +910,10 @@ impl<'a> Renderer<'a> {
 
             let min_x = floor_to_usize(p0[0].min(p1[0]).min(p2[0]).max(clip_min_x as f32));
             let min_y = floor_to_usize(p0[1].min(p1[1]).min(p2[1]).max(clip_min_y as f32));
-            let max_x = Self::ceil_to_usize(p0[0].max(p1[0]).max(p2[0]).min((clip_max_x - 1) as f32));
-            let max_y = Self::ceil_to_usize(p0[1].max(p1[1]).max(p2[1]).min((clip_max_y - 1) as f32));
+            let max_x =
+                Self::ceil_to_usize(p0[0].max(p1[0]).max(p2[0]).min((clip_max_x - 1) as f32));
+            let max_y =
+                Self::ceil_to_usize(p0[1].max(p1[1]).max(p2[1]).min((clip_max_y - 1) as f32));
             if min_x > max_x || min_y > max_y {
                 continue;
             }
@@ -908,17 +925,26 @@ impl<'a> Renderer<'a> {
 
             let sign = if area < 0.0 { -1.0 } else { 1.0 };
             let inv_area = 1.0 / area.abs();
-            for y in min_y..=max_y {
-                for x in min_x..=max_x {
-                    if !Self::scissor_contains(pipeline.state.scissor, x, y) {
-                        continue;
-                    }
+            let start_sample = [min_x as f32 + 0.5, min_y as f32 + 0.5];
+            let mut row_w0 = Self::edge_function(p1, p2, start_sample) * sign;
+            let mut row_w1 = Self::edge_function(p2, p0, start_sample) * sign;
+            let mut row_w2 = Self::edge_function(p0, p1, start_sample) * sign;
+            let w0_dx = (p2[1] - p1[1]) * sign;
+            let w1_dx = (p0[1] - p2[1]) * sign;
+            let w2_dx = (p1[1] - p0[1]) * sign;
+            let w0_dy = (p1[0] - p2[0]) * sign;
+            let w1_dy = (p2[0] - p0[0]) * sign;
+            let w2_dy = (p0[0] - p1[0]) * sign;
 
-                    let sample = [x as f32 + 0.5, y as f32 + 0.5];
-                    let w0 = Self::edge_function(p1, p2, sample) * sign;
-                    let w1 = Self::edge_function(p2, p0, sample) * sign;
-                    let w2 = Self::edge_function(p0, p1, sample) * sign;
+            for y in min_y..=max_y {
+                let mut w0 = row_w0;
+                let mut w1 = row_w1;
+                let mut w2 = row_w2;
+                for x in min_x..=max_x {
                     if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        w0 += w0_dx;
+                        w1 += w1_dx;
+                        w2 += w2_dx;
                         continue;
                     }
 
@@ -936,7 +962,13 @@ impl<'a> Renderer<'a> {
                         }
                         FragmentOutput::Discard => {}
                     }
+                    w0 += w0_dx;
+                    w1 += w1_dx;
+                    w2 += w2_dx;
                 }
+                row_w0 += w0_dy;
+                row_w1 += w1_dy;
+                row_w2 += w2_dy;
             }
         }
     }
@@ -1055,9 +1087,9 @@ impl<'a> Renderer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Renderer;
     use crate::color::PixelFormat;
     use crate::framebuffer::FramebufferInfo;
-    use crate::Renderer;
     use alloc::boxed::Box;
     use alloc::vec;
 
@@ -1431,7 +1463,10 @@ mod tests {
 
         renderer.draw_arrays(PrimitiveType::Triangles, &vertices, &pipeline);
 
-        assert_eq!(renderer.get_pixel(1, 1), Some(Color::with_alpha(255, 0, 0, 64)));
+        assert_eq!(
+            renderer.get_pixel(1, 1),
+            Some(Color::with_alpha(255, 0, 0, 64))
+        );
     }
 
     #[test]

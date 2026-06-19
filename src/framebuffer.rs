@@ -28,12 +28,7 @@ impl FramebufferInfo {
     /// # 恐慌
     ///
     /// 当 `pitch` 小于最小所需跨度（`width × bytes_per_pixel`）时恐慌。
-    pub fn new(
-        width: usize,
-        height: usize,
-        pitch: usize,
-        format: PixelFormat,
-    ) -> FramebufferInfo {
+    pub fn new(width: usize, height: usize, pitch: usize, format: PixelFormat) -> FramebufferInfo {
         let min_pitch = width.saturating_mul(format.bytes_per_pixel());
         assert!(
             pitch >= min_pitch,

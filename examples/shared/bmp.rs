@@ -33,12 +33,7 @@ pub fn write_bmp(
 }
 
 /// 写入 24-bit BMP（BGR 格式）。
-fn write_bmp_bgr24(
-    path: &Path,
-    width: usize,
-    height: usize,
-    pixels: &[u8],
-) -> std::io::Result<()> {
+fn write_bmp_bgr24(path: &Path, width: usize, height: usize, pixels: &[u8]) -> std::io::Result<()> {
     let row_stride = width * 3;
     let row_padding = (4 - (row_stride % 4)) % 4;
     let image_size = (row_stride + row_padding) * height;
@@ -127,12 +122,7 @@ fn write_bmp_bgra32(
 }
 
 /// 将任意像素格式的帧缓冲转换为 BGR24 平面数据。
-fn convert_to_bgr24(
-    width: usize,
-    height: usize,
-    format: PixelFormat,
-    pixels: &[u8],
-) -> Vec<u8> {
+fn convert_to_bgr24(width: usize, height: usize, format: PixelFormat, pixels: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; width * height * 3];
     let bpp = format.bytes_per_pixel();
     for y in 0..height {

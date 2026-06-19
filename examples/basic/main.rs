@@ -6,7 +6,7 @@
 //!   cargo run --example basic
 
 use rasteron::Renderer;
-use rasteron::color::{BLACK, BLUE, GRAY, GREEN, RED, WHITE, YELLOW, Color, PixelFormat};
+use rasteron::color::{BLACK, BLUE, Color, GRAY, GREEN, PixelFormat, RED, WHITE, YELLOW};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::pixel::Pixel;
 

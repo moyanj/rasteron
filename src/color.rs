@@ -204,33 +204,6 @@ impl PixelFormat {
     }
 
     #[inline(always)]
-    fn write_color_channels(
-        self,
-        dst: &mut [u8],
-        color: &Color,
-        alpha: u16,
-        inv_alpha: u16,
-        opaque: bool,
-    ) {
-        let bytes = color.to_bytes(self);
-        let bpp = self.bytes_per_pixel();
-        if opaque {
-            dst[..bpp].copy_from_slice(&bytes[..bpp]);
-            if bpp == 4 {
-                dst[3] = self.opaque_alpha_byte();
-            }
-            return;
-        }
-
-        for index in 0..3 {
-            dst[index] = Self::blend_channel(bytes[index], dst[index], alpha, inv_alpha);
-        }
-        if bpp == 4 {
-            dst[3] = self.opaque_alpha_byte();
-        }
-    }
-
-    #[inline(always)]
     const fn opaque_alpha_byte(self) -> u8 {
         match self {
             PixelFormat::Xrgb8888 => 0,
@@ -303,9 +276,55 @@ impl PixelFormat {
     /// `dst` 长度至少为 `bytes_per_pixel()`。
     #[inline(always)]
     pub fn write_color(self, dst: &mut [u8], color: &Color) {
+        debug_assert!(dst.len() >= self.bytes_per_pixel());
         let alpha = color.a as u16;
+        if alpha == 255 {
+            match self {
+                PixelFormat::Rgb24 | PixelFormat::Rgba8888 => {
+                    dst[0] = color.r;
+                    dst[1] = color.g;
+                    dst[2] = color.b;
+                    if matches!(self, PixelFormat::Rgba8888) {
+                        dst[3] = 255;
+                    }
+                }
+                PixelFormat::Bgr24
+                | PixelFormat::Xrgb8888
+                | PixelFormat::Argb8888
+                | PixelFormat::Bgra8888 => {
+                    dst[0] = color.b;
+                    dst[1] = color.g;
+                    dst[2] = color.r;
+                    if self.bytes_per_pixel() == 4 {
+                        dst[3] = self.opaque_alpha_byte();
+                    }
+                }
+            }
+            return;
+        }
+
         let inv_alpha = 255 - alpha;
-        self.write_color_channels(dst, color, alpha, inv_alpha, color.a == 255);
+        match self {
+            PixelFormat::Rgb24 | PixelFormat::Rgba8888 => {
+                dst[0] = Self::blend_channel(color.r, dst[0], alpha, inv_alpha);
+                dst[1] = Self::blend_channel(color.g, dst[1], alpha, inv_alpha);
+                dst[2] = Self::blend_channel(color.b, dst[2], alpha, inv_alpha);
+                if matches!(self, PixelFormat::Rgba8888) {
+                    dst[3] = 255;
+                }
+            }
+            PixelFormat::Bgr24
+            | PixelFormat::Xrgb8888
+            | PixelFormat::Argb8888
+            | PixelFormat::Bgra8888 => {
+                dst[0] = Self::blend_channel(color.b, dst[0], alpha, inv_alpha);
+                dst[1] = Self::blend_channel(color.g, dst[1], alpha, inv_alpha);
+                dst[2] = Self::blend_channel(color.r, dst[2], alpha, inv_alpha);
+                if self.bytes_per_pixel() == 4 {
+                    dst[3] = self.opaque_alpha_byte();
+                }
+            }
+        }
     }
 
     /// 从源缓冲区读取一个像素并解码为颜色。
@@ -409,12 +428,18 @@ mod tests {
 
     #[test]
     fn from_hex_rejects_invalid_length() {
-        assert_eq!(Color::from_hex("#12345"), Err(ColorParseError::InvalidLength));
+        assert_eq!(
+            Color::from_hex("#12345"),
+            Err(ColorParseError::InvalidLength)
+        );
     }
 
     #[test]
     fn from_hex_rejects_invalid_digits() {
-        assert_eq!(Color::from_hex("#12GG56"), Err(ColorParseError::InvalidDigit));
+        assert_eq!(
+            Color::from_hex("#12GG56"),
+            Err(ColorParseError::InvalidDigit)
+        );
     }
 
     #[test]

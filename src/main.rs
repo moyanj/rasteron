@@ -34,6 +34,6 @@ fn main() {
         PixelFormat::Bgr24,
         renderer.buffer_mut(),
     )
-        .expect("failed to write bmp");
+    .expect("failed to write bmp");
     println!("{}", output);
 }
