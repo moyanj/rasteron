@@ -199,9 +199,14 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
+    /// Alpha 混合单通道的计算。
+    ///
+    /// 使用 `(src * alpha + dst * inv_alpha + 255) >> 8` 近似
+    /// 标准 `(src * alpha + dst * inv_alpha) / 255`，误差 ≤ 1。
     #[inline(always)]
-    fn blend_channel(src: u8, dst: u8, alpha: u16, inv_alpha: u16) -> u8 {
-        ((src as u16 * alpha + dst as u16 * inv_alpha) / 255) as u8
+    pub fn blend_channel(src: u8, dst: u8, alpha: u16, inv_alpha: u16) -> u8 {
+        let v = src as u16 * alpha + dst as u16 * inv_alpha;
+        ((v + 255) >> 8) as u8
     }
 
     #[inline(always)]

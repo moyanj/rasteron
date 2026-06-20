@@ -555,7 +555,12 @@ impl<'a> Renderer<'a> {
     fn viewport_intersection(&self, viewport: Viewport) -> Option<(usize, usize, usize, usize)> {
         let fb = self.framebuffer_viewport();
         Self::rect_intersection(
-            (fb.x, fb.y, fb.x.saturating_add(fb.width), fb.y.saturating_add(fb.height)),
+            (
+                fb.x,
+                fb.y,
+                fb.x.saturating_add(fb.width),
+                fb.y.saturating_add(fb.height),
+            ),
             ScissorRect {
                 x: viewport.x,
                 y: viewport.y,
@@ -577,19 +582,50 @@ impl<'a> Renderer<'a> {
     }
 
     /// 直接将颜色写入缓冲区，不进行任何混合。
+    ///
+    /// 使用缓存格式属性代替 `color.to_bytes(format)` 的枚举匹配。
     #[inline(always)]
     fn write_color_raw_at_offset(&mut self, offset: usize, color: &Color) {
-        let format = self.info().format;
-        let bpp = format.bytes_per_pixel();
-        let bytes = color.to_bytes(format);
-        self.current_buffer_mut()[offset..offset + bpp].copy_from_slice(&bytes[..bpp]);
+        let bpp = self.fmt_bpp;
+        let is_rgb_order = self.fmt_rgb_order;
+        let stores_alpha = self.fmt_stores_color_alpha;
+        let target = self.current_buffer_mut();
+        let dst = &mut target[offset..offset + bpp];
+        if is_rgb_order {
+            dst[0] = color.r;
+            dst[1] = color.g;
+            dst[2] = color.b;
+        } else {
+            dst[0] = color.b;
+            dst[1] = color.g;
+            dst[2] = color.r;
+        }
+        if bpp == 4 {
+            dst[3] = if stores_alpha { color.a } else { 0 };
+        }
     }
 
     #[inline(always)]
     fn read_color_at_offset(&self, offset: usize) -> Color {
-        let format = self.info().format;
-        let bpp = format.bytes_per_pixel();
-        Color::from_bytes(format, &self.current_buffer()[offset..offset + bpp])
+        let bpp = self.fmt_bpp;
+        let is_rgb_order = self.fmt_rgb_order;
+        let stores_alpha = self.fmt_stores_color_alpha;
+        let src = &self.current_buffer()[offset..offset + bpp];
+        if is_rgb_order {
+            Color::with_alpha(
+                src[0],
+                src[1],
+                src[2],
+                if stores_alpha { src[3] } else { 255 },
+            )
+        } else {
+            Color::with_alpha(
+                src[2],
+                src[1],
+                src[0],
+                if stores_alpha { src[3] } else { 255 },
+            )
+        }
     }
 
     #[inline(always)]
