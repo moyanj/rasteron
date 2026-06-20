@@ -18,8 +18,9 @@ use rasteron::color::{BLACK, BLUE, Color, GREEN, RED, WHITE};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::pixel::Pixel;
 use rasteron::programmable::{
-    FilterMode, FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState,
-    PrimitiveType, Sampler2D, ScissorRect, Texture2D, Vertex2D, VertexShader, Viewport, WrapMode,
+    FilterMode, FragmentInput, FragmentOutput, FragmentShader, Passthrough2D, Pipeline,
+    PipelineState, PrimitiveType, Sampler2D, ScissorRect, Texture2D, Vertex2D, VertexShader,
+    Viewport, WrapMode,
 };
 
 #[path = "../shared/bmp.rs"]
@@ -61,9 +62,9 @@ struct CheckerFs;
 impl FragmentShader for CheckerFs {
     type Varying = [f32; 2];
 
-    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-        let u = varying[0];
-        let v = varying[1];
+    fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+        let u = input.varying[0];
+        let v = input.varying[1];
         let tile_u = (u * 8.0).floor() as i32;
         let tile_v = (v * 8.0).floor() as i32;
         let is_white = (tile_u + tile_v) % 2 == 0;
@@ -94,8 +95,8 @@ struct DiscardRightFs;
 impl FragmentShader for DiscardRightFs {
     type Varying = [f32; 2];
 
-    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-        if varying[0] > 0.5 {
+    fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+        if input.varying[0] > 0.5 {
             FragmentOutput::Discard
         } else {
             FragmentOutput::Color(WHITE)
@@ -110,8 +111,8 @@ struct SolidFs;
 impl FragmentShader for SolidFs {
     type Varying = Color;
 
-    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-        FragmentOutput::Color(*varying)
+    fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+        FragmentOutput::Color(input.varying)
     }
 }
 
@@ -186,9 +187,9 @@ fn main() {
     impl FragmentShader for TexFs<'_> {
         type Varying = [f32; 2];
 
-        fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
+        fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
             FragmentOutput::Color(self.tex.sample(
-                *varying,
+                input.varying,
                 Sampler2D {
                     wrap_u: WrapMode::Clamp,
                     wrap_v: WrapMode::Clamp,

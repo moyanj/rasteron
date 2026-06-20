@@ -30,8 +30,8 @@
 //! use rasteron::color::Color;
 //! use rasteron::framebuffer::{FramebufferInfo, PixelFormat};
 //! use rasteron::programmable::{
-//!     FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState, PrimitiveType,
-//!     Vertex2D, Viewport,
+//!     FragmentInput, FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState,
+//!     PrimitiveType, Vertex2D, Viewport,
 //! };
 //!
 //! struct SolidFs;
@@ -39,8 +39,8 @@
 //! impl FragmentShader for SolidFs {
 //!     type Varying = Color;
 //!
-//!     fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-//!         FragmentOutput::Color(*varying)
+//!     fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+//!         FragmentOutput::Color(input.varying)
 //!     }
 //! }
 //!

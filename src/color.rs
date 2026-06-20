@@ -114,8 +114,9 @@ impl Color {
     /// # 恐慌
     ///
     /// 如果 `bytes` 长度小于 `format.bytes_per_pixel()`，将会恐慌。
+    #[inline(always)]
     pub fn from_bytes(format: PixelFormat, bytes: &[u8]) -> Self {
-        assert!(
+        debug_assert!(
             bytes.len() >= format.bytes_per_pixel(),
             "not enough bytes for pixel format {:?}",
             format

@@ -6,8 +6,8 @@ use rasteron::color::{Color, PixelFormat};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::pixel::Pixel;
 use rasteron::programmable::{
-    FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState, PrimitiveType,
-    Texture2D, Vertex2D, VertexShader, Viewport,
+    FragmentInput, FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState,
+    PrimitiveType, Texture2D, Vertex2D, VertexShader, Viewport,
 };
 
 const BENCH_FORMATS: [PixelFormat; 1] = [PixelFormat::Bgr24];
@@ -65,8 +65,8 @@ struct SolidFs;
 impl FragmentShader for SolidFs {
     type Varying = Color;
 
-    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-        FragmentOutput::Color(*varying)
+    fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+        FragmentOutput::Color(input.varying)
     }
 }
 
@@ -77,8 +77,8 @@ struct TextureFs<'a> {
 impl FragmentShader for TextureFs<'_> {
     type Varying = [f32; 2];
 
-    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-        FragmentOutput::Color(self.texture.sample_nearest(*varying))
+    fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+        FragmentOutput::Color(self.texture.sample_nearest(input.varying))
     }
 }
 

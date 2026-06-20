@@ -18,8 +18,7 @@ extern crate alloc;
 
 use crate::color::Color;
 use crate::core::Renderer;
-use crate::pixel::Pixel;
-use crate::utils::{clip_line, floor_to_usize};
+use crate::utils::floor_to_usize;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
@@ -44,6 +43,16 @@ pub enum PrimitiveType {
 pub struct ProgramVertex<V> {
     pub position: [f32; 2],
     pub varying: V,
+}
+
+/// 片元着色器输入。
+///
+/// - `varying` 是插值后的片元属性
+/// - `position` 是当前片元中心对应的屏幕像素坐标
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FragmentInput<V> {
+    pub varying: V,
+    pub position: [f32; 2],
 }
 
 /// 片元着色器输出。
@@ -140,7 +149,7 @@ pub trait VertexShader {
 pub trait FragmentShader {
     type Varying: Copy;
 
-    fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput;
+    fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput;
 }
 
 /// 裁剪矩形。
@@ -524,24 +533,36 @@ impl<'a> Renderer<'a> {
         floor_to_usize(value + 0.5)
     }
 
+    /// `(min_x, min_y, max_x, max_y)` 矩形与 [`ScissorRect`] 求交。
+    /// 若结果为 `None`，表示无可见区域。
     #[inline(always)]
-    fn viewport_intersection(&self, viewport: Viewport) -> Option<(usize, usize, usize, usize)> {
-        let fb = self.framebuffer_viewport();
-        let min_x = viewport.x.max(fb.x);
-        let min_y = viewport.y.max(fb.y);
-        let max_x = viewport
-            .x
-            .saturating_add(viewport.width)
-            .min(fb.x.saturating_add(fb.width));
-        let max_y = viewport
-            .y
-            .saturating_add(viewport.height)
-            .min(fb.y.saturating_add(fb.height));
+    fn rect_intersection(
+        (min_x, min_y, max_x, max_y): (usize, usize, usize, usize),
+        rect: ScissorRect,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let min_x = min_x.max(rect.x);
+        let min_y = min_y.max(rect.y);
+        let max_x = max_x.min(rect.x.saturating_add(rect.width));
+        let max_y = max_y.min(rect.y.saturating_add(rect.height));
         if min_x >= max_x || min_y >= max_y {
             None
         } else {
             Some((min_x, min_y, max_x, max_y))
         }
+    }
+
+    #[inline(always)]
+    fn viewport_intersection(&self, viewport: Viewport) -> Option<(usize, usize, usize, usize)> {
+        let fb = self.framebuffer_viewport();
+        Self::rect_intersection(
+            (fb.x, fb.y, fb.x.saturating_add(fb.width), fb.y.saturating_add(fb.height)),
+            ScissorRect {
+                x: viewport.x,
+                y: viewport.y,
+                width: viewport.width,
+                height: viewport.height,
+            },
+        )
     }
 
     #[inline(always)]
@@ -549,21 +570,14 @@ impl<'a> Renderer<'a> {
         bounds: (usize, usize, usize, usize),
         scissor: Option<ScissorRect>,
     ) -> Option<(usize, usize, usize, usize)> {
-        let (mut min_x, mut min_y, mut max_x, mut max_y) = bounds;
-        if let Some(rect) = scissor {
-            min_x = min_x.max(rect.x);
-            min_y = min_y.max(rect.y);
-            max_x = max_x.min(rect.x.saturating_add(rect.width));
-            max_y = max_y.min(rect.y.saturating_add(rect.height));
-        }
-
-        if min_x >= max_x || min_y >= max_y {
-            None
-        } else {
-            Some((min_x, min_y, max_x, max_y))
+        match scissor {
+            Some(rect) => Self::rect_intersection(bounds, rect),
+            None => Some(bounds),
         }
     }
 
+    /// 直接将颜色写入缓冲区，不进行任何混合。
+    #[inline(always)]
     fn write_color_raw_at_offset(&mut self, offset: usize, color: &Color) {
         let format = self.info().format;
         let bpp = format.bytes_per_pixel();
@@ -573,21 +587,9 @@ impl<'a> Renderer<'a> {
 
     #[inline(always)]
     fn read_color_at_offset(&self, offset: usize) -> Color {
-        let src = &self.current_buffer()[offset..offset + self.info().format.bytes_per_pixel()];
-        match self.info().format {
-            crate::color::PixelFormat::Rgb24 => Color::new(src[0], src[1], src[2]),
-            crate::color::PixelFormat::Bgr24 => Color::new(src[2], src[1], src[0]),
-            crate::color::PixelFormat::Xrgb8888 => Color::new(src[2], src[1], src[0]),
-            crate::color::PixelFormat::Argb8888 => {
-                Color::with_alpha(src[2], src[1], src[0], src[3])
-            }
-            crate::color::PixelFormat::Rgba8888 => {
-                Color::with_alpha(src[0], src[1], src[2], src[3])
-            }
-            crate::color::PixelFormat::Bgra8888 => {
-                Color::with_alpha(src[2], src[1], src[0], src[3])
-            }
-        }
+        let format = self.info().format;
+        let bpp = format.bytes_per_pixel();
+        Color::from_bytes(format, &self.current_buffer()[offset..offset + bpp])
     }
 
     #[inline(always)]
@@ -616,15 +618,14 @@ impl<'a> Renderer<'a> {
             ),
             BlendMode::PremultipliedAlpha => {
                 let inv_alpha = 255 - src.a;
+                fn blend_channel(src: u8, dst: u8, inv_alpha: u16) -> u8 {
+                    src.saturating_add(((dst as u16 * inv_alpha + 127) / 255) as u8)
+                }
                 Color::with_alpha(
-                    src.r
-                        .saturating_add((dst.r as u16 * inv_alpha as u16 / 255) as u8),
-                    src.g
-                        .saturating_add((dst.g as u16 * inv_alpha as u16 / 255) as u8),
-                    src.b
-                        .saturating_add((dst.b as u16 * inv_alpha as u16 / 255) as u8),
-                    src.a
-                        .saturating_add((dst.a as u16 * inv_alpha as u16 / 255) as u8),
+                    blend_channel(src.r, dst.r, inv_alpha as u16),
+                    blend_channel(src.g, dst.g, inv_alpha as u16),
+                    blend_channel(src.b, dst.b, inv_alpha as u16),
+                    blend_channel(src.a, dst.a, inv_alpha as u16),
                 )
             }
         }
@@ -681,49 +682,58 @@ impl<'a> Renderer<'a> {
     fn clip_line_segment<V: Interpolate + Copy>(
         vertices: [ProgramVertex<V>; 2],
     ) -> Option<ClippedLine<V>> {
-        const SCALE: f32 = 10000.0;
-        const OFFSET: usize = 10000;
-        const DIM: usize = OFFSET * 3;
+        let p0 = vertices[0].position;
+        let p1 = vertices[1].position;
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let mut t0 = 0.0f32;
+        let mut t1 = 1.0f32;
 
-        let to_pixel = |pos: [f32; 2]| -> (usize, usize) {
-            (
-                (pos[0] * SCALE + OFFSET as f32).max(0.0) as usize,
-                (pos[1] * SCALE + OFFSET as f32).max(0.0) as usize,
-            )
-        };
-        let to_ndc = |px: usize| -> f32 { (px as f32 - OFFSET as f32) / SCALE };
+        let clip_test = |p: f32, q: f32, t0: &mut f32, t1: &mut f32| -> bool {
+            if p.abs() <= f32::EPSILON {
+                return q >= 0.0;
+            }
 
-        let (px0, py0) = to_pixel(vertices[0].position);
-        let (px1, py1) = to_pixel(vertices[1].position);
-        let (cp0, cp1) = clip_line(Pixel::new(px0, py0), Pixel::new(px1, py1), DIM, DIM)?;
-        let pos0 = [to_ndc(cp0.x), to_ndc(cp0.y)];
-        let pos1 = [to_ndc(cp1.x), to_ndc(cp1.y)];
-        let dx = vertices[1].position[0] - vertices[0].position[0];
-        let dy = vertices[1].position[1] - vertices[0].position[1];
-        let (t0, t1) = if dx.abs() >= dy.abs() && dx.abs() > f32::EPSILON {
-            (
-                (pos0[0] - vertices[0].position[0]) / dx,
-                (pos1[0] - vertices[0].position[0]) / dx,
-            )
-        } else if dy.abs() > f32::EPSILON {
-            (
-                (pos0[1] - vertices[0].position[1]) / dy,
-                (pos1[1] - vertices[0].position[1]) / dy,
-            )
-        } else {
-            (0.0, 1.0)
+            let r = q / p;
+            if p < 0.0 {
+                if r > *t1 {
+                    return false;
+                }
+                if r > *t0 {
+                    *t0 = r;
+                }
+            } else {
+                if r < *t0 {
+                    return false;
+                }
+                if r < *t1 {
+                    *t1 = r;
+                }
+            }
+            true
         };
+
+        if !clip_test(-dx, p0[0], &mut t0, &mut t1)
+            || !clip_test(dx, 1.0 - p0[0], &mut t0, &mut t1)
+            || !clip_test(-dy, p0[1], &mut t0, &mut t1)
+            || !clip_test(dy, 1.0 - p0[1], &mut t0, &mut t1)
+            || t0 > t1
+        {
+            return None;
+        }
 
         Some(ClippedLine {
-            start: ProgramVertex {
-                position: pos0,
-                varying: V::lerp(vertices[0].varying, vertices[1].varying, t0),
-            },
-            end: ProgramVertex {
-                position: pos1,
-                varying: V::lerp(vertices[0].varying, vertices[1].varying, t1),
-            },
+            start: Self::interpolate_vertex(vertices[0], vertices[1], t0),
+            end: Self::interpolate_vertex(vertices[0], vertices[1], t1),
         })
+    }
+
+    #[inline(always)]
+    fn fragment_input<V>(varying: V, x: usize, y: usize) -> FragmentInput<V> {
+        FragmentInput {
+            varying,
+            position: [x as f32 + 0.5, y as f32 + 0.5],
+        }
     }
 
     fn clip_triangle<V: Interpolate + Copy>(
@@ -833,8 +843,9 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        if let FragmentOutput::Color(color) =
-            pipeline.fragment_shader.shade_fragment(&vertex.varying)
+        if let FragmentOutput::Color(color) = pipeline
+            .fragment_shader
+            .shade_fragment(Self::fragment_input(vertex.varying, x, y))
         {
             self.write_fragment_color(x, y, &color, pipeline.state.blend);
         }
@@ -877,7 +888,9 @@ impl<'a> Renderer<'a> {
             }
 
             let varying = V::lerp(clipped.start.varying, clipped.end.varying, t);
-            if let FragmentOutput::Color(color) = pipeline.fragment_shader.shade_fragment(&varying)
+            if let FragmentOutput::Color(color) = pipeline
+                .fragment_shader
+                .shade_fragment(Self::fragment_input(varying, px, py))
             {
                 self.write_fragment_color(px, py, &color, pipeline.state.blend);
             }
@@ -956,7 +969,10 @@ impl<'a> Renderer<'a> {
                         w1 * inv_area,
                         w2 * inv_area,
                     );
-                    match pipeline.fragment_shader.shade_fragment(&varying) {
+                    match pipeline
+                        .fragment_shader
+                        .shade_fragment(Self::fragment_input(varying, x, y))
+                    {
                         FragmentOutput::Color(color) => {
                             self.write_fragment_color(x, y, &color, pipeline.state.blend);
                         }
@@ -1032,15 +1048,20 @@ impl<'a> Renderer<'a> {
         VS::Varying: Interpolate + Copy,
         FS: FragmentShader<Varying = VS::Varying>,
     {
+        let mut shaded_vertices = alloc::vec![None; vertices.len()];
+        let mut shade = |vertex_index: usize| -> Option<ProgramVertex<VS::Varying>> {
+            let slot = shaded_vertices.get_mut(vertex_index)?;
+            Some(*slot.get_or_insert_with(|| {
+                pipeline.vertex_shader.shade_vertex(&vertices[vertex_index])
+            }))
+        };
+
         match primitive {
             PrimitiveType::Points => {
                 for index in indices {
                     let vertex_index = *index as usize;
-                    if vertex_index < vertices.len() {
-                        self.shade_vertex_point(
-                            pipeline.vertex_shader.shade_vertex(&vertices[vertex_index]),
-                            pipeline,
-                        );
+                    if let Some(vertex) = shade(vertex_index) {
+                        self.shade_vertex_point(vertex, pipeline);
                     }
                 }
             }
@@ -1049,14 +1070,8 @@ impl<'a> Renderer<'a> {
                 while index + 1 < indices.len() {
                     let i0 = indices[index] as usize;
                     let i1 = indices[index + 1] as usize;
-                    if i0 < vertices.len() && i1 < vertices.len() {
-                        self.rasterize_line(
-                            [
-                                pipeline.vertex_shader.shade_vertex(&vertices[i0]),
-                                pipeline.vertex_shader.shade_vertex(&vertices[i1]),
-                            ],
-                            pipeline,
-                        );
+                    if let (Some(v0), Some(v1)) = (shade(i0), shade(i1)) {
+                        self.rasterize_line([v0, v1], pipeline);
                     }
                     index += 2;
                 }
@@ -1067,15 +1082,8 @@ impl<'a> Renderer<'a> {
                     let i0 = indices[index] as usize;
                     let i1 = indices[index + 1] as usize;
                     let i2 = indices[index + 2] as usize;
-                    if i0 < vertices.len() && i1 < vertices.len() && i2 < vertices.len() {
-                        self.rasterize_triangle(
-                            [
-                                pipeline.vertex_shader.shade_vertex(&vertices[i0]),
-                                pipeline.vertex_shader.shade_vertex(&vertices[i1]),
-                                pipeline.vertex_shader.shade_vertex(&vertices[i2]),
-                            ],
-                            pipeline,
-                        );
+                    if let (Some(v0), Some(v1), Some(v2)) = (shade(i0), shade(i1), shade(i2)) {
+                        self.rasterize_triangle([v0, v1, v2], pipeline);
                     }
                     index += 3;
                 }
@@ -1118,8 +1126,8 @@ mod tests {
     impl FragmentShader for SolidFs {
         type Varying = Color;
 
-        fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-            FragmentOutput::Color(*varying)
+        fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+            FragmentOutput::Color(input.varying)
         }
     }
 
@@ -1128,7 +1136,7 @@ mod tests {
     impl FragmentShader for WhiteFs {
         type Varying = ();
 
-        fn shade_fragment(&self, _: &Self::Varying) -> FragmentOutput {
+        fn shade_fragment(&self, _: FragmentInput<Self::Varying>) -> FragmentOutput {
             FragmentOutput::Color(Color::new(255, 255, 255))
         }
     }
@@ -1138,8 +1146,8 @@ mod tests {
     impl FragmentShader for DiscardRightHalfFs {
         type Varying = [f32; 2];
 
-        fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-            if varying[0] > 0.5 {
+        fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+            if input.varying[0] > 0.5 {
                 FragmentOutput::Discard
             } else {
                 FragmentOutput::Color(Color::new(255, 255, 255))
@@ -1189,8 +1197,8 @@ mod tests {
     impl FragmentShader for TextureFs<'_> {
         type Varying = [f32; 2];
 
-        fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-            FragmentOutput::Color(self.texture.sample_nearest(*varying))
+        fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+            FragmentOutput::Color(self.texture.sample_nearest(input.varying))
         }
     }
 
@@ -1530,8 +1538,8 @@ mod tests {
         impl FragmentShader for FlatFs {
             type Varying = Flat<Color>;
 
-            fn shade_fragment(&self, varying: &Self::Varying) -> FragmentOutput {
-                FragmentOutput::Color(varying.0)
+            fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+                FragmentOutput::Color(input.varying.0)
             }
         }
 
@@ -1543,6 +1551,101 @@ mod tests {
         renderer.draw_arrays(PrimitiveType::Triangles, &vertices, &pipeline);
 
         assert_eq!(renderer.get_pixel(1, 1), Some(Color::new(255, 0, 0)));
+    }
+
+    #[test]
+    fn fragment_input_exposes_pixel_center_position() {
+        struct PixelCenterFs;
+
+        impl FragmentShader for PixelCenterFs {
+            type Varying = ();
+
+            fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+                if input.position == [1.5, 1.5] {
+                    FragmentOutput::Color(Color::new(255, 255, 255))
+                } else {
+                    FragmentOutput::Discard
+                }
+            }
+        }
+
+        let mut renderer = test_renderer(4, 4);
+        renderer.clear(Color::new(0, 0, 0));
+        let vertices = [
+            Vertex2D {
+                position: [1.0 / 3.0, 1.0 / 3.0],
+                varying: (),
+            },
+            Vertex2D {
+                position: [1.0, 1.0 / 3.0],
+                varying: (),
+            },
+            Vertex2D {
+                position: [1.0 / 3.0, 1.0],
+                varying: (),
+            },
+        ];
+        let pipeline = Pipeline::new(
+            Passthrough2D::new(),
+            PixelCenterFs,
+            PipelineState::alpha_blend(Viewport::new(0, 0, 4, 4)),
+        );
+
+        renderer.draw_arrays(PrimitiveType::Triangles, &vertices, &pipeline);
+
+        assert_eq!(renderer.get_pixel(1, 1), Some(Color::new(255, 255, 255)));
+        assert_eq!(renderer.get_pixel(2, 1), Some(Color::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn draw_indexed_reuses_vertex_shader_results() {
+        use core::cell::Cell;
+
+        #[derive(Clone, Copy)]
+        struct CountingVs<'a> {
+            calls: &'a Cell<usize>,
+        }
+
+        impl VertexShader for CountingVs<'_> {
+            type Input = Vertex2D<Color>;
+            type Varying = Color;
+
+            fn shade_vertex(&self, input: &Self::Input) -> ProgramVertex<Self::Varying> {
+                self.calls.set(self.calls.get() + 1);
+                (*input).into()
+            }
+        }
+
+        let calls = Cell::new(0usize);
+        let mut renderer = test_renderer(4, 4);
+        let vertices = [
+            Vertex2D {
+                position: [0.0, 0.0],
+                varying: Color::new(255, 0, 0),
+            },
+            Vertex2D {
+                position: [1.0, 0.0],
+                varying: Color::new(0, 255, 0),
+            },
+            Vertex2D {
+                position: [1.0, 1.0],
+                varying: Color::new(0, 0, 255),
+            },
+            Vertex2D {
+                position: [0.0, 1.0],
+                varying: Color::new(255, 255, 0),
+            },
+        ];
+        let indices = [0u16, 1, 2, 0, 2, 3];
+        let pipeline = Pipeline::new(
+            CountingVs { calls: &calls },
+            SolidFs,
+            PipelineState::alpha_blend(Viewport::new(0, 0, 4, 4)),
+        );
+
+        renderer.draw_indexed(PrimitiveType::Triangles, &vertices, &indices, &pipeline);
+
+        assert_eq!(calls.get(), vertices.len());
     }
 
     #[test]
