@@ -419,6 +419,458 @@ pub const MAGENTA: Color = color!(255, 0, 255);
 /// 灰色 `(128, 128, 128)`。
 pub const GRAY: Color = color!(128, 128, 128);
 
+// ———————————————————————————————— SWAR Alpha 混合 ————————————————————————————————
+
+/// 面向 4bpp 像素格式的 SWAR（SIMD Within A Register）Alpha 混合内核。
+///
+/// 只用 32 位整数运算，不依赖任何架构 intrinsics 或内联汇编，
+/// 因此在 `no_std` 与任意目标上都可用。
+///
+/// 布局约定：一个 `u32` 字按小端序承载 4 个字节 `[c0, c1, c2, c3]`，
+/// 即字节 `i` 位于位 `8i`。SWAR 运算时先把待处理的字节「摊」到 16 位槽里，
+/// 空出的高 8 位用作乘法与加法的进位空间。
+pub(crate) mod swar {
+    use super::{Color, PixelFormat};
+
+    /// 「偶数号字节」掩码：保留 `c0`、`c2`，抹掉 `c1`、`c3`。
+    ///
+    /// 被保留的字节因此各自独占一个 16 位槽（低 8 位是数据，高 8 位空出）。
+    const LANE_MASK: u32 = 0x00FF_00FF;
+
+    /// 每个 16 位槽的舍入项，等价于 [`PixelFormat::blend_channel`] 里的 `+ 255`。
+    ///
+    /// 数值与 [`LANE_MASK`] 相同，但语义不同（把 255 加到每个槽上），
+    /// 故单独命名。
+    const ROUND_LANES: u32 = 0x00FF_00FF;
+
+    /// 构造与目标字同布局的 SWAR 源字。
+    ///
+    /// 返回字的 4 个字节依次为 `[c0, c1, c2, opaque_alpha]`：`is_rgb_order`
+    /// 为真时 `c0..c2` 是 R/G/B，否则是 B/G/R。第 4 字节在混合后会被强制
+    /// 覆写成 `opaque_alpha`，这里的取值只影响一个即将被丢弃的槽。
+    #[inline(always)]
+    pub(crate) fn source_word(r: u8, g: u8, b: u8, opaque_alpha: u8, is_rgb_order: bool) -> u32 {
+        let (c0, c1, c2) = if is_rgb_order { (r, g, b) } else { (b, g, r) };
+        (c0 as u32) | ((c1 as u32) << 8) | ((c2 as u32) << 16) | ((opaque_alpha as u32) << 24)
+    }
+
+    /// 对两个「偶数号字节」槽并行执行一次 `(d*(255-a) + s*a + 255) >> 8`。
+    ///
+    /// `d` / `s` 必须已用 [`LANE_MASK`] 把待处理字节放进 16 位槽的低 8 位；
+    /// 返回值的槽布局与输入一致，每个槽的低 8 位是混合结果。
+    ///
+    /// # 取值范围
+    ///
+    /// 因为 `a ≤ 255`，槽内各项都不超过 65025：
+    ///
+    /// | 项 | 上界 |
+    /// |----|------|
+    /// | `d * 255` | 65025 |
+    /// | `d * a` | 65025 |
+    /// | `s * a` | 65025 |
+    /// | `d*255 - d*a + s*a = d*(255-a) + s*a` | 65025 |
+    /// | 再加舍入项 `255` | 65280 |
+    ///
+    /// 中间量 `d*255 - d*a` 与最终结果都落在 `[0, 65025]`，因此槽与槽之间
+    /// 既不会进位也不会借位，整个 32 位字也不会回绕（debug 下不会触发溢出检查）。
+    #[inline(always)]
+    fn blend_lane_pairs(d: u32, s: u32, alpha: u32) -> u32 {
+        // `d*255` 展开成 `(d << 8) - d`，省掉一次乘法。`d` 已被 LANE_MASK
+        // 约束为每槽只占低 8 位，左移不会丢失任何数据。
+        let blended = (d << 8) - d - d * alpha + s * alpha + ROUND_LANES;
+        (blended >> 8) & LANE_MASK
+    }
+
+    /// 用 SWAR 对 4 个 8 位通道并行做 Alpha 混合。
+    ///
+    /// `word` 与 `src` 都按小端字节序布局，返回值的字节 `i` 等于
+    /// `PixelFormat::blend_channel(src_i, word_i, alpha, 255 - alpha)`，
+    /// 与逐通道参考实现逐字节一致。
+    ///
+    /// # 为什么分两批
+    ///
+    /// 逐通道参考式 `s*a + d*(255-a)` 的中间值需要 16 位，4 个通道就要 64 位；
+    /// 这里把 `c0`/`c2` 留在原位、`c1`/`c3` 右移 8 位，于是一个 32 位字恰好
+    /// 同时容纳两个通道的 16 位中间值，两批各处理两个通道。
+    ///
+    /// 直接展开 `s*a + d*(255-a)` 的中间和可达 `130050 > 2^16`，会跨槽进位；
+    /// 改写成 `d*255 - d*a + s*a` 后每一项都不超过 65025，槽内自洽
+    /// （推导见 [`blend_lane_pairs`]）。
+    #[inline(always)]
+    pub(crate) fn blend_word(word: u32, src: u32, alpha: u8) -> u32 {
+        let a = alpha as u32;
+        let even = blend_lane_pairs(word & LANE_MASK, src & LANE_MASK, a);
+        let odd = blend_lane_pairs((word >> 8) & LANE_MASK, (src >> 8) & LANE_MASK, a);
+        even | (odd << 8)
+    }
+
+    /// 对 4bpp 格式的一行像素做 SWAR 批量 Alpha 混合。
+    ///
+    /// 每次处理 4 个像素（16 字节 = 4 个 `u32` 字），不足 4 像素的尾部回退到
+    /// 逐通道实现。第 4 字节恒被写成 `opaque_alpha` 而不参与插值
+    /// （`Xrgb8888` 为 0，其余 4bpp 格式为 255）。
+    ///
+    /// `color.a` 必须落在 `1..=254`：完全透明由调用方提前跳过，完全不透明走
+    /// 不透明填充路径。
+    ///
+    /// # Safety
+    ///
+    /// * `row` 必须指向 `pixel_count * 4` 字节的可写区域；
+    /// * `row` 必须按 4 字节对齐（内核按 `u32` 读写）。
+    #[inline(never)]
+    pub(crate) unsafe fn blend_span_alpha_4bpp(
+        row: *mut u8,
+        pixel_count: usize,
+        color: &Color,
+        is_rgb_order: bool,
+        opaque_alpha: u8,
+    ) {
+        let alpha = color.a;
+        let src_word = source_word(color.r, color.g, color.b, opaque_alpha, is_rgb_order);
+        let opaque_word = (opaque_alpha as u32) << 24;
+
+        let quads = pixel_count / 4;
+        for quad in 0..quads {
+            // SAFETY: 调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，
+            // 故 quad * 16 + 16 <= quads * 16 <= pixel_count * 4，且每次访问都对齐。
+            let dst = unsafe { row.add(quad * 16) as *mut u32 };
+            for lane in 0..4 {
+                unsafe {
+                    let word = *dst.add(lane);
+                    let blended = blend_word(word, src_word, alpha);
+                    // 第 4 字节必须恒为 opaque_alpha，而不是参与混合的结果——
+                    // 与逐像素路径的 `*dst.add(3) = opaque_alpha` 保持一致。
+                    *dst.add(lane) = (blended & 0x00FF_FFFF) | opaque_word;
+                }
+            }
+        }
+
+        // 尾部不足 4 像素的部分回退到逐通道路径
+        let alpha16 = alpha as u16;
+        let inv_alpha = 255 - alpha16;
+        let (c0, c1, c2) = if is_rgb_order {
+            (color.r, color.g, color.b)
+        } else {
+            (color.b, color.g, color.r)
+        };
+        for pixel_idx in (quads * 4)..pixel_count {
+            // SAFETY: pixel_idx < pixel_count，故 pixel_idx * 4 + 4 <= pixel_count * 4。
+            let dst = unsafe { row.add(pixel_idx * 4) };
+            unsafe {
+                *dst = PixelFormat::blend_channel(c0, *dst, alpha16, inv_alpha);
+                *dst.add(1) = PixelFormat::blend_channel(c1, *dst.add(1), alpha16, inv_alpha);
+                *dst.add(2) = PixelFormat::blend_channel(c2, *dst.add(2), alpha16, inv_alpha);
+                *dst.add(3) = opaque_alpha;
+            }
+        }
+    }
+
+    /// 对 4bpp 格式的一行像素做掩码（逐像素 alpha）混合。
+    ///
+    /// 与 [`blend_span_alpha_4bpp`] 的区别是：每个像素的透明度来自掩码而不是
+    /// 同一个源色，且 `mask == 0` 要跳过该像素、`mask == 255` 直接不透明写入。
+    ///
+    /// 掩码逐像素变化，无法像跨度填充那样把整行当作一个常量源字，但每个像素
+    /// 内部的 3 个颜色通道仍可由 [`blend_word`] 并行处理：一次 32 位读-改-写
+    /// 替代 3 次逐通道混合加 3 次字节写。
+    ///
+    /// # Safety
+    ///
+    /// * `row` 必须指向 `pixel_count * 4` 字节的可写区域，且按 4 字节对齐；
+    /// * `mask` 必须指向 `pixel_count` 个可读字节。
+    #[inline(never)]
+    pub(crate) unsafe fn blend_masked_row_4bpp(
+        row: *mut u8,
+        mask: *const u8,
+        pixel_count: usize,
+        color: &Color,
+        is_rgb_order: bool,
+        opaque_alpha: u8,
+    ) {
+        let src_word = source_word(color.r, color.g, color.b, opaque_alpha, is_rgb_order);
+        let opaque_word = (opaque_alpha as u32) << 24;
+        // 不透明直写用的整像素字：通道顺序与目标字一致，第 4 字节为 opaque_alpha
+        let (c0, c1, c2) = if is_rgb_order {
+            (color.r, color.g, color.b)
+        } else {
+            (color.b, color.g, color.r)
+        };
+        let opaque_pixel =
+            (c0 as u32) | ((c1 as u32) << 8) | ((c2 as u32) << 16) | opaque_word;
+
+        for idx in 0..pixel_count {
+            // SAFETY: 调用方保证 mask 至少有 pixel_count 个可读字节
+            let m = unsafe { *mask.add(idx) };
+            if m == 0 {
+                // 完全透明：整像素跳过，不读也不写
+                continue;
+            }
+            // SAFETY: 调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，
+            // 故 idx * 4 + 4 <= pixel_count * 4，且每次 u32 访问都对齐。
+            let dst = unsafe { row.add(idx * 4) };
+            if m == 255 {
+                // 不透明：直接写整像素，省掉一次读-改-写
+                unsafe { *(dst as *mut u32) = opaque_pixel };
+            } else {
+                unsafe {
+                    let word = *(dst as *const u32);
+                    let blended = blend_word(word, src_word, m);
+                    // 第 4 字节恒为 opaque_alpha，不参与混合
+                    *(dst as *mut u32) = (blended & 0x00FF_FFFF) | opaque_word;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{blend_masked_row_4bpp, blend_span_alpha_4bpp, blend_word, source_word};
+        use crate::color::{Color, PixelFormat};
+
+        /// 4bpp 格式的 `(格式, opaque_alpha)` 组合。
+        const FORMATS: [(PixelFormat, u8); 4] = [
+            (PixelFormat::Xrgb8888, 0),
+            (PixelFormat::Rgba8888, 255),
+            (PixelFormat::Bgra8888, 255),
+            (PixelFormat::Argb8888, 255),
+        ];
+
+        /// 逐槽对照参考实现：全 alpha 扫描 × 代表性字节组合。
+        ///
+        /// 4 个槽填入互不相同的字节，一次调用即可同时校验 4 条通道，
+        /// 也能暴露「某一槽的结果被相邻槽污染」这类错误。
+        #[test]
+        fn blend_word_matches_blend_channel_over_all_alphas() {
+            const SAMPLES: [u8; 11] = [0, 1, 2, 63, 64, 127, 128, 129, 192, 254, 255];
+
+            for alpha in 1u8..=254 {
+                let inv = 255 - alpha as u16;
+                for s in SAMPLES {
+                    for d in SAMPLES {
+                        let src_bytes =
+                            [s, s.wrapping_add(1), s.wrapping_add(2), s.wrapping_add(3)];
+                        let dst_bytes =
+                            [d, d.wrapping_add(1), d.wrapping_add(2), d.wrapping_add(3)];
+                        let got = blend_word(
+                            u32::from_le_bytes(dst_bytes),
+                            u32::from_le_bytes(src_bytes),
+                            alpha,
+                        )
+                        .to_le_bytes();
+
+                        for lane in 0..4 {
+                            assert_eq!(
+                                got[lane],
+                                PixelFormat::blend_channel(
+                                    src_bytes[lane],
+                                    dst_bytes[lane],
+                                    alpha as u16,
+                                    inv
+                                ),
+                                "alpha={alpha} src={} dst={} lane={lane}",
+                                src_bytes[lane],
+                                dst_bytes[lane]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// 穷举 `(src, dst)` 的全部 65536 种字节组合（固定若干 alpha）。
+        ///
+        /// 这是等价性的最强形式：任意一对字节值都必须与 `blend_channel` 一致。
+        #[test]
+        fn blend_word_matches_blend_channel_over_all_byte_pairs() {
+            for alpha in [1u8, 2, 85, 127, 128, 170, 254] {
+                let inv = 255 - alpha as u16;
+                for s in 0u8..=255 {
+                    for d in 0u8..=255 {
+                        // 高位槽填互补值，进一步验证槽间互不干扰
+                        let src_bytes = [s, 255 - s, s, 255 - s];
+                        let dst_bytes = [d, d, 255 - d, 255 - d];
+                        let got = blend_word(
+                            u32::from_le_bytes(dst_bytes),
+                            u32::from_le_bytes(src_bytes),
+                            alpha,
+                        )
+                        .to_le_bytes();
+
+                        for lane in 0..4 {
+                            assert_eq!(
+                                got[lane],
+                                PixelFormat::blend_channel(
+                                    src_bytes[lane],
+                                    dst_bytes[lane],
+                                    alpha as u16,
+                                    inv
+                                ),
+                                "alpha={alpha} src={s} dst={d} lane={lane}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// `source_word` 的字节序必须跟随 `is_rgb_order`，且第 4 字节填 `opaque_alpha`。
+        #[test]
+        fn source_word_follows_byte_order() {
+            assert_eq!(
+                source_word(0x12, 0x34, 0x56, 0x78, true),
+                0x78_56_34_12,
+                "RGB 序应把 R 放在最低字节"
+            );
+            assert_eq!(
+                source_word(0x12, 0x34, 0x56, 0x78, false),
+                0x78_12_34_56,
+                "BGR 序应把 B 放在最低字节"
+            );
+        }
+
+        /// 掩码行混合必须与 [`PixelFormat::write_color`] 参考逐字节一致。
+        ///
+        /// 掩码交替取 0 / 255 / 中间值，覆盖「跳过」「不透明直写」「混合」
+        /// 三条分支；`mask == 0` 的像素连第 4 字节都不应被改动。
+        #[test]
+        fn blend_masked_row_matches_write_color_reference() {
+            const WIDTH: usize = 9;
+            const MASK: [u8; WIDTH] = [0, 255, 1, 128, 254, 0, 255, 77, 200];
+            let color = Color::new(0x12, 0x34, 0x56);
+
+            // 用 u32 数组承载，保证行首 4 字节对齐（内核按 u32 读写）
+            let mut storage = [0u32; WIDTH + 2];
+            // SAFETY: storage 是有效的 u32 数组，字节视图长度为其 4 倍。
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, storage.len() * 4)
+            };
+
+            for (format, opaque_alpha) in FORMATS {
+                let is_rgb_order = format.red_shift() == 0;
+                // 目标像素种入确定性的非平凡值，第 4 字节置非零以验证会被覆写
+                let mut original = [0u8; WIDTH * 4];
+                for x in 0..WIDTH {
+                    let seed = [
+                        (x * 37 + 11) as u8,
+                        (x * 91 + 5) as u8,
+                        (x * 13 + 200) as u8,
+                        0x7F,
+                    ];
+                    bytes[4 + x * 4..8 + x * 4].copy_from_slice(&seed);
+                    original[x * 4..x * 4 + 4].copy_from_slice(&seed);
+                }
+
+                // SAFETY: row 指向 bytes 中 4 + WIDTH * 4 字节的可写区域，
+                // 且因来自 u32 数组而满足 4 字节对齐；MASK 有 WIDTH 个可读字节。
+                unsafe {
+                    blend_masked_row_4bpp(
+                        bytes.as_mut_ptr().add(4),
+                        MASK.as_ptr(),
+                        WIDTH,
+                        &color,
+                        is_rgb_order,
+                        opaque_alpha,
+                    )
+                };
+
+                for x in 0..WIDTH {
+                    let mut want = [0u8; 4];
+                    want.copy_from_slice(&original[x * 4..x * 4 + 4]);
+                    if MASK[x] != 0 {
+                        // 掩码字节直接作为该像素的绘制 alpha
+                        format.write_color(&mut want, &color.mix_alpha(MASK[x]));
+                    }
+                    assert_eq!(
+                        &bytes[4 + x * 4..8 + x * 4],
+                        &want[..],
+                        "{format:?} 列 {x}（mask={}）",
+                        MASK[x]
+                    );
+                }
+            }
+        }
+
+        /// 跨度填充必须与安全的逐像素参考 [`PixelFormat::write_color`] 完全一致。
+        ///
+        /// 覆盖 3 种宽度形态：纯尾部（不足 4 像素）、整 4 像素分组、分组 + 尾部；
+        /// 同时用首尾哨兵验证不会越界写。
+        #[test]
+        fn blend_span_matches_write_color_reference() {
+            const MAX_WIDTH: usize = 9;
+            let color = Color::with_alpha(200, 30, 90, 77);
+
+            // 用 u32 数组承载，保证行首 4 字节对齐（SWAR 内核按 u32 读写）
+            let mut storage = [0xA5A5_A5A5u32; MAX_WIDTH + 2];
+            // SAFETY: storage 是有效的 u32 数组，字节视图长度为其 4 倍。
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, storage.len() * 4)
+            };
+
+            for width in [1usize, 3, 4, 5, 8, 9] {
+                for (format, opaque_alpha) in FORMATS {
+                    let is_rgb_order = format.red_shift() == 0;
+
+                    // 目标像素种入确定性的非平凡值，避免「零缓冲恰好正确」
+                    let mut original = [0u8; MAX_WIDTH * 4];
+                    for x in 0..width {
+                        let seed = [
+                            (x * 37 + 11) as u8,
+                            (x * 91 + 5) as u8,
+                            (x * 13 + 200) as u8,
+                            0x7F,
+                        ];
+                        bytes[4 + x * 4..8 + x * 4].copy_from_slice(&seed);
+                        original[x * 4..x * 4 + 4].copy_from_slice(&seed);
+                    }
+                    let head = u32::from_ne_bytes(bytes[0..4].try_into().expect("4 字节"));
+                    let tail = u32::from_ne_bytes(
+                        bytes[(width + 1) * 4..(width + 2) * 4]
+                            .try_into()
+                            .expect("4 字节"),
+                    );
+
+                    // SAFETY: row 指向 bytes 中 4 + width * 4 字节的可写区域，
+                    // 且因来自 u32 数组而满足 4 字节对齐。
+                    unsafe {
+                        blend_span_alpha_4bpp(
+                            bytes.as_mut_ptr().add(4),
+                            width,
+                            &color,
+                            is_rgb_order,
+                            opaque_alpha,
+                        )
+                    };
+
+                    for x in 0..width {
+                        let mut want = [0u8; 4];
+                        want.copy_from_slice(&original[x * 4..x * 4 + 4]);
+                        format.write_color(&mut want, &color);
+                        assert_eq!(
+                            &bytes[4 + x * 4..8 + x * 4],
+                            &want[..],
+                            "width={width} {format:?} 列 {x}"
+                        );
+                    }
+                    assert_eq!(
+                        u32::from_ne_bytes(bytes[0..4].try_into().expect("4 字节")),
+                        head,
+                        "width={width} 行首哨兵被改写"
+                    );
+                    assert_eq!(
+                        u32::from_ne_bytes(
+                            bytes[(width + 1) * 4..(width + 2) * 4]
+                                .try_into()
+                                .expect("4 字节")
+                        ),
+                        tail,
+                        "width={width} 行尾哨兵被改写"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Color, ColorParseError, PixelFormat};

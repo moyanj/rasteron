@@ -1,4 +1,6 @@
 use crate::Pixel;
+#[cfg(feature = "simd")]
+use crate::simd;
 
 /// Cohen–Sutherland 线段裁剪算法，针对矩形视口。
 ///
@@ -32,8 +34,8 @@ pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(P
         code
     }
 
-    let (mut x1, mut y1) = (saturating_usize_to_i64(p1.x), saturating_usize_to_i64(p1.y));
-    let (mut x2, mut y2) = (saturating_usize_to_i64(p2.x), saturating_usize_to_i64(p2.y));
+    let (mut x1, mut y1) = (sat_i64(p1.x), sat_i64(p1.y));
+    let (mut x2, mut y2) = (sat_i64(p2.x), sat_i64(p2.y));
     let mut code1 = compute_code(x1, y1, width, height);
     let mut code2 = compute_code(x2, y2, width, height);
 
@@ -112,7 +114,7 @@ fn intersect_axis(a: i64, b: i64, num: i64, den: i64) -> i64 {
 /// 超过 [`i64::MAX`] 的值会被截断为 [`i64::MAX`]。
 /// 内部用于在插值运算中避免负数。
 #[inline(always)]
-pub(crate) fn saturating_usize_to_i64(value: usize) -> i64 {
+pub(crate) fn sat_i64(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64
 }
 
@@ -123,4 +125,51 @@ pub(crate) fn saturating_usize_to_i64(value: usize) -> i64 {
 #[inline(always)]
 pub(crate) fn floor_to_usize(value: f32) -> usize {
     if value < 0.0 { 0 } else { value as usize }
+}
+
+/// 用重复模式填充整个切片。
+///
+/// 对 4bpp 等能整除 16 的格式，模式固定为 16 字节：按 16 字节块**直接重复写入**，
+/// 而不是"复制已填部分来翻倍"。后者需要 `O(log n)` 次串行 `memcpy`，
+/// 每次的源区域都不同、无法向量化，且总写入量随步数累积；直接块写是
+/// 单一 stready-state 循环，流水线友好。
+///
+/// 3bpp 无法整除 16，退回逐次倍增复制。
+#[inline(always)]
+pub fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
+    let len = row.len();
+    let pattern_len = pattern.len();
+    if pattern_len == 0 || len <= pattern_len {
+        return;
+    }
+
+    // 16 字节定长块：直接铺满，无倍增链
+    if pattern_len == 16 {
+        let mut block = [0u8; 16];
+        block.copy_from_slice(&pattern[..16]);
+        let mut offset = 16;
+        while offset + 16 <= len {
+            row[offset..offset + 16].copy_from_slice(&block);
+            offset += 16;
+        }
+        if offset < len {
+            let tail = len - offset;
+            row[offset..].copy_from_slice(&block[..tail]);
+        }
+        return;
+    }
+
+    // 非 16 字节模式（3bpp）：逐次倍增复制
+    let base = row.as_mut_ptr();
+    let mut filled = pattern_len;
+    while filled < len {
+        let copy_len = core::cmp::min(filled, len - filled);
+        unsafe {
+            #[cfg(feature = "simd")]
+            simd::memcpy(base.add(filled), base, copy_len);
+            #[cfg(not(feature = "simd"))]
+            core::ptr::copy_nonoverlapping(base, base.add(filled), copy_len);
+        }
+        filled += copy_len;
+    }
 }

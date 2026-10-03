@@ -12,6 +12,39 @@ use rasteron::programmable::{
 
 const BENCH_FORMATS: [PixelFormat; 1] = [PixelFormat::Bgr24];
 
+/// 覆盖 SWAR 批量 Alpha 混合路径的格式组合。
+///
+/// 4bpp 格式（`Rgba8888` / `Xrgb8888`）走 SWAR 内核，`Bgr24` 因跨字节错位
+/// 始终走逐通道回退，作为对照基线；`Xrgb8888` 与 `Rgba8888` 的
+/// `opaque_alpha` 分别是 0 与 255，可覆盖第 4 字节的两种处理。
+const ALPHA_BENCH_FORMATS: [PixelFormat; 3] = [
+    PixelFormat::Rgba8888,
+    PixelFormat::Xrgb8888,
+    PixelFormat::Bgr24,
+];
+
+/// 构造抗锯齿风格的掩码：圆内为 255、圆外为 0，边缘一圈为中间值。
+///
+/// 这类掩码是 `blit_mask` 的典型输入（字体/图形边缘），用于观察
+/// 「0 / 255 占多数」时掩码批量路径的分组命中情况。
+fn antialiased_mask(width: usize, height: usize) -> Vec<u8> {
+    let cx = width as f32 / 2.0;
+    let cy = height as f32 / 2.0;
+    let radius = width.min(height) as f32 / 2.0 - 1.0;
+    let mut mask = vec![0u8; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let distance = (dx * dx + dy * dy).sqrt();
+            // 距边界 ±0.5 像素内线性过渡，得到一圈中间值
+            let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
+            mask[y * width + x] = (coverage * 255.0).round() as u8;
+        }
+    }
+    mask
+}
+
 fn criterion_config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(4))
@@ -396,35 +429,6 @@ fn bench_fill_circle(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_fill_rounded_rect(c: &mut Criterion) {
-    let width = 640usize;
-    let height = 360usize;
-    let mut group = c.benchmark_group("fill_rounded_rect");
-
-    for format in BENCH_FORMATS {
-        let (mut renderer, _front) = make_renderer(width, height, format);
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{format:?}")),
-            &format,
-            |b, _| {
-                let mut x = 16usize;
-                b.iter(|| {
-                    renderer.fill_rounded_rect(
-                        black_box(Pixel::new(x, 32)),
-                        black_box(width - 48),
-                        black_box(96usize),
-                        black_box(16usize),
-                        black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
-                    );
-                    x = (x + 32) % 128 + 16;
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
 fn bench_blit(c: &mut Criterion) {
     let width = 640usize;
     let height = 360usize;
@@ -461,18 +465,80 @@ fn bench_blit(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_fill_rect_alpha(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("fill_rect_alpha");
+    group.throughput(Throughput::Elements((width * height) as u64));
+
+    for format in ALPHA_BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                b.iter(|| {
+                    renderer.fill_rect(
+                        black_box(Pixel::new(0, 0)),
+                        black_box(width),
+                        black_box(height),
+                        black_box(Color::with_alpha(0x12, 0x34, 0x56, 0x80)),
+                    );
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_blit_mask(c: &mut Criterion) {
     let width = 640usize;
     let height = 360usize;
     let mut group = c.benchmark_group("blit_mask");
     group.throughput(Throughput::Elements(64 * 64));
 
-    for format in BENCH_FORMATS {
+    for format in ALPHA_BENCH_FORMATS {
         let (mut renderer, _front) = make_renderer(width, height, format);
         let src_w = 64usize;
         let src_h = 64usize;
         let mask_pitch = src_w;
         let mask = vec![128u8; mask_pitch * src_h];
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{format:?}")),
+            &format,
+            |b, _| {
+                let mut x = 0usize;
+                b.iter(|| {
+                    renderer.blit_mask(
+                        black_box(Pixel::new(x, 32)),
+                        black_box(src_w),
+                        black_box(src_h),
+                        black_box(&mask),
+                        black_box(mask_pitch),
+                        black_box(Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
+                    x = (x + 32) % (width - src_w - 16) + 8;
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_blit_mask_antialiased(c: &mut Criterion) {
+    let width = 640usize;
+    let height = 360usize;
+    let mut group = c.benchmark_group("blit_mask_antialiased");
+    group.throughput(Throughput::Elements(64 * 64));
+
+    for format in ALPHA_BENCH_FORMATS {
+        let (mut renderer, _front) = make_renderer(width, height, format);
+        let src_w = 64usize;
+        let src_h = 64usize;
+        let mask_pitch = src_w;
+        let mask = antialiased_mask(mask_pitch, src_h);
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{format:?}")),
             &format,
@@ -608,11 +674,12 @@ criterion_group!(
     bench_fill_triangle,
     bench_draw_rect,
     bench_fill_rect,
+    bench_fill_rect_alpha,
     bench_draw_circle,
     bench_fill_circle,
-    bench_fill_rounded_rect,
     bench_blit,
     bench_blit_mask,
+    bench_blit_mask_antialiased,
     bench_programmable_draw_indexed_triangles,
     bench_programmable_textured_triangles
 );
