@@ -210,13 +210,11 @@ fn bench_draw_line(c: &mut Criterion) {
                 b.iter(|| {
                     let start = Pixel::new(0, y);
                     let end = Pixel::new(width - 1, y + 16);
-                    unsafe {
-                        renderer.draw_line_unchecked(
-                            black_box(start),
-                            black_box(end),
-                            black_box(&Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
-                        );
-                    }
+                    renderer.draw_line(
+                        black_box(start),
+                        black_box(end),
+                        black_box(&Color::with_alpha(0x12, 0x34, 0x56, 0xFF)),
+                    );
                     y = (y + 1) % (height - 16);
                 });
             },

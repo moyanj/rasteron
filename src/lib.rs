@@ -67,6 +67,7 @@
 //! 开启 `programmable` 后，顶点着色器输出的 `ProgramVertex.position` 使用 `[0, 1]`
 //! 的 normalized viewport 坐标，而不是 OpenGL 风格的 `[-1, 1]` clip space。
 #![no_std]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod color;
 pub mod core;

@@ -42,6 +42,49 @@ macro_rules! write_rgb_blend {
     };
 }
 
+/// 对 RGB 三通道执行 Alpha 混合后写入裸指针位置。
+///
+/// 使用 [`PixelFormat::blend_channel`] 进行单通道混合。
+/// `$is_rgb_order` 控制字节序。`$dst` 为 `*mut u8` 裸指针。
+macro_rules! write_rgb_blend_ptr {
+    ($dst:expr, $r:expr, $g:expr, $b:expr, $alpha:expr, $inv_alpha:expr, $is_rgb_order:expr) => {
+        if $is_rgb_order {
+            unsafe {
+                *$dst = PixelFormat::blend_channel($r, *$dst, $alpha, $inv_alpha);
+                *$dst.add(1) = PixelFormat::blend_channel($g, *$dst.add(1), $alpha, $inv_alpha);
+                *$dst.add(2) = PixelFormat::blend_channel($b, *$dst.add(2), $alpha, $inv_alpha);
+            }
+        } else {
+            unsafe {
+                *$dst = PixelFormat::blend_channel($b, *$dst, $alpha, $inv_alpha);
+                *$dst.add(1) = PixelFormat::blend_channel($g, *$dst.add(1), $alpha, $inv_alpha);
+                *$dst.add(2) = PixelFormat::blend_channel($r, *$dst.add(2), $alpha, $inv_alpha);
+            }
+        }
+    };
+}
+
+/// 对 RGB 三通道直接写入裸指针位置（不透明路径）。
+///
+/// `$is_rgb_order` 控制字节序。`$dst` 为 `*mut u8` 裸指针。
+macro_rules! write_rgb_ptr {
+    ($dst:expr, $r:expr, $g:expr, $b:expr, $is_rgb_order:expr) => {
+        if $is_rgb_order {
+            unsafe {
+                *$dst = $r;
+                *$dst.add(1) = $g;
+                *$dst.add(2) = $b;
+            }
+        } else {
+            unsafe {
+                *$dst = $b;
+                *$dst.add(1) = $g;
+                *$dst.add(2) = $r;
+            }
+        }
+    };
+}
+
 /// 软件光栅化渲染器，操作原始帧缓冲字节切片。
 ///
 /// `Renderer` 将绘制命令（像素、线段、三角形、矩形、圆形）直接写入
@@ -79,16 +122,20 @@ pub struct Renderer<'a> {
 }
 
 /// 整数平方根（牛顿法），用于纯整数圆弧计算。
+///
+/// 使用 bit-shift 估初值，减少迭代次数。
 #[inline(always)]
 fn integer_sqrt(n: usize) -> usize {
     if n <= 1 {
         return n;
     }
-    let mut x = n;
-    let mut y = x.div_ceil(2);
+    // 用最高有效位估初值，减少牛顿法迭代次数约 2-3 次
+    let bits = usize::BITS as usize - n.leading_zeros() as usize;
+    let mut x = 1usize << (bits + 1) / 2;
+    let mut y = (x + n / x) / 2;
     while y < x {
         x = y;
-        y = (y + n / y) / 2;
+        y = (x + n / x) / 2;
     }
     x
 }
@@ -193,7 +240,6 @@ impl<'a> Renderer<'a> {
         }
 
         let alpha = color.a as u16;
-        // 在 current_buffer_mut 之前拷贝缓存值，避免借用冲突
         let bpp = self.fmt_bpp;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
@@ -203,7 +249,8 @@ impl<'a> Renderer<'a> {
             "write_color_at_offset: offset {offset} + bpp {bpp} exceeds buffer length {}",
             target.len()
         );
-        let dst = &mut target[offset..offset + bpp];
+        // SAFETY: 调用方保证 offset + bpp <= buffer.len()
+        let dst = unsafe { target.get_unchecked_mut(offset..offset + bpp) };
 
         if alpha == 255 {
             // 不透明快速路径：直接写入，无混合
@@ -290,10 +337,10 @@ impl<'a> Renderer<'a> {
 
     /// 使用 8bpp 的 mask 将指定颜色绘制到渲染目标。
     ///
-    /// `mask` 中每个字节代表对应像素的不透明度（0=透明，255=完全不透明）。
+    /// `mask` 中每个字节代表对应像素的不透明度（0=透明，255=完全不透明)。
     /// 适用于文本渲染/精灵绘制的前置能力。
     ///
-    /// 当 `width` 或 `height` 为 0，或 `mask` 切片长度不足时，静默返回。
+    /// 当 `width` 或 `height` 为 0，或 `mask` 切片长度不足时，1111  静默返回。
     pub fn blit_mask(
         &mut self,
         dst_top_left: Pixel,
@@ -315,45 +362,54 @@ impl<'a> Renderer<'a> {
         let bpp = self.fmt_bpp;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
+        let pitch = self.info.pitch;
 
-        // 预拷贝颜色分量到局部变量，避免热路径中反复访问结构体
         let src_r = color.r;
         let src_g = color.g;
         let src_b = color.b;
+        let src_alpha = color.a as u16;
+        if src_alpha == 0 {
+            return;
+        }
+
+        // 一次性获取缓冲区裸指针，避免逐像素借用
+        let buffer = self.current_buffer_mut();
+        let base_ptr = buffer.as_mut_ptr();
+        let buf_len = buffer.len();
 
         for row in 0..height {
             let dy = dst_top_left.y + row;
             if dy >= fb_height {
                 break;
             }
-            // Row-level clipping
             if dst_x >= fb_width {
                 continue;
             }
             let visible_cols = width.min(fb_width - dst_x);
             let row_mask_off = row * mask_pitch;
-            let base_off = self.pixel_offset_unchecked(dst_x, dy);
+            let base_off = dy * pitch + dst_x * bpp;
 
             for col in 0..visible_cols {
-                let alpha = mask[row_mask_off + col];
-                if alpha == 0 {
+                let m_alpha = mask[row_mask_off + col];
+                if m_alpha == 0 {
                     continue;
                 }
                 let offset = base_off + col * bpp;
-                // 直接写入，跳过 Color::with_alpha + write_color_at_offset 的冗余检查
-                let target = self.current_buffer_mut();
-                let dst = &mut target[offset..offset + bpp];
-                let alpha_u16 = alpha as u16;
-                if alpha_u16 == 255 {
-                    write_rgb!(dst, src_r, src_g, src_b, is_rgb_order);
+                debug_assert!(offset + bpp <= buf_len, "blit_mask: offset overflow");
+                // SAFETY: offset + bpp <= buf_len 由裁剪保证
+                let dst = unsafe { base_ptr.add(offset) };
+                if m_alpha == 255 {
+                    write_rgb_ptr!(dst, src_r, src_g, src_b, is_rgb_order);
                     if bpp == 4 {
-                        dst[3] = opaque_alpha;
+                        unsafe { *dst.add(3) = opaque_alpha };
                     }
                 } else {
-                    let inv_alpha = 255 - alpha_u16;
-                    write_rgb_blend!(dst, src_r, src_g, src_b, alpha_u16, inv_alpha, is_rgb_order);
+                    // mask byte 直接作为该像素的绘制 alpha
+                    let m_alpha_u16 = m_alpha as u16;
+                    let m_inv_alpha = 255 - m_alpha_u16;
+                    write_rgb_blend_ptr!(dst, src_r, src_g, src_b, m_alpha_u16, m_inv_alpha, is_rgb_order);
                     if bpp == 4 {
-                        dst[3] = opaque_alpha;
+                        unsafe { *dst.add(3) = opaque_alpha };
                     }
                 }
             }
@@ -362,11 +418,8 @@ impl<'a> Renderer<'a> {
 
     /// 用不透明颜色快速填充一行中的水平跨度。
     ///
-    /// 使用倍增复制策略（先写入一个像素，然后不断将已填充部分复制到
-    /// 未填充区域），以最小化逐个像素写入的开销。
-    ///
-    /// 倍增循环中源和目标区域不存在重叠，因此使用 `copy_nonoverlapping` 替代
-    /// `copy_within` 以消除切片边界检查开销。
+    /// 对 4bpp 格式，构造 u32 pattern 后用 `copy_nonoverlapping` 批量写入，
+    /// 避免倍增复制的逐字节依赖链。对 3bpp 格式回退到倍增复制策略。
     #[inline(always)]
     pub(crate) fn fill_span_opaque(
         &mut self,
@@ -386,18 +439,82 @@ impl<'a> Renderer<'a> {
         // 故 start + row_len = pixel_offset(x_end, y) + pixel_size <= buffer.len()。
         let row = unsafe { target.get_unchecked_mut(start..start + row_len) };
 
-        // 直接写入第一个像素（内联代替 write_color_at_offset 避免双重借用）
-        write_rgb!(row, color.r, color.g, color.b, is_rgb_order);
         if pixel_size == 4 {
-            row[3] = opaque_alpha;
-        }
+            // 构造 4 字节 pattern，然后用 copy_nonoverlapping 批量填充
+            let mut pattern = [0u8; 4];
+            write_rgb!(pattern, color.r, color.g, color.b, is_rgb_order);
+            pattern[3] = opaque_alpha;
+            let pattern_u32 = u32::from_ne_bytes(pattern);
 
-        Self::doubling_fill(row, pixel_size, row_len);
+            // 用 u32 批量写入
+            let num_pixels = x_end - x_start + 1;
+            let row_ptr = row.as_mut_ptr() as *mut u32;
+            for i in 0..num_pixels {
+                unsafe {
+                    *row_ptr.add(i) = pattern_u32;
+                }
+            }
+        } else {
+            // 3bpp: 回退到倍增复制
+            write_rgb!(row, color.r, color.g, color.b, is_rgb_order);
+            Self::doubling_fill(row, pixel_size, row_len);
+        }
+    }
+
+    /// 用半透明颜色快速填充一行中的水平跨度。
+    ///
+    /// 一次性获取缓冲区裸指针，逐像素直接指针操作 alpha blend，
+    /// 避免每个像素重复调用 `current_buffer_mut()` 的借用开销。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证 `x_start..=x_end` 已裁剪到 `[0, width)`，
+    /// `y` 已裁剪到 `[0, height)`，且 `color.a > 0 && color.a < 255`。
+    #[inline(always)]
+    pub(crate) fn fill_span_alpha(
+        &mut self,
+        x_start: usize,
+        x_end: usize,
+        y: usize,
+        color: &Color,
+    ) {
+        debug_assert!(color.a > 0 && color.a < 255);
+
+        let bpp = self.fmt_bpp;
+        let is_rgb_order = self.fmt_rgb_order;
+        let opaque_alpha = self.fmt_opaque_alpha;
+        let alpha = color.a as u16;
+        let inv_alpha = 255 - alpha;
+        let src_r = color.r;
+        let src_g = color.g;
+        let src_b = color.b;
+
+        let start = y * self.info.pitch + x_start * bpp;
+        let span_len = (x_end - x_start + 1) * bpp;
+        let buffer = self.current_buffer_mut();
+
+        debug_assert!(start + span_len <= buffer.len());
+
+        let base_ptr = buffer.as_mut_ptr();
+        // SAFETY: start + span_len <= buffer.len() 由调用方保证裁剪
+        let row = unsafe { base_ptr.add(start) };
+
+        for pixel_idx in 0..=x_end - x_start {
+            let off = pixel_idx * bpp;
+            // SAFETY: off + bpp <= span_len
+            let dst = unsafe { row.add(off) };
+            write_rgb_blend_ptr!(dst, src_r, src_g, src_b, alpha, inv_alpha, is_rgb_order);
+            if bpp == 4 {
+                unsafe { *dst.add(3) = opaque_alpha };
+            }
+        }
     }
 
     /// 在可见区域内填充水平跨度。自动裁剪到帧缓冲边界。
     ///
-    /// 不透明颜色使用 `fill_span_opaque` 快速填充，否则逐像素写入。
+    /// 不透明颜色使用 `fill_span_opaque` 快速填充；
+    /// 半透明颜色使用 `fill_span_alpha` 行级批量处理；
+    /// 完全透明颜色直接跳过。
     #[inline(always)]
     pub(crate) fn fill_visible_horizontal_span(
         &mut self,
@@ -414,15 +531,14 @@ impl<'a> Renderer<'a> {
         if sx > ex {
             core::mem::swap(&mut sx, &mut ex);
         }
+        if color.a == 0 {
+            // 完全透明，跳过
+            return;
+        }
         if color.a == 255 {
             self.fill_span_opaque(sx as usize, ex as usize, y as usize, color);
         } else {
-            for x in sx..=ex {
-                self.write_color_at_offset(
-                    self.pixel_offset_unchecked(x as usize, y as usize),
-                    color,
-                );
-            }
+            self.fill_span_alpha(sx as usize, ex as usize, y as usize, color);
         }
     }
 
@@ -533,7 +649,8 @@ impl<'a> Renderer<'a> {
 
     /// 用重复像素模式填充当前缓冲区的可见区域。
     ///
-    /// 使用倍增复制策略逐行填充。
+    /// 当 `pitch == row_len`（无行间填充）时，一次 doubling_fill 整个 buffer，
+    /// 省去逐行复制循环。否则回退到逐行倍增+行复制策略。
     ///
     /// # Safety
     ///
@@ -543,6 +660,7 @@ impl<'a> Renderer<'a> {
         let pixel_size = pattern.len();
         let buffer = self.current_buffer_mut();
         let base_ptr = buffer.as_mut_ptr();
+        let total_bytes = pitch * height;
 
         unsafe {
             #[cfg(feature = "simd")]
@@ -550,16 +668,24 @@ impl<'a> Renderer<'a> {
             #[cfg(not(feature = "simd"))]
             core::ptr::copy_nonoverlapping(pattern.as_ptr(), base_ptr, pixel_size);
         }
-        let first_row = unsafe { core::slice::from_raw_parts_mut(base_ptr, row_len) };
-        Self::doubling_fill(first_row, pixel_size, row_len);
 
-        for y in 1..height {
-            let row_ptr = unsafe { base_ptr.add(y * pitch) };
-            unsafe {
-                #[cfg(feature = "simd")]
-                simd::memcpy(row_ptr, base_ptr, row_len);
-                #[cfg(not(feature = "simd"))]
-                core::ptr::copy_nonoverlapping(base_ptr, row_ptr, row_len);
+        if pitch == row_len {
+            // 无行间填充：一次 doubling_fill 整个 buffer
+            let full_buf = unsafe { core::slice::from_raw_parts_mut(base_ptr, total_bytes) };
+            Self::doubling_fill(full_buf, pixel_size, total_bytes);
+        } else {
+            // 有行间填充：先倍增填充第一行，再逐行复制
+            let first_row = unsafe { core::slice::from_raw_parts_mut(base_ptr, row_len) };
+            Self::doubling_fill(first_row, pixel_size, row_len);
+
+            for y in 1..height {
+                let row_ptr = unsafe { base_ptr.add(y * pitch) };
+                unsafe {
+                    #[cfg(feature = "simd")]
+                    simd::memcpy(row_ptr, base_ptr, row_len);
+                    #[cfg(not(feature = "simd"))]
+                    core::ptr::copy_nonoverlapping(base_ptr, row_ptr, row_len);
+                }
             }
         }
     }
@@ -606,12 +732,78 @@ impl<'a> Renderer<'a> {
     }
 
     /// 使用 Bresenham 算法绘制线段，自动裁剪到帧缓冲边界。
+    ///
+    /// 裁剪后使用 `draw_line_clipped_internal`，比 `draw_line_unchecked` 更快：
+    /// 预取缓冲区裸指针，内循环中仅做轻量边界检查 + 指针写入，避免
+    /// 逐像素调用 `write_color_if_visible_i64` 的函数调用和格式匹配开销。
     pub fn draw_line(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
         if clip_line(p1, p2, self.info.width, self.info.height).is_none() {
             return;
         }
+        // clip_line 通过后，大部分像素在范围内——仍需保护 Bresenham 步进偶有越界
+        self.draw_line_clipped_internal(p1, p2, color);
+    }
 
-        unsafe { self.draw_line_unchecked(p1, p2, color) };
+    /// 已裁剪线段的 Bresenham 绘制（内部快速路径）。
+    ///
+    /// 预取缓冲区裸指针，内循环用轻量 `if px < width && py < height` 边界检查
+    /// 后直接指针写入，避免逐像素 `write_color_if_visible_i64` 的重复调用开销。
+    #[inline(always)]
+    fn draw_line_clipped_internal(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
+        let (mut x1, mut y1) = (p1.x as i64, p1.y as i64);
+        let (mut x2, mut y2) = (p2.x as i64, p2.y as i64);
+        let dx_abs = (x2 - x1).unsigned_abs();
+        let dy_abs = (y2 - y1).unsigned_abs();
+        let steep = dy_abs > dx_abs;
+        if steep {
+            core::mem::swap(&mut x1, &mut y1);
+            core::mem::swap(&mut x2, &mut y2);
+        }
+        if x1 > x2 {
+            core::mem::swap(&mut x1, &mut x2);
+            core::mem::swap(&mut y1, &mut y2);
+        }
+        let dx = x2 - x1;
+        let dy = (y2 - y1).unsigned_abs() as i64;
+        let mut error = dx / 2;
+        let y_step = if y1 < y2 { 1i64 } else { -1i64 };
+        let mut y = y1;
+        let width = self.info.width as i64;
+        let height = self.info.height as i64;
+        let bpp = self.fmt_bpp;
+        let pitch = self.info.pitch;
+        let is_rgb_order = self.fmt_rgb_order;
+        let opaque_alpha = self.fmt_opaque_alpha;
+        let buffer = self.current_buffer_mut();
+        let base_ptr = buffer.as_mut_ptr();
+        for x in x1..=x2 {
+            let (px, py) = if steep { (y, x) } else { (x, y) };
+            if px >= 0 && px < width && py >= 0 && py < height {
+                let offset = py as usize * pitch + px as usize * bpp;
+                let dst = unsafe { base_ptr.add(offset) };
+                let alpha = color.a;
+                if alpha == 0 {
+                    // skip
+                } else if alpha == 255 {
+                    write_rgb_ptr!(dst, color.r, color.g, color.b, is_rgb_order);
+                    if bpp == 4 {
+                        unsafe { *dst.add(3) = opaque_alpha };
+                    }
+                } else {
+                    let alpha_u16 = alpha as u16;
+                    let inv_alpha = 255 - alpha_u16;
+                    write_rgb_blend_ptr!(dst, color.r, color.g, color.b, alpha_u16, inv_alpha, is_rgb_order);
+                    if bpp == 4 {
+                        unsafe { *dst.add(3) = opaque_alpha };
+                    }
+                }
+            }
+            error -= dy;
+            if error < 0 {
+                y += y_step;
+                error += dx;
+            }
+        }
     }
 
     /// Bresenham 线段算法，**不进行裁剪检查**。
@@ -771,11 +963,9 @@ impl<'a> Renderer<'a> {
             for y in y_start..y_max {
                 self.fill_span_opaque(x_start, x_max - 1, y, &color);
             }
-        } else {
+        } else if color.a > 0 {
             for y in y_start..y_max {
-                for x in x_start..x_max {
-                    self.write_color_at_offset(self.pixel_offset_unchecked(x, y), &color);
-                }
+                self.fill_span_alpha(x_start, x_max - 1, y, &color);
             }
         }
     }

@@ -147,7 +147,7 @@ pub unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) {
         return;
     }
 
-    if len <= 32 {
+    if len <= 128 {
         unsafe {
             core::ptr::copy_nonoverlapping(src, dst, len);
         }
