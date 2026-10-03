@@ -159,7 +159,7 @@ impl Color {
     }
     /// 返回颜色的反色（按位取反 RGB 通道）。
     pub fn invert(&self) -> Color {
-        Color::new(255 - self.r, 255 - self.g, 255 - self.b)
+        Color::new(!self.r, !self.g, !self.b)
     }
 }
 
@@ -221,6 +221,7 @@ impl PixelFormat {
     /// 红色通道在 32 位小端字中的位移。
     ///
     /// 例如 BGR 布局下 red 在高 16 位，位移为 16。
+    #[inline(always)]
     pub const fn red_shift(self) -> u8 {
         match self {
             PixelFormat::Rgb24 | PixelFormat::Rgba8888 => 0,
@@ -232,11 +233,13 @@ impl PixelFormat {
     }
 
     /// 绿色通道的位移（所有格式均为 8）。
+    #[inline(always)]
     pub const fn green_shift(self) -> u8 {
         8
     }
 
     /// 蓝色通道在 32 位小端字中的位移。
+    #[inline(always)]
     pub const fn blue_shift(self) -> u8 {
         match self {
             PixelFormat::Rgb24 | PixelFormat::Rgba8888 => 16,
@@ -250,6 +253,7 @@ impl PixelFormat {
     /// Alpha 通道的位移（如果格式支持）。
     ///
     /// 对于不含 alpha 的格式（`Rgb24`、`Bgr24`、`Xrgb8888`）返回 `None`。
+    #[inline(always)]
     pub const fn alpha_shift(self) -> Option<u8> {
         match self {
             PixelFormat::Argb8888 | PixelFormat::Rgba8888 | PixelFormat::Bgra8888 => Some(24),

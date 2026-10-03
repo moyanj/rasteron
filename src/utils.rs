@@ -54,22 +54,27 @@ pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(P
         let code_out = if code1 != INSIDE { code1 } else { code2 };
         let (mut x, mut y) = (0, 0);
 
-        // 找到线段与边界的交点
+        // 找到线段与边界的交点。
+        //
+        // 交点公式形如 `a + (b - a) * t / (d - c)`，其中 `(b - a) * t` 的中间
+        // 乘积可能远超 `i64` 范围：端点来自 `usize`（`saturating_usize_to_i64`
+        // 可产生 `i64::MAX`），而 `t` 最大可达 `height - 1`，两者相乘会溢出。
+        // 因此用 `i128` 做中间运算，再把结果收窄回 `i64`。
         if (code_out & TOP) != 0 {
             // y = height - 1  (上边界，假设 y 增大向下)
-            x = x1 + (x2 - x1) * (height as i64 - 1 - y1) / (y2 - y1);
+            x = intersect_axis(x1, x2, height as i64 - 1 - y1, y2 - y1);
             y = height as i64 - 1;
         } else if (code_out & BOTTOM) != 0 {
             // y = 0
-            x = x1 + (x2 - x1) * (0 - y1) / (y2 - y1);
+            x = intersect_axis(x1, x2, 0 - y1, y2 - y1);
             y = 0;
         } else if (code_out & RIGHT) != 0 {
             // x = width - 1
-            y = y1 + (y2 - y1) * (width as i64 - 1 - x1) / (x2 - x1);
+            y = intersect_axis(y1, y2, width as i64 - 1 - x1, x2 - x1);
             x = width as i64 - 1;
         } else if (code_out & LEFT) != 0 {
             // x = 0
-            y = y1 + (y2 - y1) * (0 - x1) / (x2 - x1);
+            y = intersect_axis(y1, y2, 0 - x1, x2 - x1);
             x = 0;
         }
 
@@ -84,6 +89,22 @@ pub fn clip_line(p1: Pixel, p2: Pixel, width: usize, height: usize) -> Option<(P
             code2 = compute_code(x2, y2, width, height);
         }
     }
+}
+
+/// 求解 `a + (b - a) * num / den`，用 `i128` 中间运算避免 `i64` 溢出。
+///
+/// 用于 Cohen–Sutherland 裁剪中计算线段与边界线的交点。端点由 `usize` 饱和
+/// 转换而来，可能取到 `i64::MAX`，直接相乘会溢出。
+///
+/// `den` 为 0 时（线段平行于该边界且退化）返回 `a`。
+#[inline]
+fn intersect_axis(a: i64, b: i64, num: i64, den: i64) -> i64 {
+    if den == 0 {
+        return a;
+    }
+    let value = a as i128 + (b as i128 - a as i128) * num as i128 / den as i128;
+    // 交点在裁剪边界上，理论上必落在 i64 范围内；饱和处理仅为防御。
+    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 /// 饱和转换：从 `usize` 转换为 `i64`。

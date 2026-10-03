@@ -19,9 +19,21 @@
 //!
 //! | 标志 | 说明 |
 //! |------|------|
-//! | `double_buffer` | 分配后台缓冲区，调用 [`Renderer::swap_buffers`] 交换到前台。 |
+//! | `double_buffer` | 分配后台缓冲区，调用 [`Renderer::swap_buffers`] 交换到前台。这是唯一需要 `alloc` 的固定功能特性。 |
 //! | `programmable`  | 启用完整的 2D 可编程管线。 |
 //! | `simd`          | 启用 SIMD 优化，提升内存操作性能。支持 AVX-512、AVX2、SSE2、NEON 和 RISC-V 向量扩展。 |
+//!
+//! # 裸机 / 内核选型
+//!
+//! * **浮点**：关闭 `programmable` 后，整个库不依赖浮点运算（几何计算全部为整数）。
+//!   启用 `programmable` 会引入 `f32`，在不支持浮点的目标上不可用；在内核态使用
+//!   还需要显式保存/恢复 FPU 状态。
+//! * **分配器**：关闭 `double_buffer` 与 `programmable` 后不链接全局分配器。
+//! * **FPU 状态**：`simd` 会经由 `blit` / `clear` / 填充路径使用向量寄存器
+//!   （x86 的 XMM/YMM/ZMM、aarch64 的 V0-V31），内核中需配合
+//!   `kernel_fpu_begin/end`（或 `kernel_neon_begin/end`）使用。
+//! * **缓冲区大小**：[`Renderer::new`] 要求传入的切片不小于 `pitch × height`，
+//!   否则恐慌（详见该函数文档）。
 //!
 //! # 可编程管线示例
 //!

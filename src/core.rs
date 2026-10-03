@@ -4,7 +4,9 @@ use crate::pixel::Pixel;
 #[cfg(feature = "simd")]
 use crate::simd;
 use crate::utils::{clip_line, saturating_usize_to_i64};
+#[cfg(feature = "double_buffer")]
 extern crate alloc;
+#[cfg(feature = "double_buffer")]
 use alloc::vec::Vec;
 
 /// 根据字节序写入 RGB 三通道到目标切片。
@@ -147,7 +149,36 @@ impl<'a> Renderer<'a> {
     /// * `front_buffer` — 前端帧缓冲的可变引用。
     ///
     /// 当启用 `double_buffer` 特性时，会自动分配后端缓冲区。
+    ///
+    /// # 恐慌
+    ///
+    /// 如果 `front_buffer.len() < info.buffer_size()` 则恐慌。渲染器的所有写入都
+    /// 以 `info` 为准进行边界保护（安全 API 的边界判断比较的是 `width` / `height`，
+    /// 底层写入使用 `get_unchecked_mut`），因此调用方必须保证切片能容纳
+    /// `pitch × height` 字节。这一校验是安全 API 不发生越界写的前提。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use rasteron::Renderer;
+    /// # use rasteron::framebuffer::FramebufferInfo;
+    /// # use rasteron::color::PixelFormat;
+    /// let info = FramebufferInfo::new(16, 16, 48, PixelFormat::Bgr24);
+    /// let mut fb = vec![0u8; info.buffer_size()];
+    /// let mut renderer = Renderer::new(info, &mut fb);
+    /// renderer.set_pixel(0, 0, &rasteron::color::Color::new(255, 0, 0));
+    /// ```
     pub fn new(info: FramebufferInfo, front_buffer: &'a mut [u8]) -> Self {
+        // 以 info 为准的边界保护（含 get_unchecked_mut）要求切片足够大。
+        let required = info.buffer_size();
+        assert!(
+            front_buffer.len() >= required,
+            "front_buffer too small: need {} bytes (pitch {} x height {}), got {}",
+            required,
+            info.pitch,
+            info.height,
+            front_buffer.len()
+        );
         #[cfg(feature = "double_buffer")]
         let buffer_size = info.buffer_size();
         let (fmt_bpp, fmt_rgb_order, fmt_opaque_alpha, fmt_stores_color_alpha) = match info.format {
@@ -287,11 +318,12 @@ impl<'a> Renderer<'a> {
     /// 将同格式像素数据块 blit（原始拷贝）到渲染目标。
     ///
     /// `dst_top_left` 指定目标区域左上角，`src` 为源像素数据（格式必须与帧缓冲相同）。
-    /// 使用源数据的 pith（每行字节数）来正确换行。
+    /// 使用源数据的 pitch（每行字节数）来正确换行。
     /// 自动裁剪到帧缓冲可见区域。
     ///
-    /// 当 `src_format` 与帧缓冲格式不匹配、`width`/`height` 为 0、或 `src` 切片长度
-    /// 不足以容纳 `pitch × height` 字节时，静默返回，不写入任何像素。
+    /// 当 `src_format` 与帧缓冲格式不匹配、`width`/`height` 为 0、`src_pitch` 小于
+    /// `width × bytes_per_pixel`、或 `src` 切片长度不足以容纳 `src_pitch × height`
+    /// 字节时，静默返回，不写入任何像素。
     pub fn blit(
         &mut self,
         dst_top_left: Pixel,
@@ -302,6 +334,11 @@ impl<'a> Renderer<'a> {
         src_pitch: usize,
     ) {
         if src_format != self.info.format || width == 0 || height == 0 {
+            return;
+        }
+        // 每行实际读取 width * bpp 字节，故 src_pitch 不得小于该值，
+        // 否则 src_start + copy_bytes 会越过行尾（见下方切片索引）。
+        if src_pitch < width.saturating_mul(self.info.format.bytes_per_pixel()) {
             return;
         }
         if src.len() < src_pitch.saturating_mul(height) {
@@ -340,7 +377,8 @@ impl<'a> Renderer<'a> {
     /// `mask` 中每个字节代表对应像素的不透明度（0=透明，255=完全不透明)。
     /// 适用于文本渲染/精灵绘制的前置能力。
     ///
-    /// 当 `width` 或 `height` 为 0，或 `mask` 切片长度不足时，1111  静默返回。
+    /// 当 `width`/`height` 为 0、颜色完全透明、`mask_pitch` 小于 `width`、
+    /// 或 `mask` 切片长度不足 `mask_pitch × height` 时，静默返回。
     pub fn blit_mask(
         &mut self,
         dst_top_left: Pixel,
@@ -351,6 +389,11 @@ impl<'a> Renderer<'a> {
         color: Color,
     ) {
         if width == 0 || height == 0 {
+            return;
+        }
+        // 每行实际读取 width 字节的 mask，故 mask_pitch 不得小于 width，
+        // 否则 row_mask_off + col 会越过行尾（见下方 mask 索引）。
+        if mask_pitch < width {
             return;
         }
         if mask.len() < mask_pitch.saturating_mul(height) {
@@ -418,7 +461,7 @@ impl<'a> Renderer<'a> {
 
     /// 用不透明颜色快速填充一行中的水平跨度。
     ///
-    /// 对 4bpp 格式，构造 u32 pattern 后用 `copy_nonoverlapping` 批量写入，
+    /// 对 4bpp 格式，把像素写成 `[u8; 4]` 后按 4 字节块批量填充，
     /// 避免倍增复制的逐字节依赖链。对 3bpp 格式回退到倍增复制策略。
     #[inline(always)]
     pub(crate) fn fill_span_opaque(
@@ -440,37 +483,35 @@ impl<'a> Renderer<'a> {
         let row = unsafe { target.get_unchecked_mut(start..start + row_len) };
 
         if pixel_size == 4 {
-            // 构造 4 字节 pattern，然后用 copy_nonoverlapping 批量填充
+            // 构造 4 字节 pattern，然后按 4 字节块批量填充。
+            // 注意：这里必须用 chunks_exact_mut 而不是把 row 的指针转成 *mut u32 后
+            // 逐元素写入——`FramebufferInfo` 允许任意 `pitch >= width * bpp`，当
+            // `pitch % 4 != 0` 时（如 Bgra8888 配 pitch = width*4 + 1），第二行起的
+            // 起始地址不是 4 字节对齐的，解引用 *mut u32 属于未定义行为
+            // （x86 上通常能工作，ARM / RISC-V 上可能触发异常）。
             let mut pattern = [0u8; 4];
             write_rgb!(pattern, color.r, color.g, color.b, is_rgb_order);
             pattern[3] = opaque_alpha;
-            let pattern_u32 = u32::from_ne_bytes(pattern);
-
-            // 用 u32 批量写入
-            let num_pixels = x_end - x_start + 1;
-            let row_ptr = row.as_mut_ptr() as *mut u32;
-            for i in 0..num_pixels {
-                unsafe {
-                    *row_ptr.add(i) = pattern_u32;
-                }
-            }
+            row.chunks_exact_mut(4).for_each(|pixel| {
+                pixel.copy_from_slice(&pattern);
+            });
         } else {
-            // 3bpp: 回退到倍增复制
+            // 3bpp: 单像素模式 + 倍增复制
             write_rgb!(row, color.r, color.g, color.b, is_rgb_order);
-            Self::doubling_fill(row, pixel_size, row_len);
+            Self::pattern_fill(row, &[row[0], row[1], row[2]]);
         }
     }
 
     /// 用半透明颜色快速填充一行中的水平跨度。
     ///
-    /// 一次性获取缓冲区裸指针，逐像素直接指针操作 alpha blend，
-    /// 避免每个像素重复调用 `current_buffer_mut()` 的借用开销。
+    /// 4bpp 格式走 SWAR 批量路径：把 RGB 重排成 `[R,G,B,R]` / `[B,G,R,B]` 形式，
+    /// 用 16 位通道并行做 alpha 插值；3bpp 格式因跨字节不对齐，保留逐通道路径。
     ///
     /// # Safety
     ///
     /// 调用方必须保证 `x_start..=x_end` 已裁剪到 `[0, width)`，
     /// `y` 已裁剪到 `[0, height)`，且 `color.a > 0 && color.a < 255`。
-    #[inline(always)]
+    #[inline]
     pub(crate) fn fill_span_alpha(
         &mut self,
         x_start: usize,
@@ -481,33 +522,134 @@ impl<'a> Renderer<'a> {
         debug_assert!(color.a > 0 && color.a < 255);
 
         let bpp = self.fmt_bpp;
+        let start = y * self.info.pitch + x_start * bpp;
+        let pixel_count = x_end - x_start + 1;
+        let span_len = pixel_count * bpp;
+
+        let buffer = self.current_buffer_mut();
+        debug_assert!(start + span_len <= buffer.len());
+        let base_ptr = buffer.as_mut_ptr();
+
+        if bpp == 4 {
+            // SWAR 路径独立成函数：其代码体明显大于逐像素路径，
+            // 若整体内联进 fill_rect，会挤占不透明路径的代码布局。
+            unsafe { self.swar_fill_span_alpha_4bpp(base_ptr.add(start), pixel_count, color) };
+            return;
+        }
+
+        let row = unsafe { base_ptr.add(start) };
+        let is_rgb_order = self.fmt_rgb_order;
+        let alpha = color.a as u16;
+        let inv_alpha = 255 - alpha;
+        let (src_r, src_g, src_b) = (color.r, color.g, color.b);
+
+        for pixel_idx in 0..pixel_count {
+            let dst = unsafe { row.add(pixel_idx * bpp) };
+            write_rgb_blend_ptr!(dst, src_r, src_g, src_b, alpha, inv_alpha, is_rgb_order);
+        }
+    }
+
+    /// 4bpp 的 SWAR alpha 跨度填充。
+    ///
+    /// # Safety
+    ///
+    /// `row` 必须指向 `pixel_count * 4` 字节的可写区域。
+    #[inline(never)]
+    unsafe fn swar_fill_span_alpha_4bpp(&mut self, row: *mut u8, pixel_count: usize, color: &Color) {
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
         let alpha = color.a as u16;
-        let inv_alpha = 255 - alpha;
-        let src_r = color.r;
-        let src_g = color.g;
-        let src_b = color.b;
+        let (src_r, src_g, src_b) = (color.r, color.g, color.b);
 
-        let start = y * self.info.pitch + x_start * bpp;
-        let span_len = (x_end - x_start + 1) * bpp;
-        let buffer = self.current_buffer_mut();
+        // 一次处理 4 个像素（16 字节 = 4 个 u32 字）。
+        //
+        // 通道插值恒等式（见 `swar_blend_word` 的推导）：
+        //     ((s*a + d*ia) + 255) >> 8  ==  (d*255 + a*(s-d) + 255) >> 8
+        // 后者把 `a` 提成了公共因子，四个通道的和上界为
+        // `255 + 255*255 = 65280 < 2^16`，因此可以安全地并行处理，
+        // 不会发生跨字节进位。
+        let s_delta = Self::swar_delta_word(src_r, src_g, src_b, opaque_alpha, is_rgb_order);
+        let a4 = Self::swar_scale_word(alpha);
+        let opaque_word = (opaque_alpha as u32) << 24;
 
-        debug_assert!(start + span_len <= buffer.len());
-
-        let base_ptr = buffer.as_mut_ptr();
-        // SAFETY: start + span_len <= buffer.len() 由调用方保证裁剪
-        let row = unsafe { base_ptr.add(start) };
-
-        for pixel_idx in 0..=x_end - x_start {
-            let off = pixel_idx * bpp;
-            // SAFETY: off + bpp <= span_len
-            let dst = unsafe { row.add(off) };
-            write_rgb_blend_ptr!(dst, src_r, src_g, src_b, alpha, inv_alpha, is_rgb_order);
-            if bpp == 4 {
-                unsafe { *dst.add(3) = opaque_alpha };
+        let quads = pixel_count / 4;
+        for quad in 0..quads {
+            // SAFETY: quad*16 + 16 <= quads*16 <= pixel_count*4
+            let dst = unsafe { row.add(quad * 16) as *mut u32 };
+            for lane in 0..4 {
+                unsafe {
+                    let word = *dst.add(lane);
+                    let blended = Self::swar_blend_word(word, s_delta, a4);
+                    // 第 4 字节必须恒为 opaque_alpha（Xrgb8888 为 0，
+                    // 其余 4bpp 格式为 255），而不是参与混合的结果——
+                    // 这与逐像素路径 `*dst.add(3) = opaque_alpha` 一致。
+                    *dst.add(lane) = (blended & 0x00FF_FFFF) | opaque_word;
+                }
             }
         }
+
+        // 尾部不足 4 像素的部分回退到逐像素路径
+        let inv_alpha = 255 - alpha;
+        for pixel_idx in (quads * 4)..pixel_count {
+            let dst = unsafe { row.add(pixel_idx * 4) };
+            write_rgb_blend_ptr!(dst, src_r, src_g, src_b, alpha, inv_alpha, is_rgb_order);
+            unsafe { *dst.add(3) = opaque_alpha };
+        }
+    }
+
+    /// 构造 SWAR 混合用的「源差分」字：每个 16 位通道的值为 `s - d` 的源项部分。
+    ///
+    /// 由于目标通道 `d` 在运行时才知道，这里只预计算 `s` 部分——
+    /// 实际计算在 [`Self::swar_blend_word`] 中与目标字完成合并。
+    #[inline(always)]
+    fn swar_delta_word(r: u8, g: u8, b: u8, alpha: u8, is_rgb_order: bool) -> u32 {
+        // 通道布局与目标字一致：[R,G,B,A] 或 [B,G,R,A]（低字节在前）
+        let (c0, c1, c2) = if is_rgb_order { (r, g, b) } else { (b, g, r) };
+        (c0 as u32) | ((c1 as u32) << 8) | ((c2 as u32) << 16) | ((alpha as u32) << 24)
+    }
+
+    /// 把 8 位标量 `alpha` 复制到 4 个 16 位通道。
+    #[inline(always)]
+    fn swar_scale_word(alpha: u16) -> u32 {
+        let a = alpha as u32;
+        a | (a << 16)
+    }
+
+    /// 用 SWAR 对 4 个 8 位通道并行做 alpha 插值。
+    ///
+    /// 推导：设目标字节为 `d`、源字节为 `s`、透明度为 `a`，则
+    /// `blend_channel(s, d, a, 255-a) = ((s*a + d*(255-a)) + 255) >> 8`。
+    ///
+    /// 直接展开会让两个乘积之和达到 `130050 > 2^16`，跨通道进位。
+    /// 改用恒等变形 `d*255 + a*(s-d)` 后，四通道和的上界为
+    /// `255 + 255*255 = 65280 < 2^16`，可安全并行。
+    ///
+    /// 每个 8 位通道在这里被展宽到 16 位处理：`word` 的字节 `i` 作为
+    /// 16 位通道 `i` 的低字节，高字节由 `d255` 提供的 255 与 `s_delta`
+    /// 的源字节相乘后填充。
+    #[inline(always)]
+    fn swar_blend_word(word: u32, s_delta: u32, a4: u32) -> u32 {
+        // 逐通道拆分到 16 位槽：d = (word >> 8i) & 0xFF
+        let d0 = word & 0xFF;
+        let d1 = (word >> 8) & 0xFF;
+        let d2 = (word >> 16) & 0xFF;
+        let d3 = (word >> 24) & 0xFF;
+
+        let s0 = s_delta & 0xFF;
+        let s1 = (s_delta >> 8) & 0xFF;
+        let s2 = (s_delta >> 16) & 0xFF;
+        let s3 = (s_delta >> 24) & 0xFF;
+
+        let a = a4 & 0xFFFF;
+
+        // 每通道: (d*255 + a*(s - d) + 255) >> 8
+        // 用 i32 计算以避免 u32 下溢（s - d 可能为负）。
+        let blend = |d: u32, s: u32| -> u32 {
+            let v = d as i32 * 255 + a as i32 * (s as i32 - d as i32);
+            (((v + 255) >> 8) as u32) & 0xFF
+        };
+
+        blend(d0, s0) | (blend(d1, s1) << 8) | (blend(d2, s2) << 16) | (blend(d3, s3) << 24)
     }
 
     /// 在可见区域内填充水平跨度。自动裁剪到帧缓冲边界。
@@ -633,8 +775,7 @@ impl<'a> Renderer<'a> {
 
     /// 用指定颜色清空整个帧缓冲。
     pub fn clear(&mut self, color: Color) {
-        let format = self.info.format;
-        let pixel_size = format.bytes_per_pixel();
+        let pixel_size = self.info.format.bytes_per_pixel();
         let width = self.info.width;
         let height = self.info.height;
         let row_len = width * pixel_size;
@@ -643,40 +784,49 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        let bytes = color.to_bytes(format);
-        unsafe { self.clear_unchecked(&bytes[..pixel_size], row_len, height) };
+        unsafe {
+            self.clear_unchecked(&color, row_len, height);
+        }
     }
 
     /// 用重复像素模式填充当前缓冲区的可见区域。
     ///
-    /// 当 `pitch == row_len`（无行间填充）时，一次 doubling_fill 整个 buffer，
-    /// 省去逐行复制循环。否则回退到逐行倍增+行复制策略。
+    /// 先把单个像素展开成 16 字节宽的模式描述符，再用一次定长写入铺满整个
+    /// 缓冲区，避免逐像素的枚举匹配与倍增复制的写入放大。
     ///
     /// # Safety
     ///
-    /// 调用方必须保证 `pattern.len()` 与当前像素大小一致，且 `row_len > 0`。
-    unsafe fn clear_unchecked(&mut self, pattern: &[u8], row_len: usize, height: usize) {
+    /// 调用方必须保证 `row_len > 0` 且 `row_len` 是当前格式的整数倍像素宽度。
+    unsafe fn clear_unchecked(&mut self, color: &Color, row_len: usize, height: usize) {
         let pitch = self.info.pitch;
-        let pixel_size = pattern.len();
+        let total_bytes = pitch * height;
+
+        // 16 字节模式描述符。对 4bpp 可铺满整个缓冲，把每像素一次写入降为
+        // 每 16 字节一次写入；对 3bpp 退回单像素模式。
+        let (pattern, pattern_len) = self.build_pattern(color);
+
+        // 缓冲区可能小于一个完整模式（例如 1×1 的 4bpp 只有 4 字节），
+        // 此时只能写入实际存在的字节数，否则会越界。
+        let init_len = pattern_len.min(total_bytes);
+
         let buffer = self.current_buffer_mut();
         let base_ptr = buffer.as_mut_ptr();
-        let total_bytes = pitch * height;
 
         unsafe {
             #[cfg(feature = "simd")]
-            simd::memcpy(base_ptr, pattern.as_ptr(), pixel_size);
+            simd::memcpy(base_ptr, pattern.as_ptr(), init_len);
             #[cfg(not(feature = "simd"))]
-            core::ptr::copy_nonoverlapping(pattern.as_ptr(), base_ptr, pixel_size);
+            core::ptr::copy_nonoverlapping(pattern.as_ptr(), base_ptr, init_len);
         }
 
         if pitch == row_len {
-            // 无行间填充：一次 doubling_fill 整个 buffer
+            // 无行间填充：一次铺满整个 buffer
             let full_buf = unsafe { core::slice::from_raw_parts_mut(base_ptr, total_bytes) };
-            Self::doubling_fill(full_buf, pixel_size, total_bytes);
+            Self::pattern_fill(full_buf, &pattern[..init_len]);
         } else {
-            // 有行间填充：先倍增填充第一行，再逐行复制
+            // 有行间填充：先铺满第一行，再逐行复制
             let first_row = unsafe { core::slice::from_raw_parts_mut(base_ptr, row_len) };
-            Self::doubling_fill(first_row, pixel_size, row_len);
+            Self::pattern_fill(first_row, &pattern[..init_len.min(row_len)]);
 
             for y in 1..height {
                 let row_ptr = unsafe { base_ptr.add(y * pitch) };
@@ -690,8 +840,86 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// 构造像素模式缓冲，返回 `(pattern, pattern_len)`。
+    ///
+    /// `pattern_len` 为 16 表示模式可一次铺满 16 字节；否则等于 `bpp`。
+    /// 参数从 `self` 的缓存格式属性与给定颜色派生。
     #[inline(always)]
-    fn doubling_fill(row: &mut [u8], pattern_len: usize, len: usize) {
+    fn build_pattern(&self, color: &Color) -> ([u8; 16], usize) {
+        let bpp = self.fmt_bpp;
+        let is_rgb_order = self.fmt_rgb_order;
+        let color_alpha = color.a;
+        let stores_alpha = self.fmt_stores_color_alpha;
+        let opaque_alpha = self.fmt_opaque_alpha;
+        let mut pattern = [0u8; 16];
+        if bpp == 0 || bpp > 4 {
+            return (pattern, bpp);
+        }
+
+        // 单像素的规范字节布局（含 alpha 处理），通过 write_rgb! 统一字节序。
+        let mut pixel = [0u8; 4];
+        write_rgb!(pixel, color.r, color.g, color.b, is_rgb_order);
+        if bpp == 4 {
+            pixel[3] = if stores_alpha { color_alpha } else { opaque_alpha };
+        }
+
+        // 4bpp：像素 4 字节，恰好铺满 16 字节。
+        if bpp == 4 {
+            let mut offset = 0;
+            while offset < 16 {
+                pattern[offset..offset + 4].copy_from_slice(&pixel);
+                offset += 4;
+            }
+            return (pattern, 16);
+        }
+
+        // 2bpp / 1bpp：由 2 或 1 字节组成，均可整除 16。
+        if bpp == 2 || bpp == 1 {
+            let reps = 16 / bpp;
+            for i in 0..reps {
+                pattern[i * bpp..(i + 1) * bpp].copy_from_slice(&pixel[..bpp]);
+            }
+            return (pattern, 16);
+        }
+
+        // 3bpp 无法整除 16，退回单像素模式。
+        pattern[..3].copy_from_slice(&pixel[..3]);
+        (pattern, 3)
+    }
+
+    /// 用重复模式填充整个切片。
+    ///
+    /// 对 4bpp 等能整除 16 的格式，模式固定为 16 字节：按 16 字节块**直接重复写入**，
+    /// 而不是"复制已填部分来翻倍"。后者需要 `O(log n)` 次串行 `memcpy`，
+    /// 每次的源区域都不同、无法向量化，且总写入量随步数累积；直接块写是
+    /// 单一 stready-state 循环，流水线友好。
+    ///
+    /// 3bpp 无法整除 16，退回逐次倍增复制。
+    #[inline(always)]
+    fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
+        let len = row.len();
+        let pattern_len = pattern.len();
+        if pattern_len == 0 || len <= pattern_len {
+            return;
+        }
+
+        // 16 字节定长块：直接铺满，无倍增链
+        if pattern_len == 16 {
+            let mut block = [0u8; 16];
+            block.copy_from_slice(&pattern[..16]);
+            let mut offset = 16;
+            while offset + 16 <= len {
+                row[offset..offset + 16].copy_from_slice(&block);
+                offset += 16;
+            }
+            if offset < len {
+                let tail = len - offset;
+                row[offset..].copy_from_slice(&block[..tail]);
+            }
+            return;
+        }
+
+        // 非 16 字节模式（3bpp）：逐次倍增复制
         let base = row.as_mut_ptr();
         let mut filled = pattern_len;
         while filled < len {
@@ -733,25 +961,49 @@ impl<'a> Renderer<'a> {
 
     /// 使用 Bresenham 算法绘制线段，自动裁剪到帧缓冲边界。
     ///
-    /// 裁剪后使用 `draw_line_clipped_internal`，比 `draw_line_unchecked` 更快：
-    /// 预取缓冲区裸指针，内循环中仅做轻量边界检查 + 指针写入，避免
-    /// 逐像素调用 `write_color_if_visible_i64` 的函数调用和格式匹配开销。
+    /// 先用 Cohen–Sutherland 裁剪（`clip_line`）对整条线段做快速拒绝，再交给
+    /// `draw_line_clipped_internal`。该内部函数会把迭代范围收窄到可见区间，
+    /// 因此工作量与**线段总长度无关**，只与可见部分的像素数成正比。
+    ///
+    /// 收窄不会改变像素覆盖：Bresenham 的递推是确定的，内部函数保留原始端点
+    /// 与完整的相位，仅跳过必然越界的迭代。
     pub fn draw_line(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
+        if self.info.width == 0 || self.info.height == 0 {
+            return;
+        }
         if clip_line(p1, p2, self.info.width, self.info.height).is_none() {
             return;
         }
-        // clip_line 通过后，大部分像素在范围内——仍需保护 Bresenham 步进偶有越界
         self.draw_line_clipped_internal(p1, p2, color);
     }
 
-    /// 已裁剪线段的 Bresenham 绘制（内部快速路径）。
+    /// Bresenham 线段绘制（内部快速路径）。
     ///
-    /// 预取缓冲区裸指针，内循环用轻量 `if px < width && py < height` 边界检查
-    /// 后直接指针写入，避免逐像素 `write_color_if_visible_i64` 的重复调用开销。
+    /// 预取缓冲区裸指针，内循环直接指针写入，避免逐像素调用
+    /// `write_color_if_visible_i64` 的函数调用与格式匹配开销。
+    ///
+    /// # 迭代范围收窄
+    ///
+    /// 外层 `draw_line` 只会拒绝完全不可见的线段，可见线段仍可能带有极长的
+    /// 越界部分（例如端点来自 `usize` 上的饱和算术）。若从原始端点一路步进，
+    /// 代价是 O(线段长度)——在实时系统里这是一个可被外部输入触发的长耗时路径。
+    ///
+    /// 因此这里先做两件事：
+    ///
+    /// 1. **主轴收窄**：主循环变量 `x` 对应原始坐标 `(px, py) = steep ? (y, x) : (x, y)`，
+    ///    因此它的可见区间是 `[0, width) `（非 steep）或 `[0, height)`（steep）。
+    ///    把迭代区间直接收窄为该区间与 `[x1, x2]` 的交集。
+    /// 2. **相位重算**：`error` 与 `y` 的递推是确定的，可以从 `x1` 精确重演到新的
+    ///    起点 `x_lo`，得到与完整步进完全一致的中间状态。
+    ///
+    /// 次轴仍在内循环中逐像素检查，故覆盖与未收窄时逐像素相同。
     #[inline(always)]
     fn draw_line_clipped_internal(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
-        let (mut x1, mut y1) = (p1.x as i64, p1.y as i64);
-        let (mut x2, mut y2) = (p2.x as i64, p2.y as i64);
+        // 用饱和转换（而非 `as i64`）把 `usize` 坐标转到 `i64`：`as` 会把
+        // 大于 `i64::MAX` 的值回绕成负数（如 `usize::MAX as i64 == -1`），
+        // 使端点被错误地折到画布另一侧，覆盖结果完全错误。
+        let (mut x1, mut y1) = (saturating_usize_to_i64(p1.x), saturating_usize_to_i64(p1.y));
+        let (mut x2, mut y2) = (saturating_usize_to_i64(p2.x), saturating_usize_to_i64(p2.y));
         let dx_abs = (x2 - x1).unsigned_abs();
         let dy_abs = (y2 - y1).unsigned_abs();
         let steep = dy_abs > dx_abs;
@@ -765,34 +1017,74 @@ impl<'a> Renderer<'a> {
         }
         let dx = x2 - x1;
         let dy = (y2 - y1).unsigned_abs() as i64;
-        let mut error = dx / 2;
         let y_step = if y1 < y2 { 1i64 } else { -1i64 };
-        let mut y = y1;
         let width = self.info.width as i64;
         let height = self.info.height as i64;
+
+        // 主循环变量 `x` 与次轴变量 `y` 各自对应哪条原始坐标轴，由 `steep` 决定：
+        //   steep = false → (px, py) = (x, y)  → 主轴 x 是原始 x，次轴 y 是原始 y
+        //   steep = true  → (px, py) = (y, x)  → 主轴 x 是原始 y，次轴 y 是原始 x
+        // 因此：主轴的上界 = width-1（非 steep）/ height-1（steep）；
+        //       次轴的上界 = height-1（非 steep）/ width-1（steep）。
+        let (x_hi_bound, y_hi_bound) = if steep {
+            (height - 1, width - 1)
+        } else {
+            (width - 1, height - 1)
+        };
+
+        // 收窄迭代区间；与 [x1, x2] 求交后若为空则整条线段不可见。
+        // 下界恒为 0（坐标非负），上界由主轴决定。
+        let x_lo = x1.max(0);
+        let x_hi = x2.min(x_hi_bound);
+        if x_lo > x_hi {
+            return;
+        }
+
+        // 从 x1 重演递推到 x_lo，恢复 error 与 y 的相位。
+        // 这里的算术与下方主循环逐字一致，保证相位完全相同。
+        let mut error = dx / 2;
+        let mut y = y1;
+        for _ in x1..x_lo {
+            error -= dy;
+            if error < 0 {
+                y += y_step;
+                error += dx;
+            }
+        }
+
         let bpp = self.fmt_bpp;
         let pitch = self.info.pitch;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
+        let alpha = color.a as u16;
+        let inv_alpha = 255 - alpha;
         let buffer = self.current_buffer_mut();
         let base_ptr = buffer.as_mut_ptr();
-        for x in x1..=x2 {
+        for x in x_lo..=x_hi {
             let (px, py) = if steep { (y, x) } else { (x, y) };
-            if px >= 0 && px < width && py >= 0 && py < height {
+            // 主轴（x）已由区间收窄保证在 [0, x_hi_bound] 内；次轴（y）在这里
+            // 单独检查其上界。下界恒为 0：坐标非负，且 y 从 y1 >= 0 出发，
+            // 步进方向 y_step 只会让它朝 y2 所在的一侧移动，不会越过 0。
+            if y <= y_hi_bound {
                 let offset = py as usize * pitch + px as usize * bpp;
                 let dst = unsafe { base_ptr.add(offset) };
-                let alpha = color.a;
                 if alpha == 0 {
-                    // skip
+                    // 完全透明：跳过写入
                 } else if alpha == 255 {
                     write_rgb_ptr!(dst, color.r, color.g, color.b, is_rgb_order);
                     if bpp == 4 {
                         unsafe { *dst.add(3) = opaque_alpha };
                     }
                 } else {
-                    let alpha_u16 = alpha as u16;
-                    let inv_alpha = 255 - alpha_u16;
-                    write_rgb_blend_ptr!(dst, color.r, color.g, color.b, alpha_u16, inv_alpha, is_rgb_order);
+                    write_rgb_blend_ptr!(
+                        dst,
+                        color.r,
+                        color.g,
+                        color.b,
+                        alpha,
+                        inv_alpha,
+                        is_rgb_order
+                    );
                     if bpp == 4 {
                         unsafe { *dst.add(3) = opaque_alpha };
                     }
@@ -1128,6 +1420,10 @@ mod tests {
     use crate::color::{Color, PixelFormat};
     use crate::framebuffer::FramebufferInfo;
     use crate::pixel::Pixel;
+    // 测试需要堆分配（部分用 vec! 构造帧缓冲，draw_line 回归测试构造像素列表）
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     #[test]
     fn set_pixel_uses_bgr24_format() {
@@ -1632,4 +1928,372 @@ mod tests {
         assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(255, 127, 127)));
         assert_eq!(renderer.get_pixel(1, 0), Some(Color::new(255, 127, 127)));
     }
+
+    // ── clear 缓冲区边界（安全性回归） ──
+
+    /// `clear` 在缓冲区小于一个填充模式时不得越界写。
+    ///
+    /// 4bpp 的填充模式是 16 字节；1×1 的 4bpp 缓冲区只有 4 字节，
+    /// 若不把模式写入长度收敛到 `pitch * height`，会越界写 12 字节。
+    ///
+    /// 用 canary 检测：缓冲区后紧跟守卫字节，写入越界会破坏守卫。
+    #[test]
+    fn clear_does_not_write_past_tiny_buffer() {
+        #[repr(C)]
+        struct Guarded {
+            buf: [u8; 4],
+            canary: [u8; 32],
+        }
+
+        for (format, bpp, pitch, w, h) in [
+            (PixelFormat::Rgba8888, 4usize, 4usize, 1usize, 1usize),
+            (PixelFormat::Bgra8888, 4, 4, 1, 1),
+            (PixelFormat::Argb8888, 4, 4, 1, 1),
+            (PixelFormat::Xrgb8888, 4, 4, 1, 1),
+            (PixelFormat::Rgb24, 3, 3, 1, 1),
+            (PixelFormat::Bgr24, 3, 3, 1, 1),
+        ] {
+            let _ = bpp;
+            let mut g = Guarded {
+                buf: [0u8; 4],
+                canary: [0xAAu8; 32],
+            };
+            let info = FramebufferInfo::new(w, h, pitch, format);
+            {
+                let mut r = Renderer::new(info, &mut g.buf);
+                r.clear(Color::new(1, 2, 3));
+            }
+            assert_eq!(
+                g.canary, [0xAAu8; 32],
+                "{format:?} ({w}x{h}, pitch {pitch}) 的 clear 越界写了 canary"
+            );
+        }
+    }
+
+    /// `clear` 在极小缓冲区下的实际像素值应正确（不只是不越界）。
+    #[test]
+    fn clear_fills_tiny_buffer_correctly() {
+        let info = FramebufferInfo::new(1, 1, 4, PixelFormat::Rgba8888);
+        let mut front = [0u8; 4];
+        let mut renderer = Renderer::new(info, &mut front);
+        renderer.clear(Color::new(1, 2, 3));
+        let got = renderer.get_pixel(0, 0).unwrap();
+        assert_eq!((got.r, got.g, got.b), (1, 2, 3));
+    }
+
+    // ── SWAR 混合路径等价性 ──
+
+    /// SWAR 混合必须与逐通道 `blend_channel` 逐字节一致。
+    ///
+    /// 覆盖全部 255 个有效 alpha 值 × 广泛的 src/dst 组合，包含会被
+    /// 4 像素分组与不足 4 像素的尾部两条分支。
+    #[test]
+    fn swar_alpha_blend_matches_per_channel_reference() {
+        fn reference(src: Color, dst: Color, alpha: u16) -> Color {
+            let inv = 255 - alpha;
+            Color::with_alpha(
+                PixelFormat::blend_channel(src.r, dst.r, alpha, inv),
+                PixelFormat::blend_channel(src.g, dst.g, alpha, inv),
+                PixelFormat::blend_channel(src.b, dst.b, alpha, inv),
+                255,
+            )
+        }
+
+        // 5 像素宽度：4 像素走 SWAR，1 像素走尾部回退分支。
+        const WIDTH: usize = 5;
+        const HEIGHT: usize = 1;
+        let make_info = || FramebufferInfo::new(WIDTH, HEIGHT, WIDTH * 4, PixelFormat::Rgba8888);
+
+        let src_colors = [
+            Color::new(0, 0, 0),
+            Color::new(255, 255, 255),
+            Color::new(255, 0, 0),
+            Color::new(0, 255, 0),
+            Color::new(17, 201, 99),
+        ];
+        let dst_colors = [
+            Color::new(0, 0, 0),
+            Color::new(255, 255, 255),
+            Color::new(255, 0, 0),
+            Color::new(1, 128, 254),
+            Color::new(200, 33, 77),
+        ];
+
+        // 单个 renderer 内完成：先种 dst，再叠加半透明 src，全程操作同一缓冲区。
+        // （不能创建两个 Renderer——`double_buffer` 下各自持有独立的 back_buffer。）
+        for alpha in 1u8..255 {
+            for src in src_colors {
+                for dst in dst_colors {
+                    let mut front = [0u8; WIDTH * 4];
+                    let mut renderer = Renderer::new(make_info(), &mut front);
+                    for x in 0..WIDTH {
+                        renderer.set_pixel(x, 0, &dst);
+                    }
+                    renderer.fill_rect(Pixel::new(0, 0), WIDTH, 1, src.mix_alpha(alpha));
+
+                    // fill_rect 走的是填充路径（非 set_pixel 的 alpha 分支），
+                    // 期望值用同一套 blend_channel 语义推导。
+                    let want = reference(src, dst, alpha as u16);
+                    for x in 0..WIDTH {
+                        let got = renderer.get_pixel(x, 0).expect("列在范围内");
+                        // 同时校验第 4 字节：4bpp 混合后必须被强制为 opaque_alpha，
+                        // 而不是参与插值的结果（曾因此漏掉一个真实 bug）。
+                        let off = x * 4;
+                        assert_eq!(
+                            (got.r, got.g, got.b),
+                            (want.r, want.g, want.b),
+                            "alpha={alpha} src={src:?} dst={dst:?} col={x}"
+                        );
+                        assert_eq!(
+                            renderer.buffer_mut()[off + 3],
+                            255,
+                            "Rgba8888 第 4 字节应为 255, alpha={alpha} col={x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 同一行内 4 像素分组与尾部回退必须产出相同结果（无分组边界错位）。
+    #[test]
+    fn swar_alpha_blend_row_is_uniform_for_uniform_target() {
+        const WIDTH: usize = 9; // 2 组 SWAR + 1 像素尾部
+        let info = FramebufferInfo::new(WIDTH, 1, WIDTH * 4, PixelFormat::Rgba8888);
+        let mut front = [0u8; WIDTH * 4];
+        let mut renderer = Renderer::new(info, &mut front);
+        for x in 0..WIDTH {
+            renderer.set_pixel(x, 0, &Color::new(64, 128, 192));
+        }
+        renderer.fill_rect(
+            Pixel::new(0, 0),
+            WIDTH,
+            1,
+            Color::with_alpha(200, 30, 90, 77),
+        );
+        let first = renderer.get_pixel(0, 0).unwrap();
+        for x in 0..WIDTH {
+            assert_eq!(renderer.get_pixel(x, 0), Some(first), "列 {x} 与列 0 不一致");
+        }
+    }
+
+    /// 4bpp 的 alpha 填充必须把第 4 字节强制成该格式的 `opaque_alpha`，
+    /// 而不是让它参与插值。
+    ///
+    /// `Xrgb8888` 的 `opaque_alpha` 是 0，其余 4bpp 格式是 255。SWAR 路径
+    /// 早期版本对第 4 字节也做了混合，导致 Xrgb8888 得到非 0 的残留值。
+    #[test]
+    fn alpha_fill_forces_opaque_alpha_byte_per_format() {
+        for (format, expected) in [
+            (PixelFormat::Xrgb8888, 0u8),
+            (PixelFormat::Rgba8888, 255),
+            (PixelFormat::Bgra8888, 255),
+            (PixelFormat::Argb8888, 255),
+        ] {
+            const W: usize = 8;
+            let info = FramebufferInfo::new(W, 1, W * 4, format);
+            let mut front = [0u8; W * 4];
+            let mut renderer = Renderer::new(info, &mut front);
+            // 先把第 4 字节种成非零，确保填充会覆写它
+            for x in 0..W {
+                renderer.buffer_mut()[x * 4 + 3] = 0x7F;
+            }
+            // 宽度 8 = 2 组 SWAR，无尾部分支，专门覆盖 SWAR 路径
+            renderer.fill_rect(
+                Pixel::new(0, 0),
+                W,
+                1,
+                Color::with_alpha(0x12, 0x34, 0x56, 128),
+            );
+            for x in 0..W {
+                assert_eq!(
+                    renderer.buffer_mut()[x * 4 + 3],
+                    expected,
+                    "{format:?} 第 {x} 列第 4 字节应为 {expected}"
+                );
+            }
+        }
+    }
+
+    // ── 输入校验（安全性回归） ──
+
+    #[test]
+    #[should_panic(expected = "front_buffer too small")]
+    fn new_rejects_undersized_front_buffer() {
+        // 元数据声称 4x4（需要 48 字节），但切片只有一行的大小。
+        // 若不校验，单缓冲 + release 下 set_pixel 会越界写（UB）。
+        let info = FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 12];
+        let _ = Renderer::new(info, &mut front);
+    }
+
+    #[test]
+    fn new_accepts_buffer_with_pitch_padding() {
+        // pitch > width * bpp 时 buffer_size > width * height * bpp，属合法布局
+        let info = FramebufferInfo::new(4, 4, 16, PixelFormat::Bgr24);
+        let mut front = [0u8; 64];
+        let mut renderer = Renderer::new(info, &mut front);
+        renderer.set_pixel(3, 3, &Color::new(0x12, 0x34, 0x56));
+        assert_eq!(
+            renderer.get_pixel(3, 3),
+            Some(Color::new(0x12, 0x34, 0x56))
+        );
+    }
+
+    #[test]
+    fn blit_rejects_src_pitch_smaller_than_row() {
+        let info = FramebufferInfo::new(4, 2, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 24];
+        let mut renderer = Renderer::new(info, &mut front);
+        renderer.set_pixel(1, 0, &Color::new(255, 255, 255));
+        // width=4, bpp=3 → 每行需要 12 字节，但 src_pitch=3。
+        // src.len() 满足 3*1，因此旧实现会越过行尾 panic。
+        let src = [0u8; 6];
+
+        renderer.blit(Pixel::new(0, 0), 4, 1, PixelFormat::Bgr24, &src, 3);
+
+        // 静默拒绝，原有像素不变
+        assert_eq!(renderer.get_pixel(1, 0), Some(Color::new(255, 255, 255)));
+    }
+
+    #[test]
+    fn blit_mask_rejects_mask_pitch_smaller_than_width() {
+        let info = FramebufferInfo::new(4, 1, 12, PixelFormat::Bgr24);
+        let mut front = [0u8; 12];
+        let mut renderer = Renderer::new(info, &mut front);
+        renderer.set_pixel(1, 0, &Color::new(255, 255, 255));
+        // width=4 但 mask_pitch=1；mask.len() 满足 1*1。
+        let mask = [0u8; 2];
+
+        renderer.blit_mask(Pixel::new(0, 0), 4, 1, &mask, 1, Color::new(255, 255, 255));
+
+        assert_eq!(renderer.get_pixel(1, 0), Some(Color::new(255, 255, 255)));
+    }
+
+    #[test]
+    fn fill_rect_handles_unaligned_pitch() {
+        // pitch = width*4 + 1 → 第 2 行起的目标指针不是 4 字节对齐。
+        // 旧实现把行指针转成 *mut u32 后写入，属于未定义行为
+        // （ARM / RISC-V 上可能触发异常）。
+        let width = 8usize;
+        let pitch = width * 4 + 1;
+        let info = FramebufferInfo::new(width, 4, pitch, PixelFormat::Rgba8888);
+        let mut front = vec![0u8; info.buffer_size()];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(0x12, 0x34, 0x56);
+
+        renderer.fill_rect(Pixel::new(0, 0), width, 4, color);
+
+        for y in 0..4 {
+            for x in 0..width {
+                assert_eq!(renderer.get_pixel(x, y), Some(color), "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    // ── draw_line 的迭代范围收窄 ──
+
+    #[test]
+    fn draw_line_with_huge_endpoint_stays_cheap() {
+        // 端点在 usize::MAX 量级时必须完成得很快：迭代范围收窄后
+        // 工作量只与可见像素数成正比，而非与线段长度成正比。
+        // （收窄前 x 方向 2 亿的线段约需 586 ms。）
+        let info = FramebufferInfo::new(64, 64, 64 * 3, PixelFormat::Bgr24);
+        let mut front = [0u8; 64 * 64 * 3];
+        let mut renderer = Renderer::new(info, &mut front);
+        let color = Color::new(0xFF, 0xFF, 0xFF);
+
+        renderer.draw_line(Pixel::new(0, 0), Pixel::new(usize::MAX, usize::MAX), &color);
+        renderer.draw_line(Pixel::new(0, 0), Pixel::new(usize::MAX, 0), &color);
+        renderer.draw_line(Pixel::new(0, 0), Pixel::new(0, usize::MAX), &color);
+
+        // 对角线方向的可见部分应被绘制
+        assert_eq!(renderer.get_pixel(0, 0), Some(color));
+        assert_eq!(renderer.get_pixel(63, 63), Some(color));
+    }
+
+    #[test]
+    fn draw_line_iteration_narrowing_preserves_coverage() {
+        // 参考实现：从原始端点跑完整 Bresenham，仅过滤越界像素
+        // （即收窄之前的旧行为）。收窄后必须逐像素一致。
+        fn reference(p1: (i64, i64), p2: (i64, i64), w: i64, h: i64) -> Vec<(i64, i64)> {
+            let (mut x1, mut y1) = p1;
+            let (mut x2, mut y2) = p2;
+            let steep = (y2 - y1).abs() > (x2 - x1).abs();
+            if steep {
+                core::mem::swap(&mut x1, &mut y1);
+                core::mem::swap(&mut x2, &mut y2);
+            }
+            if x1 > x2 {
+                core::mem::swap(&mut x1, &mut x2);
+                core::mem::swap(&mut y1, &mut y2);
+            }
+            let (dx, dy) = (x2 - x1, (y2 - y1).abs());
+            let mut error = dx / 2;
+            let y_step = if y1 < y2 { 1 } else { -1 };
+            let mut y = y1;
+            let mut out = Vec::new();
+            for x in x1..=x2 {
+                let (px, py) = if steep { (y, x) } else { (x, y) };
+                if px >= 0 && px < w && py >= 0 && py < h {
+                    out.push((px, py));
+                }
+                error -= dy;
+                if error < 0 {
+                    y += y_step;
+                    error += dx;
+                }
+            }
+            out
+        }
+
+        let (w, h) = (16i64, 16i64);
+        let color = Color::new(0xFF, 0xFF, 0xFF);
+        // 覆盖水平、垂直、两方向对角、极陡 / 极缓，以及大量越界终点
+        let pts: [(i64, i64); 12] = [
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (3, 7),
+            (8, 0),
+            (7, 9),
+            (15, 15),
+            (16, 0),
+            (0, 16),
+            (40, 3),
+            (100, 100),
+            (300, 7),
+        ];
+
+        for &(ax, ay) in &pts {
+            for &(bx, by) in &pts {
+                let info =
+                    FramebufferInfo::new(w as usize, h as usize, w as usize * 3, PixelFormat::Bgr24);
+                let mut front = [0u8; 16 * 16 * 3];
+                let mut renderer = Renderer::new(info, &mut front);
+                renderer.draw_line(
+                    Pixel::new(ax as usize, ay as usize),
+                    Pixel::new(bx as usize, by as usize),
+                    &color,
+                );
+
+                let mut drawn = Vec::new();
+                for y in 0..h {
+                    for x in 0..w {
+                        if renderer.get_pixel(x as usize, y as usize) == Some(color) {
+                            drawn.push((x, y));
+                        }
+                    }
+                }
+                let mut expected = reference((ax, ay), (bx, by), w, h);
+                drawn.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(
+                    drawn, expected,
+                    "coverage mismatch for ({ax},{ay})->({bx},{by})"
+                );
+            }
+        }
+    }
 }
+

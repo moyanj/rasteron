@@ -14,13 +14,24 @@
 //! - 多种 `BlendMode`
 //! - `Texture2D` 的 nearest / bilinear 采样
 //!
+//! `draw_indexed` 的顶点着色结果缓存需要 `alloc`，因此本模块会链接全局分配器。
 extern crate alloc;
 
 use crate::color::Color;
 use crate::core::Renderer;
 use crate::utils::floor_to_usize;
-use alloc::vec::Vec;
 use core::marker::PhantomData;
+
+/// 三角形裁剪后可能产生的最大顶点数。
+///
+/// 四个半平面各最多切一刀，3 个顶点的凸多边形最多增长到 3 + 4 = 7 个顶点，
+/// 取 8 作为安全上界。
+const MAX_CLIP_VERTICES: usize = 8;
+
+/// 扇形三角化后可能产生的最大三角形数。
+///
+/// `n` 个顶点扇形三角化产生 `n - 2` 个三角形，故上界为 `MAX_CLIP_VERTICES - 2`。
+const MAX_CLIP_TRIANGLES: usize = MAX_CLIP_VERTICES - 2;
 
 /// 光栅化原语类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,7 +682,14 @@ impl<'a> Renderer<'a> {
     fn write_fragment_color(&mut self, x: usize, y: usize, color: &Color, blend: BlendMode) {
         let offset = self.pixel_offset_unchecked(x, y);
         match blend {
+            // 完全不透明：跳过读-改-写，直接写。`Color::mix` 在 a == 255 时
+            // 恒等于 src，因此这一路径与混合路径的像素结果逐位一致，只是省掉了
+            // 一次目标读取 + 3 次乘法除法。GUI/字体等大覆盖面片基本全走这里。
             BlendMode::None => self.write_color_raw_at_offset(offset, color),
+            BlendMode::Alpha if color.a == 255 => self.write_color_raw_at_offset(offset, color),
+            // 完全透明：`Color::mix` 在 a == 0 时恒等于 dst，即写入是空操作。
+            // 直接跳过可以避免一次无用的读-改-写（虚线/镂空模板场景收益明显）。
+            BlendMode::Alpha if color.a == 0 => {}
             _ => {
                 let dst = self.read_color_at_offset(offset);
                 self.write_color_raw_at_offset(offset, &Self::blend_pixel(*color, dst, blend));
@@ -772,10 +790,16 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// 对三角形做四个半平面的 Sutherland–Hodgman 裁剪，并把结果三角化。
+    ///
+    /// 返回顶点扇形三角化的结果：`(顶点数组, 三角形个数)`。裁剪一个凸多边形
+    /// 最多产生 `MAX_VERTICES - 2` 个三角形，因此定长数组足以容纳全部输出，
+    /// **无需堆分配**——这对内核/裸机场景很关键（原实现每三角形一次 `Vec` 分配）。
     fn clip_triangle<V: Interpolate + Copy>(
         vertices: [ProgramVertex<V>; 3],
-    ) -> Option<Vec<ClippedTriangle<V>>> {
-        const MAX_VERTICES: usize = 8;
+    ) -> Option<([ClippedTriangle<V>; MAX_CLIP_TRIANGLES], usize)> {
+        const MAX_VERTICES: usize = MAX_CLIP_VERTICES;
+
         let mut input = [vertices[0]; MAX_VERTICES];
         input[0] = vertices[0];
         input[1] = vertices[1];
@@ -820,13 +844,17 @@ impl<'a> Renderer<'a> {
             return None;
         }
 
-        let mut triangles = Vec::new();
+        let mut triangles = [ClippedTriangle {
+            vertices: [vertices[0]; 3],
+        }; MAX_CLIP_TRIANGLES];
+        let mut count = 0usize;
         for index in 1..input_len - 1 {
-            triangles.push(ClippedTriangle {
+            triangles[count] = ClippedTriangle {
                 vertices: [input[0], input[index], input[index + 1]],
-            });
+            };
+            count += 1;
         }
-        Some(triangles)
+        Some((triangles, count))
     }
 
     #[inline(always)]
@@ -941,7 +969,7 @@ impl<'a> Renderer<'a> {
         V: Interpolate + Copy,
         FS: FragmentShader<Varying = V>,
     {
-        let Some(clipped_tris) = Self::clip_triangle(vertices) else {
+        let Some((clipped_tris, clipped_count)) = Self::clip_triangle(vertices) else {
             return;
         };
         let Some((clip_min_x, clip_min_y, clip_max_x, clip_max_y)) = self
@@ -951,7 +979,7 @@ impl<'a> Renderer<'a> {
             return;
         };
 
-        for clipped in clipped_tris {
+        for clipped in &clipped_tris[..clipped_count] {
             let vertices = clipped.vertices;
             let p0 = Self::ndc_to_screen(vertices[0].position, pipeline.state.viewport);
             let p1 = Self::ndc_to_screen(vertices[1].position, pipeline.state.viewport);
