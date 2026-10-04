@@ -11,7 +11,7 @@ use rasteron::Renderer;
 use rasteron::color::{Color, PixelFormat};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::pixel::Pixel;
-use rasteron::utils::sub_view;
+use rasteron::utils::sub_view_with_back_buffer;
 
 #[path = "../shared/bmp.rs"]
 mod bmp;
@@ -21,11 +21,13 @@ mod bmp;
 /// 用结构体收拢而非堆长参数列表——面板本身就是「一个矩形 + 一点内容」的概念。
 struct Panel<'a> {
     fb: &'a mut [u8],
+    /// 面板自己的后台缓冲区（双缓冲）。绘制落在它上面，`swap_buffers` 才写回 `fb`。
+    back: &'a mut [u8],
     info: &'a FramebufferInfo,
     /// 窗口左上角（父帧缓冲坐标系）。
     x: usize,
     y: usize,
-    /// 窗口尺寸（会被 `sub_view` 收缩到可视区内）。
+    /// 窗口尺寸（会被 `sub_view_with_back_buffer` 收缩到可视区内）。
     w: usize,
     h: usize,
     /// 标题色，同时用作强调色。
@@ -38,6 +40,7 @@ struct Panel<'a> {
 fn draw_panel(spec: Panel<'_>) {
     let Panel {
         fb,
+        back,
         info,
         x,
         y,
@@ -48,7 +51,7 @@ fn draw_panel(spec: Panel<'_>) {
     } = spec;
 
     // 裁剪在这里发生：子渲染器只看得到窗口内那部分字节。
-    let Some(mut panel) = sub_view(fb, info, x, y, w, h) else {
+    let Some(mut panel) = sub_view_with_back_buffer(fb, back, info, x, y, w, h) else {
         return;
     };
 
@@ -92,9 +95,8 @@ fn draw_panel(spec: Panel<'_>) {
         Color::with_alpha(255, 255, 255, 40),
     );
 
-    // 双缓冲下绘制落在面板自己的后台缓冲里，必须 present 才写回父缓冲区；
-    // 单缓冲下写入直接落在父缓冲区，没有该方法（编译期即不可用）。
-    #[cfg(feature = "double_buffer")]
+    // 绘制落在面板自己的后台缓冲里，必须 present 才写回父缓冲区；
+    // present 只覆盖窗口内的可见字节，面板以外的像素不受影响。
     panel.swap_buffers();
 }
 
@@ -105,21 +107,27 @@ fn main() {
     let info = FramebufferInfo::new(width, height, pitch, PixelFormat::Bgr24);
 
     let mut fb = vec![0u8; info.buffer_size()];
+    // 顶层与面板各自的后台缓冲区都由调用方提供，库不做任何分配。
+    let mut bg_back = vec![0u8; info.buffer_size()];
     {
-        let mut bg = Renderer::new(
+        let mut bg = Renderer::with_back_buffer(
             FramebufferInfo::new(width, height, pitch, PixelFormat::Bgr24),
             &mut fb,
+            &mut bg_back,
         );
         bg.clear(Color::new(20, 22, 30));
-        // 双缓冲下 clear 写的是 back_buffer，必须 present 才进 fb。
+        // clear 写的是后台缓冲区，必须 present 才进 fb。
         // 面板必须在底色 present 之后再画，否则会被底色盖掉。
-        #[cfg(feature = "double_buffer")]
         bg.swap_buffers();
     }
 
-    // 三个面板；第三个故意贴住右下角，触发 `sub_view` 的行数收缩。
+    // 三个面板共用一个足够大的后台缓冲：调用是顺序的，借用依次释放。
+    let mut panel_back = vec![0u8; info.buffer_size()];
+
+    // 三个面板；第三个故意贴住右下角，触发 `sub_view_with_back_buffer` 的行数收缩。
     draw_panel(Panel {
         fb: &mut fb,
+        back: &mut panel_back,
         info: &info,
         x: 20,
         y: 20,
@@ -130,6 +138,7 @@ fn main() {
     });
     draw_panel(Panel {
         fb: &mut fb,
+        back: &mut panel_back,
         info: &info,
         x: 220,
         y: 20,
@@ -140,6 +149,7 @@ fn main() {
     });
     draw_panel(Panel {
         fb: &mut fb,
+        back: &mut panel_back,
         info: &info,
         x: 420,
         y: 300,

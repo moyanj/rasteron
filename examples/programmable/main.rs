@@ -123,8 +123,10 @@ fn main() {
     let bpp = 4;
     let pitch = width * bpp;
     let info = FramebufferInfo::new(width, height, pitch, rasteron::color::PixelFormat::Rgba8888);
+    // 双缓冲：后台缓冲区由调用方提供，库不做任何分配。
     let mut fb = vec![0u8; info.buffer_size()];
-    let mut renderer = Renderer::new(info, &mut fb);
+    let mut back = vec![0u8; info.buffer_size()];
+    let mut renderer = Renderer::with_back_buffer(info, &mut fb, &mut back);
 
     // ── 背景：深灰色 ──
     renderer.clear(Color::new(30, 30, 30));
@@ -338,7 +340,6 @@ fn main() {
     );
     renderer.draw_arrays(PrimitiveType::Lines, &cross_lines, &pipeline_lines);
 
-    #[cfg(feature = "double_buffer")]
     renderer.swap_buffers();
 
     let output = "programmable-example.bmp";

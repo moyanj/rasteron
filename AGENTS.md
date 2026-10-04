@@ -1,7 +1,7 @@
 # rasteron 项目知识库
 
 **生成时间:** 2026-10-04
-**提交:** `91c1232` + 未提交工作区（圆与圆弧改为精确圆盘语义：逐行半宽 + 每像素单次写入）
+**提交:** `33f951b` + 未提交工作区（双缓冲改为调用方提供后台缓冲区，删除 `double_buffer` 特性）
 **分支:** `main`
 
 ## 概述
@@ -30,7 +30,9 @@ rasteron/
 ├── benches/renderer.rs  # criterion 基准，17 个 bench fn
 ├── examples/
 │   ├── basic/           # 全部固定功能图元
+│   ├── gallery/         # 12 格全图元索引图，含 sub_view 子视口
 │   ├── programmable/    # 着色器/插值/纹理/裁剪
+│   ├── subviewport/     # 子渲染器做无状态裁剪的 UI 面板
 │   └── shared/bmp.rs    # BMP 写出，被 examples 与 src/main.rs 复用
 └── *.bmp                # 运行产物，已 gitignore
 ```
@@ -53,17 +55,19 @@ rasteron/
 
 | 符号 | 类型 | 位置 | 角色 |
 |------|------|------|------|
-| `Renderer` | struct | `core.rs:125` | 唯一门面。持有 `&mut [u8]` 帧缓冲 + 缓存的格式属性 |
-| `Renderer::new` | fn | `core.rs:164` | 唯一 panic 点：切片小于 `pitch × height` |
-| `Renderer::draw_line` | fn | `core.rs:804` | `clip_line` 快速拒绝 → 迭代区间收窄的 Bresenham |
-| `Renderer::draw_line_unchecked` | fn | `core.rs:948` | 与 `draw_line` 同一内核，仅省掉快速拒绝与前置守卫 |
-| `Renderer::fill_rect` | fn | `core.rs:1049` | span 填充主入口，不透明 / 半透明双分支 |
-| `Renderer::blit` | fn | `core.rs:287` | 区域拷贝，格式不一致时静默返回 |
-| `Renderer::blit_mask` | fn | `core.rs:342` | 8bpp 掩码绘制，抗锯齿路径 |
-| `Renderer::draw_circle` / `fill_circle` | fn | `core.rs:1243,1267` | 半径在 `disk_params`（`core.rs:1087`）内钳制 |
-| `Renderer::draw_arc` / `fill_arc` | fn | `core.rs:1315,1370` | 圆弧 / 扇形。共用圆盘几何，回调内用 `Wedge` 筛角度 |
-| `walk_disk_rows` / `walk_disk_boundary` | fn | `core.rs:1132,1161` | 精确圆盘的逐行 / 逐边界像素原语，各自保证恰好回调一次 |
-| `Renderer::swap_buffers` | fn | `core.rs:1431` | 仅 `double_buffer`。实为 back→front 单向拷贝，非指针交换 |
+| `Renderer` | struct | `core.rs:122` | 唯一门面。持有前后台切片 + 缓存的格式属性 |
+| `Renderer::new` | fn | `core.rs:166` | 单缓冲构造。切片小于 `pitch × height` 时 panic |
+| `Renderer::with_back_buffer` | fn | `core.rs:205` | 双缓冲构造，后台缓冲区由调用方提供（库不做分配） |
+| `Renderer::is_double_buffered` | fn | `core.rs:262` | 是否持有后台缓冲区 |
+| `Renderer::draw_line` | fn | `core.rs:875` | `clip_line` 快速拒绝 → 迭代区间收窄的 Bresenham |
+| `Renderer::draw_line_unchecked` | fn | `core.rs:1019` | 与 `draw_line` 同一内核，仅省掉快速拒绝与前置守卫 |
+| `Renderer::fill_rect` | fn | `core.rs:1120` | span 填充主入口，不透明 / 半透明双分支 |
+| `Renderer::blit` | fn | `core.rs:358` | 区域拷贝，格式不一致时静默返回 |
+| `Renderer::blit_mask` | fn | `core.rs:413` | 8bpp 掩码绘制，抗锯齿路径 |
+| `Renderer::draw_circle` / `fill_circle` | fn | `core.rs:1313,1337` | 半径在 `disk_params`（`core.rs:1157`）内钳制 |
+| `Renderer::draw_arc` / `fill_arc` | fn | `core.rs:1385,1440` | 圆弧 / 扇形。共用圆盘几何，回调内用 `Wedge` 筛角度 |
+| `walk_disk_rows` / `walk_disk_boundary` | fn | `core.rs:1202,1231` | 精确圆盘的逐行 / 逐边界像素原语，各自保证恰好回调一次 |
+| `Renderer::swap_buffers` | fn | `core.rs:1504` | back→front 单向拷贝（非指针交换）；单缓冲时空操作 |
 | `Angle` | struct | `angle.rs` | 定点角度，整圈 `2^32` 圈值，加减自动环绕 |
 | `Wedge` | struct | `angle.rs` | 起止角区间，构造时预算单位向量，判定只做叉积 |
 | `PixelFormat` | enum | `color.rs:186` | 6 种格式，shift/bpp 均 `const fn` |
@@ -75,20 +79,20 @@ rasteron/
 | `Interpolate` | trait | `programmable.rs:129` | varying 插值契约 |
 | `Pipeline` | struct | `programmable.rs:620` | VS + FS + `PipelineState` 三元组 |
 | `Texture2D` | struct | `programmable.rs:389` | nearest / bilinear 采样 + wrap 模式 |
-| `clip_line` | fn | `utils.rs:14` | Cohen–Sutherland，i128 中间运算防溢出 |
+| `sub_view` / `sub_view_with_back_buffer` | fn | `utils.rs:47,105` | 按窗口构造子渲染器；后者带调用方提供的后台缓冲 |
+| `clip_line` | fn | `utils.rs:204` | Cohen–Sutherland，i128 中间运算防溢出 |
 | `simd::memcpy` | fn | `simd.rs:145` | `len <= 128` 直接走 `copy_nonoverlapping` |
 
 ## FEATURES
 
 | 标志 | 默认 | 影响 |
 |------|------|------|
-| `double_buffer` | 是 | 链接 `alloc`，分配后台缓冲；`programmable` 关闭时唯一需要分配器的特性 |
-| `programmable` | 是 | 引入 `f32`；关闭后几何计算全整数，无浮点依赖 |
+| `programmable` | 是 | 引入 `f32`；关闭后几何计算全整数，无浮点依赖。**唯一需要 `alloc` 的特性**（`draw_indexed` 的顶点着色缓存） |
 | `simd` | 是 | 经 `blit`/`clear`/填充路径使用向量寄存器 |
 
 组合约束（改动时勿破坏）：
 
-- 关掉 `programmable` + `double_buffer` ⇒ 不链接全局分配器。
+- 关掉 `programmable` ⇒ 不链接全局分配器。双缓冲不需要分配器：前后台缓冲区都由调用方提供。
 - 内核态使用 `simd` 需自行配对 `kernel_fpu_begin/end`（或 NEON 版本），因为它会动 XMM/YMM/ZMM、V0-V31。
 - `simd` 在无任何向量扩展的平台上仍有 `#[cfg]` 回退分支，不要删。
 
@@ -101,10 +105,10 @@ rasteron/
 - **`unsafe fn` 必须写 `# Safety` 段**。`lib.rs:82` 已开 `unsafe_op_in_unsafe_fn`，块内仍需显式 `unsafe {}`。
 - **`# Safety` 段不能与正文自相矛盾**。若实现已自行收窄与校验、实际无附加前置条件，就只声明与安全版相同的前提，不要一边写「不需要额外保证」一边罗列坐标要求（`draw_line_unchecked` 是范例）。
 - **边界裁剪只做一次**：在上层几何函数裁好，热路径直接裸指针写。`debug_assert!` 兜底，不做运行时检查。
-- **格式属性在 `new()` 缓存**：`fmt_bpp` / `fmt_rgb_order` / `fmt_opaque_alpha` / `fmt_stores_color_alpha`。热路径禁止 `match info.format`。
-- **字节序分支用宏消除**：`write_rgb!` / `write_rgb_blend!` / `write_rgb_blend_ptr!` / `write_rgb_ptr!`（`core.rs:15-88`）。
+- **格式属性在构造期缓存**（`new` / `with_back_buffer` 共用的私有 `build`）：`fmt_bpp` / `fmt_rgb_order` / `fmt_opaque_alpha` / `fmt_stores_color_alpha`。热路径禁止 `match info.format`。
+- **字节序分支用宏消除**：`write_rgb!` / `write_rgb_blend!` / `write_rgb_blend_ptr!` / `write_rgb_ptr!`（`core.rs:12-85`）。
 - **优化路径必须与标量参考等价**，并写穷举校验单测。命名约定：`blend_word_matches_blend_channel_over_all_byte_pairs`、`blend_span_matches_write_color_reference`、`alpha_fill_matches_per_channel_reference`。
-- **`usize → i64` 一律走 `sat_i64`**（`utils.rs:117`）。乘积中间值走 `i128`。
+- **`usize → i64` 一律走 `sat_i64`**（`utils.rs:307`）。乘积中间值走 `i128`。
 - **迭代量必须与调用方输入解耦**：任何 `for` / `while` 的次数只能取决于帧缓冲尺寸，不得取决于端点坐标或半径。本库曾是 DoS 温床——`draw_line_unchecked` 按线段全长步进（端点取 `usize::MAX` 时越界写，实测 SIGSEGV）、圆图元按半径迭代（半径取 `1_000_000_000` 时约 7 亿次迭代把线程钉死），二者现均改为按帧缓冲尺寸收窄（见反模式）。
 - **panic 只用于构造期不变量**：`FramebufferInfo::new`、`Renderer::new`、`Texture2D::new`。运行期可恢复错误走 `Option`/`Result`（如 `Texture2D::try_new`、`blit_mask` 静默返回）。
 - **文档与注释全中文**，公开项必须有 rustdoc 示例。

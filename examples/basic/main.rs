@@ -20,8 +20,10 @@ fn main() {
     let bpp = 3;
     let pitch = width * bpp;
     let info = FramebufferInfo::new(width, height, pitch, PixelFormat::Bgr24);
+    // 双缓冲：后台缓冲区由调用方提供，库不做任何分配。
     let mut fb = vec![0u8; info.buffer_size()];
-    let mut renderer = Renderer::new(info, &mut fb);
+    let mut back = vec![0u8; info.buffer_size()];
+    let mut renderer = Renderer::with_back_buffer(info, &mut fb, &mut back);
 
     // ── 背景：渐变天空 ──
     draw_sky(&mut renderer, width, height);
@@ -193,7 +195,6 @@ fn main() {
         renderer.set_pixel(sx, sy, &WHITE);
     }
 
-    #[cfg(feature = "double_buffer")]
     renderer.swap_buffers();
 
     let output = "basic-example.bmp";

@@ -5,10 +5,6 @@ use crate::pixel::Pixel;
 #[cfg(feature = "simd")]
 use crate::simd;
 use crate::utils::{clip_line, pattern_fill, sat_i64};
-#[cfg(feature = "double_buffer")]
-extern crate alloc;
-#[cfg(feature = "double_buffer")]
-use alloc::vec::Vec;
 
 /// 根据字节序写入 RGB 三通道到目标切片。
 ///
@@ -126,8 +122,12 @@ enum CircleKind {
 pub struct Renderer<'a> {
     info: FramebufferInfo,
     front_buffer: &'a mut [u8],
-    #[cfg(feature = "double_buffer")]
-    back_buffer: Vec<u8>,
+    /// 后台缓冲区。`Some` 表示启用双缓冲：所有绘制写入此切片，
+    /// 由 [`Renderer::swap_buffers`] 逐行 present 到 `front_buffer`。
+    ///
+    /// 缓冲区由调用方提供，库本身不做任何分配——这正是双缓冲在 `no_std`
+    /// 无分配器环境下可用的原因。
+    back_buffer: Option<&'a mut [u8]>,
 
     // --- 缓存的像素格式属性（在 new() 中初始化一次，消除热路径中的格式匹配）---
     pub(crate) fmt_bpp: usize,
@@ -137,12 +137,13 @@ pub struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    /// 创建新的渲染器。
+    /// 创建单缓冲渲染器。
     ///
     /// * `info` — 帧缓冲布局描述。
     /// * `front_buffer` — 前端帧缓冲的可变引用。
     ///
-    /// 当启用 `double_buffer` 特性时，会自动分配后端缓冲区。
+    /// 绘制直接写入 `front_buffer`，[`Renderer::swap_buffers`] 是空操作。
+    /// 需要双缓冲时用 [`Renderer::with_back_buffer`]。
     ///
     /// # 恐慌
     ///
@@ -163,6 +164,60 @@ impl<'a> Renderer<'a> {
     /// renderer.set_pixel(0, 0, &rasteron::color::Color::new(255, 0, 0));
     /// ```
     pub fn new(info: FramebufferInfo, front_buffer: &'a mut [u8]) -> Self {
+        Self::build(info, front_buffer, None)
+    }
+
+    /// 创建双缓冲渲染器，后台缓冲区由调用方提供。
+    ///
+    /// * `info` — 帧缓冲布局描述，同时描述前台与后台缓冲区。
+    /// * `front_buffer` — 前端帧缓冲，[`Renderer::swap_buffers`] 的目标。
+    /// * `back_buffer` — 后端帧缓冲，所有绘制命令的落点。
+    ///
+    /// 两个切片都必须能容纳 `pitch × height` 字节，且必须互不重叠——
+    /// 后者由 Rust 的可变借用规则在编译期保证（同一个数组的两段可用
+    /// `split_at_mut` 切开后分别传入）。
+    ///
+    /// # 恐慌
+    ///
+    /// 如果 `front_buffer` 或 `back_buffer` 短于 `info.buffer_size()` 则恐慌，
+    /// 判定口径与 [`Renderer::new`] 相同。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use rasteron::Renderer;
+    /// # use rasteron::framebuffer::FramebufferInfo;
+    /// # use rasteron::color::{Color, PixelFormat};
+    /// let info = FramebufferInfo::new(16, 16, 48, PixelFormat::Bgr24);
+    /// // 无分配器环境：前后台来自同一块静态内存的两段。
+    /// let mut storage = [0u8; 16 * 48 * 2];
+    /// {
+    ///     let (front, back) = storage.split_at_mut(16 * 48);
+    ///     let mut renderer = Renderer::with_back_buffer(info, front, back);
+    ///     renderer.clear(Color::new(0, 0, 255));
+    ///     // 绘制落在后台（Bgr24 字节序为 B,G,R），前台尚未被触碰
+    ///     assert_eq!(&renderer.buffer()[..3], &[255, 0, 0]);
+    ///     renderer.swap_buffers();
+    /// }
+    /// // 渲染器离开作用域后，前台已是呈现后的蓝色
+    /// assert_eq!(&storage[..3], &[255, 0, 0]);
+    /// ```
+    pub fn with_back_buffer(
+        info: FramebufferInfo,
+        front_buffer: &'a mut [u8],
+        back_buffer: &'a mut [u8],
+    ) -> Self {
+        Self::build(info, front_buffer, Some(back_buffer))
+    }
+
+    /// 构造函数的共用实现：校验两个缓冲区的尺寸并缓存格式属性。
+    ///
+    /// `back_buffer` 为 `None` 即单缓冲。
+    fn build(
+        info: FramebufferInfo,
+        front_buffer: &'a mut [u8],
+        back_buffer: Option<&'a mut [u8]>,
+    ) -> Self {
         // 以 info 为准的边界保护（含 get_unchecked_mut）要求切片足够大。
         let required = info.buffer_size();
         assert!(
@@ -173,8 +228,16 @@ impl<'a> Renderer<'a> {
             info.height,
             front_buffer.len()
         );
-        #[cfg(feature = "double_buffer")]
-        let buffer_size = info.buffer_size();
+        if let Some(back) = &back_buffer {
+            assert!(
+                back.len() >= required,
+                "back_buffer too small: need {} bytes (pitch {} x height {}), got {}",
+                required,
+                info.pitch,
+                info.height,
+                back.len()
+            );
+        }
         let (fmt_bpp, fmt_rgb_order, fmt_opaque_alpha, fmt_stores_color_alpha) = match info.format {
             PixelFormat::Rgb24 => (3, true, 255, false),
             PixelFormat::Bgr24 => (3, false, 255, false),
@@ -186,8 +249,7 @@ impl<'a> Renderer<'a> {
         Self {
             info,
             front_buffer,
-            #[cfg(feature = "double_buffer")]
-            back_buffer: alloc::vec![0; buffer_size],
+            back_buffer,
             fmt_bpp,
             fmt_rgb_order,
             fmt_opaque_alpha,
@@ -195,24 +257,32 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// 是否处于双缓冲模式（即构造时提供了后台缓冲区）。
+    #[inline(always)]
+    pub fn is_double_buffered(&self) -> bool {
+        self.back_buffer.is_some()
+    }
+
     /// 返回当前可写入的缓冲区切片（内部使用）。
     ///
-    /// 双缓冲模式下返回 `back_buffer`，否则返回 `front_buffer`。
+    /// 双缓冲模式下返回后台缓冲区，否则返回前台缓冲区。
     #[inline(always)]
     pub fn buffer_mut(&mut self) -> &mut [u8] {
-        #[cfg(feature = "double_buffer")]
-        return &mut self.back_buffer;
-        #[cfg(not(feature = "double_buffer"))]
-        return &mut self.front_buffer;
+        if let Some(back) = self.back_buffer.as_deref_mut() {
+            return back;
+        }
+        &mut self.front_buffer[..]
     }
 
     /// 返回当前可读取的缓冲区切片（内部使用）。
+    ///
+    /// 双缓冲模式下返回后台缓冲区，否则返回前台缓冲区。
     #[inline(always)]
     pub fn buffer(&self) -> &[u8] {
-        #[cfg(feature = "double_buffer")]
-        return &self.back_buffer;
-        #[cfg(not(feature = "double_buffer"))]
-        return &self.front_buffer;
+        if let Some(back) = self.back_buffer.as_deref() {
+            return back;
+        }
+        &self.front_buffer[..]
     }
 
     /// 每个像素占用的字节数。
@@ -1419,16 +1489,25 @@ impl<'a> Renderer<'a> {
         });
     }
 
-    /// 如果启用双缓冲，将后台缓冲区交换到前台（即刷新到显存）。
+    /// 将后台缓冲区呈现（present）到前台。
     ///
     /// 只拷贝每行可见的 `width × bytes_per_pixel` 字节：行间填充不属于可见像素，
     /// 可见区域之外的字节保持前台原样。这一点对
     /// [`sub_view`](crate::utils::sub_view) 构造的子渲染器是必需的——子渲染器的
     /// 切片按父缓冲区的 `pitch` 跨行，整段拷贝会连面板以外的像素一起覆盖。
     ///
-    /// 单缓冲模式下此方法不可用。
-    #[cfg(feature = "double_buffer")]
+    /// 本方法是**单向拷贝**，不是指针交换：调用后后台缓冲区内容保持不变，
+    /// 下一帧仍以当前后台内容为起点。需要清屏的调用方自行调用
+    /// [`Renderer::clear`]。
+    ///
+    /// 单缓冲模式下（未提供后台缓冲区）绘制本就落在前台，此方法为空操作。
     pub fn swap_buffers(&mut self) {
+        // 先取出后台切片的不可变引用：`back_buffer` 与 `front_buffer` 是不同的
+        // 字段，借用检查器允许随后可变借用 `front_buffer`。
+        let Some(back) = self.back_buffer.as_deref() else {
+            return;
+        };
+
         let row_len = self.info.width * self.info.bytes_per_pixel();
         let height = self.info.height;
         if row_len == 0 || height == 0 {
@@ -1440,15 +1519,14 @@ impl<'a> Renderer<'a> {
             // 无行间填充：一次拷贝。切片可能比 `buffer_size()` 更长，故显式取前
             // `pitch × height` 字节，而不是整体 `copy_from_slice`（长度不等会 panic）。
             let total = pitch * height;
-            self.front_buffer[..total].copy_from_slice(&self.back_buffer[..total]);
+            self.front_buffer[..total].copy_from_slice(&back[..total]);
             return;
         }
 
         // 有行间填充：逐行只拷贝可见部分，填充字节与相邻区域不被触碰。
         for y in 0..height {
             let off = y * pitch;
-            self.front_buffer[off..off + row_len]
-                .copy_from_slice(&self.back_buffer[off..off + row_len]);
+            self.front_buffer[off..off + row_len].copy_from_slice(&back[off..off + row_len]);
         }
     }
 
@@ -2942,7 +3020,7 @@ mod tests {
         ];
 
         // 单个 renderer 内完成：先种 dst，再叠加半透明 src，全程操作同一缓冲区。
-        // （不能创建两个 Renderer——`double_buffer` 下各自持有独立的 back_buffer。）
+        // （不能创建两个 Renderer——同一个 front 切片无法被同时可变借用。）
         for alpha in 1u8..255 {
             for src in src_colors {
                 for dst in dst_colors {
@@ -3264,5 +3342,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── 双缓冲（调用方提供后台缓冲区）──
+
+    /// 双缓冲下绘制必须落在后台缓冲区，只有 `swap_buffers` 才把可见字节呈现到前台。
+    #[test]
+    fn double_buffer_draws_to_back_and_present_copies_to_front() {
+        let make_info = || FramebufferInfo::new(4, 2, 16, PixelFormat::Rgba8888);
+        let mut front = [0u8; 32];
+        let mut back = [0u8; 32];
+
+        // 第一段：绘制落在后台，前台保持初值。
+        {
+            let mut renderer = Renderer::with_back_buffer(make_info(), &mut front, &mut back);
+            assert!(renderer.is_double_buffered());
+            renderer.set_pixel(1, 1, &Color::new(10, 20, 30));
+            // 像素 (1,1) 的偏移是 1 × pitch(16) + 1 × bpp(4) = 20
+            assert_eq!(renderer.buffer()[20..23], [10, 20, 30]);
+        }
+        assert_eq!(front, [0u8; 32], "未 present 时前台不应被触碰");
+
+        // 第二段：重新构造（后台内容保留），present 后前台等于后台。
+        {
+            let mut renderer = Renderer::with_back_buffer(make_info(), &mut front, &mut back);
+            renderer.swap_buffers();
+        }
+        assert_eq!(front, back);
+        assert_eq!(front[20..23], [10, 20, 30]);
+    }
+
+    /// 单缓冲下 `swap_buffers` 是空操作——绘制本就落在前台。
+    #[test]
+    fn single_buffer_swap_buffers_is_noop() {
+        let info = FramebufferInfo::new(2, 2, 8, PixelFormat::Rgba8888);
+        let mut front = [0u8; 16];
+        {
+            let mut renderer = Renderer::new(info, &mut front);
+            assert!(!renderer.is_double_buffered());
+            renderer.set_pixel(1, 1, &Color::new(1, 2, 3));
+            renderer.swap_buffers();
+        }
+        assert_eq!(front[12..15], [1, 2, 3]);
+    }
+
+    /// 后台缓冲区短于 `pitch × height` 时必须在构造期 panic。
+    #[test]
+    #[should_panic(expected = "back_buffer too small")]
+    fn with_back_buffer_rejects_short_back_buffer() {
+        let info = FramebufferInfo::new(4, 4, 16, PixelFormat::Rgba8888);
+        let mut front = [0u8; 64];
+        let mut back = [0u8; 63];
+        let _ = Renderer::with_back_buffer(info, &mut front, &mut back);
+    }
+
+    /// 有行间填充时，present 只覆盖每行可见字节：行尾填充与相邻区域保持前台原值。
+    ///
+    /// 这正是 `sub_view` 子视口能安全 present 的前提（切片按父缓冲区 `pitch` 跨行，
+    /// 整段拷贝会连面板以外的像素一起覆盖）。
+    #[test]
+    fn swap_buffers_preserves_row_padding() {
+        // pitch = 12 > width × bpp = 8，每行末尾 4 字节是填充。
+        let info = FramebufferInfo::new(2, 2, 12, PixelFormat::Rgba8888);
+        let mut front = [0xAAu8; 24];
+        let mut back = [0u8; 24];
+        {
+            let mut renderer = Renderer::with_back_buffer(info, &mut front, &mut back);
+            renderer.set_pixel(0, 0, &Color::new(1, 2, 3));
+            renderer.set_pixel(0, 1, &Color::new(4, 5, 6));
+            renderer.swap_buffers();
+        }
+        assert_eq!(&front[0..3], &[1, 2, 3]);
+        assert_eq!(&front[12..15], &[4, 5, 6]);
+        // 行尾填充字节未被触碰
+        assert_eq!(&front[8..12], &[0xAA; 4]);
+        assert_eq!(&front[20..24], &[0xAA; 4]);
+        // 后台的填充字节仍是 0，说明拷贝范围严格是可见区间
+        assert_eq!(&back[8..12], &[0u8; 4]);
+    }
+
+    /// 同一批绘制命令在单缓冲与双缓冲下必须产生完全相同的像素（present 之后）。
+    #[test]
+    fn double_buffer_present_matches_single_buffer_result() {
+        fn draw_sample(renderer: &mut Renderer<'_>) {
+            renderer.clear(Color::new(9, 8, 7));
+            renderer.fill_rect(Pixel::new(1, 0), 3, 2, Color::with_alpha(200, 100, 50, 128));
+            renderer.draw_line(Pixel::new(0, 0), Pixel::new(4, 2), &Color::new(1, 1, 1));
+            renderer.fill_circle(Pixel::new(2, 1), 2, Color::new(255, 0, 255));
+        }
+
+        let make_info = || FramebufferInfo::new(5, 3, 20, PixelFormat::Rgba8888);
+        let mut single = [0u8; 60];
+        let mut front = [0u8; 60];
+        let mut back = [0u8; 60];
+
+        {
+            let mut renderer = Renderer::new(make_info(), &mut single);
+            draw_sample(&mut renderer);
+        }
+        {
+            let mut renderer = Renderer::with_back_buffer(make_info(), &mut front, &mut back);
+            draw_sample(&mut renderer);
+            renderer.swap_buffers();
+        }
+
+        assert_eq!(single, front);
     }
 }

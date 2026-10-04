@@ -19,12 +19,12 @@ fn main() {
     let pitch = width * 3;
     let info = FramebufferInfo::new(width, height, pitch, PixelFormat::Bgr24);
     let mut front_buffer = vec![0u8; info.buffer_size()];
-    let mut renderer = Renderer::new(info, &mut front_buffer);
+    let mut back_buffer = vec![0u8; info.buffer_size()];
+    let mut renderer = Renderer::with_back_buffer(info, &mut front_buffer, &mut back_buffer);
 
     renderer.clear(BLUE);
     renderer.draw_line(pixel!(1, 0), pixel!(1000, 200), &BLACK);
 
-    #[cfg(feature = "double_buffer")]
     renderer.swap_buffers();
 
     bmp::write_bmp(

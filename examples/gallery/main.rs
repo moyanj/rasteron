@@ -13,7 +13,7 @@ use rasteron::angle::Angle;
 use rasteron::color::{BLACK, BLUE, CYAN, Color, GRAY, GREEN, MAGENTA, RED, WHITE, YELLOW};
 use rasteron::framebuffer::{FramebufferInfo, PixelFormat};
 use rasteron::pixel::Pixel;
-use rasteron::utils::sub_view;
+use rasteron::utils::sub_view_with_back_buffer;
 
 #[path = "../shared/bmp.rs"]
 mod bmp;
@@ -64,14 +64,16 @@ const ACCENTS: [Color; 6] = [RED, GREEN, BLUE, YELLOW, CYAN, MAGENTA];
 fn main() {
     let info = FramebufferInfo::new(WIDTH, HEIGHT, WIDTH * 3, PixelFormat::Bgr24);
     let mut fb = vec![0u8; info.buffer_size()];
+    let mut back = vec![0u8; info.buffer_size()];
 
     // ── 第一阶段：主渲染器 ──
     // `sub_view` 需要父缓冲的裸切片，而 `Renderer` 在存活期间独占它，
     // 所以子渲染器那一格必须放到第二阶段（作用域结束、缓冲区归还之后）。
     {
-        let mut r = Renderer::new(
+        let mut r = Renderer::with_back_buffer(
             FramebufferInfo::new(WIDTH, HEIGHT, WIDTH * 3, PixelFormat::Bgr24),
             &mut fb,
+            &mut back,
         );
         r.clear(Color::new(24, 24, 30));
 
@@ -98,7 +100,6 @@ fn main() {
             draw(&mut r, content);
         }
 
-        #[cfg(feature = "double_buffer")]
         r.swap_buffers();
     }
 
@@ -112,8 +113,12 @@ fn main() {
         let panel_y = origin.y + TITLE_H;
         let panel_w = CELL_W - 2 * GAP - 8;
         let panel_h = CELL_H - 12;
-        let Some(mut panel) = sub_view(&mut fb, &info, panel_x, panel_y, panel_w, panel_h) else {
-            panic!("sub_view 未能构造子渲染器");
+        // 子视口同样双缓冲：面板后台按窗口的 `pitch × 高度` 口径准备。
+        let mut panel_back = vec![0u8; info.pitch * panel_h];
+        let Some(mut panel) =
+            sub_view_with_back_buffer(&mut fb, &mut panel_back, &info, panel_x, panel_y, panel_w, panel_h)
+        else {
+            panic!("sub_view_with_back_buffer 未能构造子渲染器");
         };
         let (pw, ph) = (panel.info().width, panel.info().height);
 
@@ -143,7 +148,6 @@ fn main() {
         // 边框画在最后，确保可见（否则会被前面的填充覆盖）
         panel.draw_rect(Pixel::new(0, 0), pw, ph, &GRAY);
 
-        #[cfg(feature = "double_buffer")]
         panel.swap_buffers();
     }
 

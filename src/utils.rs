@@ -4,15 +4,10 @@ use crate::framebuffer::FramebufferInfo;
 #[cfg(feature = "simd")]
 use crate::simd;
 
-/// 按可见窗口构造子渲染器，实现无状态裁剪。
+/// 按可见窗口构造单缓冲子渲染器，实现无状态裁剪。
 ///
-/// # 必须注意的前提
-///
-/// 1. **双缓冲下每个子渲染器画完都要 `swap_buffers()`。** 与父渲染器一样，
-///    绘制写入的是各自的后台缓冲，不 present 不会写回 `fb`。
-///    `swap_buffers` 只写回窗口内 `width × bytes_per_pixel` 的可见字节，
-///    故 present 不会波及面板以外的像素（切片本身按父缓冲区的 `pitch` 跨行，
-///    整段拷贝会连相邻行一起覆盖）。
+/// 绘制直接写入 `fb`。需要子视口双缓冲（绘制落在独立后台缓冲区、再由
+/// `swap_buffers` 呈现回 `fb`）时用 [`sub_view_with_back_buffer`]。
 ///
 /// # 收缩规则
 ///
@@ -43,10 +38,6 @@ use crate::simd;
 ///
 /// // 画一个远超窗口的矩形，溢出部分被自动裁掉
 /// panel.fill_rect(Pixel::new(0, 0), 1000, 1000, Color::new(255, 0, 0));
-///
-/// // 双缓冲下必须 present 才写回 fb；单缓冲下没有该方法（编译期即不可用）。
-/// #[cfg(feature = "double_buffer")]
-/// panel.swap_buffers();
 /// ```
 ///
 /// # 返回值
@@ -61,6 +52,102 @@ pub fn sub_view<'a>(
     width: usize,
     height: usize,
 ) -> Option<Renderer<'a>> {
+    let geo = sub_view_geometry(fb.len(), info, x, y, width, height)?;
+    let sub_info = FramebufferInfo::new(geo.width, geo.height, info.pitch, info.format);
+    Some(Renderer::new(
+        sub_info,
+        &mut fb[geo.offset..geo.offset + geo.len],
+    ))
+}
+
+/// 按可见窗口构造**双缓冲**子渲染器，后台缓冲区由调用方提供。
+///
+/// 与 [`sub_view`] 的唯一区别是绘制落在 `back` 而非 `fb`，需要调用
+/// [`Renderer::swap_buffers`] 才会写回父缓冲区。这一点与顶层
+/// [`Renderer::with_back_buffer`] 一致。
+///
+/// `swap_buffers` 只写回窗口内 `width × bytes_per_pixel` 的可见字节，故呈现
+/// 不会波及面板以外的像素——子渲染器切片按父缓冲区的 `pitch` 跨行，整段拷贝
+/// 会连相邻行一起覆盖。
+///
+/// # 后台缓冲区口径
+///
+/// `back` 必须能容纳 `pitch × 收缩后高度` 字节（与前台切片同口径，含行填充）。
+/// 不足时返回 `None`，不 panic。
+///
+/// # 示例
+///
+/// ```
+/// # use rasteron::{Pixel};
+/// # use rasteron::framebuffer::FramebufferInfo;
+/// # use rasteron::color::{Color, PixelFormat};
+/// # use rasteron::utils::sub_view_with_back_buffer;
+/// let pitch = 64 * 4;
+/// let info = FramebufferInfo::new(64, 64, pitch, PixelFormat::Rgba8888);
+/// let mut fb = vec![0u8; info.buffer_size()];
+/// let mut back = vec![0u8; info.buffer_size()];
+///
+/// {
+///     let mut panel =
+///         sub_view_with_back_buffer(&mut fb, &mut back, &info, 8, 8, 16, 16).unwrap();
+///     panel.fill_rect(Pixel::new(0, 0), 16, 16, Color::new(255, 0, 0));
+///     assert!(panel.is_double_buffered());
+///     panel.swap_buffers();
+/// }
+/// // 呈现后只有窗口内的像素被写回，窗口外仍是初始值
+/// assert_eq!(&fb[8 * pitch + 8 * 4..8 * pitch + 8 * 4 + 3], &[255, 0, 0]);
+/// assert_eq!(fb[0], 0);
+/// ```
+///
+/// # 返回值
+///
+/// 与 [`sub_view`] 相同的收缩规则；此外 `back` 容量不足时也返回 `None`。
+pub fn sub_view_with_back_buffer<'a>(
+    fb: &'a mut [u8],
+    back: &'a mut [u8],
+    info: &FramebufferInfo,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Option<Renderer<'a>> {
+    let geo = sub_view_geometry(fb.len(), info, x, y, width, height)?;
+    // 后台按与前台完全相同的口径要求（含行填充），短一字节就拒绝。
+    if back.len() < geo.len {
+        return None;
+    }
+    let sub_info = FramebufferInfo::new(geo.width, geo.height, info.pitch, info.format);
+    Some(Renderer::with_back_buffer(
+        sub_info,
+        &mut fb[geo.offset..geo.offset + geo.len],
+        &mut back[..geo.len],
+    ))
+}
+
+/// 子视口窗口收缩后的几何结果。
+struct SubViewGeometry {
+    /// 窗口左上角在父缓冲区中的字节偏移。
+    offset: usize,
+    /// 窗口切片长度，`pitch × height`（含行填充）。
+    len: usize,
+    /// 收缩后的可见宽度（像素）。
+    width: usize,
+    /// 收缩后的可见高度（像素）。
+    height: usize,
+}
+
+/// 按可见窗口把子视口收缩到 `fb_len` 字节之内。
+///
+/// [`sub_view`] 与 [`sub_view_with_back_buffer`] 共用此收缩逻辑，两者的窗口
+/// 判定完全一致。返回 `None` 表示窗口完全不可用（见 [`sub_view`] 文档）。
+fn sub_view_geometry(
+    fb_len: usize,
+    info: &FramebufferInfo,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Option<SubViewGeometry> {
     if width == 0 || height == 0 || x >= info.width || y >= info.height {
         return None;
     }
@@ -79,8 +166,8 @@ pub fn sub_view<'a>(
 
     // 窗口左上角在缓冲区中的字节偏移。用 checked_* 而非裸算术，因为
     // `FramebufferInfo::new` 不限制 width/height，`y * pitch` 在极端输入下会溢出。
-    let off = y.checked_mul(pitch)?.checked_add(x.checked_mul(bpp)?)?;
-    let avail = fb.len().checked_sub(off)?;
+    let offset = y.checked_mul(pitch)?.checked_add(x.checked_mul(bpp)?)?;
+    let avail = fb_len.checked_sub(offset)?;
 
     // 可用完整行数：每行必须占据完整的 `pitch` 字节，含行填充。
     let rows = avail / pitch;
@@ -97,8 +184,12 @@ pub fn sub_view<'a>(
         return None;
     }
 
-    let sub_info = FramebufferInfo::new(sub_w, sub_h, pitch, info.format);
-    Some(Renderer::new(sub_info, &mut fb[off..off + len]))
+    Some(SubViewGeometry {
+        offset,
+        len,
+        width: sub_w,
+        height: sub_h,
+    })
 }
 
 /// Cohen–Sutherland 线段裁剪算法，针对矩形视口。
@@ -271,5 +362,52 @@ pub(crate) fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
             core::ptr::copy_nonoverlapping(base, base.add(filled), copy_len);
         }
         filled += copy_len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sub_view, sub_view_with_back_buffer};
+    use crate::color::PixelFormat;
+    use crate::framebuffer::FramebufferInfo;
+
+    /// 后台缓冲区不足一个窗口的 `pitch × height` 时静默返回 `None`，不 panic。
+    #[test]
+    fn sub_view_with_back_buffer_rejects_short_back_buffer() {
+        let info = FramebufferInfo::new(8, 8, 32, PixelFormat::Rgba8888);
+        let mut fb = [0u8; 256];
+        // 窗口 4 行、pitch 32 → 需要 128 字节后台
+        let mut short = [0u8; 127];
+        assert!(sub_view_with_back_buffer(&mut fb, &mut short, &info, 0, 0, 4, 4).is_none());
+
+        let mut exact = [0u8; 128];
+        assert!(sub_view_with_back_buffer(&mut fb, &mut exact, &info, 0, 0, 4, 4).is_some());
+    }
+
+    /// 两个子视口构造函数必须给出相同的窗口收缩结果，只有缓冲模式不同。
+    #[test]
+    fn sub_view_variants_shrink_identically() {
+        let info = FramebufferInfo::new(8, 8, 32, PixelFormat::Rgba8888);
+        let mut fb = [0u8; 256];
+        let mut back = [0u8; 256];
+
+        // 窗口远超屏幕，两者都应收缩到 8×8。
+        let (w, h, pitch, plain_double) = {
+            let plain = sub_view(&mut fb, &info, 0, 0, 100, 100).expect("窗口可用");
+            (
+                plain.info().width,
+                plain.info().height,
+                plain.info().pitch,
+                plain.is_double_buffered(),
+            )
+        };
+
+        let buffered =
+            sub_view_with_back_buffer(&mut fb, &mut back, &info, 0, 0, 100, 100).expect("窗口可用");
+        assert_eq!(w, buffered.info().width);
+        assert_eq!(h, buffered.info().height);
+        assert_eq!(pitch, buffered.info().pitch);
+        assert!(!plain_double);
+        assert!(buffered.is_double_buffered());
     }
 }
