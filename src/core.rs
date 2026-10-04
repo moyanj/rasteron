@@ -87,6 +87,18 @@ macro_rules! write_rgb_ptr {
     };
 }
 
+/// 圆图元的种类，供 `tests` 与 `diff_probe` 共用。
+///
+/// 显式枚举而非 `bool` 参数，避免调用点出现无法自解释的 `true` / `false`。
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CircleKind {
+    /// 只描边（`draw_circle`）。
+    Outline,
+    /// 实心填充（`fill_circle`）。
+    Filled,
+}
+
 /// 软件光栅化渲染器，操作原始帧缓冲字节切片。
 ///
 /// `Renderer` 将绘制命令（像素、线段、三角形、矩形、圆形）直接写入
@@ -784,7 +796,7 @@ impl<'a> Renderer<'a> {
     /// 使用 Bresenham 算法绘制线段，自动裁剪到帧缓冲边界。
     ///
     /// 先用 Cohen–Sutherland 裁剪（`clip_line`）对整条线段做快速拒绝，再交给
-    /// `draw_line_clipped_internal`。该内部函数会把迭代范围收窄到可见区间，
+    /// `draw_line_internal`。该内部函数会把迭代范围收窄到可见区间，
     /// 因此工作量与**线段总长度无关**，只与可见部分的像素数成正比。
     ///
     /// 收窄不会改变像素覆盖：Bresenham 的递推是确定的，内部函数保留原始端点
@@ -793,20 +805,28 @@ impl<'a> Renderer<'a> {
         if self.info.width == 0 || self.info.height == 0 {
             return;
         }
-        match clip_line(p1, p2, self.info.width, self.info.height) {
-            Some((p1, p2)) => {
-                self.draw_line_internal(p1, p2, color);
-            }
-            None => return,
+        // `clip_line` 只用于快速拒绝，**不可**把它的返回值当作新端点：
+        // `intersect_axis` 用整数除法截断求交点，得到的端点并不在原直线上，
+        // 斜率一旦改变，Bresenham 的像素覆盖就会与原线段不同。
+        // 可见区间的裁剪由 `draw_line_internal` 内部的区间收窄完成。
+        if clip_line(p1, p2, self.info.width, self.info.height).is_none() {
+            return;
         }
+        self.draw_line_internal(p1, p2, color);
     }
 
-    /// Bresenham 线段绘制（内部快速路径）。
+    /// Bresenham 线段绘制（唯一实现，也是 `draw_line` 与
+    /// `draw_line_unchecked` 共享的受限内核）。
     ///
-    /// 预取缓冲区裸指针，内循环直接指针写入，避免逐像素调用
-    /// `write_color_if_visible_i64` 的函数调用与格式匹配开销。
+    /// 预取缓冲区裸指针，内循环直接指针写入，避免逐像素的函数调用与格式匹配开销。
     ///
-    /// 次轴仍在内循环中逐像素检查，故覆盖与未收窄时逐像素相同。
+    /// 迭代区间收窄到 `[x_lo, x_hi]`（主轴可见范围），次轴在循环内单独校验上界。
+    /// 因此工作量与**线段总长度无关**，只与可见部分的像素数成正比——即便端点是
+    /// `usize::MAX` 量级也不会退化成全长步进。
+    ///
+    /// 收窄不改变像素覆盖：Bresenham 的递推是确定的，本函数保留原始端点与完整
+    /// 相位，仅跳过必然越界的迭代。该等价性由
+    /// `draw_line_iteration_narrowing_preserves_coverage` 守护。
     #[inline(always)]
     fn draw_line_internal(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
         // 用饱和转换（而非 `as i64`）把 `usize` 坐标转到 `i64`：`as` 会把
@@ -908,43 +928,25 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// Bresenham 线段算法，**不进行裁剪检查**。
+    /// Bresenham 线段算法，跳过 Cohen–Sutherland 整段拒绝。
     ///
-    /// 仅通过 `write_color_if_visible_i64` 进行逐个像素的边界保护，
-    /// 不会通过 `clip_line` 提前拒绝整条线段。
+    /// 与 [`Self::draw_line`] 的可见性差异仅在于：跳过 `clip_line` 的整段提前
+    /// 拒绝，也跳过 `width == 0 || height == 0` 的前置守卫。二者都是纯粹的
+    /// 快速路径——`clip_line` 的拒绝在迭代区间收窄到可见范围后本就是冗余的，
+    /// 而退化尺寸下 `x_lo > x_hi` 或 `y <= y_hi_bound` 恒为假，同样不会写入。
+    /// 因此像素覆盖与 [`Self::draw_line`] 逐像素一致，由
+    /// `draw_line_unchecked_matches_safe_path` 守护。
+    ///
+    /// 保留 `unsafe` 是为了不破坏既有 API，调用方无需提供任何坐标保证。
     ///
     /// # Safety
     ///
-    /// 调用方必须保证渲染器绑定的帧缓冲有效。
+    /// 本函数当前无附加前置条件：`draw_line_internal` 已把迭代区间收窄到可见范围
+    /// 并逐轴校验坐标，不会越界写。调用方只需保证渲染器自身持有的帧缓冲切片
+    /// 仍然有效（即未经释放或被移出所有权），这与 [`Self::draw_line`] 相同。
     #[inline]
     pub unsafe fn draw_line_unchecked(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
-        let (mut x1, mut y1) = (sat_i64(p1.x), sat_i64(p1.y));
-        let (mut x2, mut y2) = (sat_i64(p2.x), sat_i64(p2.y));
-        let dx_abs = (x2 - x1).unsigned_abs();
-        let dy_abs = (y2 - y1).unsigned_abs();
-        let steep = dy_abs > dx_abs;
-        if steep {
-            core::mem::swap(&mut x1, &mut y1);
-            core::mem::swap(&mut x2, &mut y2);
-        }
-        if x1 > x2 {
-            core::mem::swap(&mut x1, &mut x2);
-            core::mem::swap(&mut y1, &mut y2);
-        }
-        let dx = x2 - x1;
-        let dy = (y2 - y1).unsigned_abs();
-        let mut error = dx / 2;
-        let y_step = if y1 < y2 { 1 } else { -1 };
-        let mut y = y1;
-        for x in x1..=x2 {
-            let (px, py) = if steep { (y, x) } else { (x, y) };
-            self.set_pixel_unchecked(px as usize, py as usize, color);
-            error -= dy as i64;
-            if error < 0 {
-                y += y_step;
-                error += dx;
-            }
-        }
+        self.draw_line_internal(p1, p2, color);
     }
 
     /// 绘制三角形轮廓（由三条线段组成）。
@@ -1066,6 +1068,18 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// 中点圆递推，回调八对称点。`draw_circle` / `fill_circle` 的共享入口。
+    ///
+    /// `radius` 在此钳制到 `width + height`。依据：任意可见像素到圆心的距离不超过
+    /// 画布对角线，而 `sqrt(width² + height²) < width + height`，故半径超过该上界时
+    /// 可见像素的着色结果与恰好等于该上界时完全一致——屏幕外的点由 `visit` 内的
+    /// 边界检查丢弃，不会写入缓冲。钳制把 `while x <= y` 的迭代量从 `O(radius)`
+    /// 压到 `O(width + height)`，避免调用方传入 `usize::MAX` 量级的半径时把渲染
+    /// 线程钉死。
+    ///
+    /// 半径小于上界时钳制无效果，故不影响既有覆盖。两个方向各由一条测试守护：
+    /// `circle_clamps_huge_radius` 抓钳制缺失，`circle_clamp_preserves_radii_within_limit`
+    /// 抓钳制过度。
     #[inline(always)]
     fn walk_circle_points(
         &mut self,
@@ -1073,11 +1087,25 @@ impl<'a> Renderer<'a> {
         radius: usize,
         mut visit: impl FnMut(&mut Self, i64, i64, i64, i64),
     ) {
+        // 递推式 `d = 3 - 2 * radius` 要求 `2 * radius` 不溢出 `i64`。
+        // 真实帧缓冲到不了这个量级（`Renderer::new` 要求 `pitch * height` 字节可用，
+        // 且 `pitch >= width * bytes_per_pixel`），此处显式钳到该上界只为让后续算术
+        // 在任意输入下都不回绕。
+        const MAX_RADIUS: usize = (i64::MAX / 2) as usize;
+
+        let limit = self
+            .info
+            .width
+            .saturating_add(self.info.height)
+            .min(MAX_RADIUS);
+        // 用 `sat_i64` 而非 `as i64`：后者会把超出 `i64::MAX` 的值回绕成负数，
+        // 使 `y` 变负而 `while x <= y` 一次都不进（`usize::MAX` 即如此）。
+        let mut y = sat_i64(radius.min(limit));
+
         let cx = sat_i64(center.x);
         let cy = sat_i64(center.y);
         let mut x = 0i64;
-        let mut y = radius as i64;
-        let mut d = 3 - 2 * radius as i64;
+        let mut d = 3 - 2 * y;
 
         while x <= y {
             visit(self, cx, cy, x, y);
@@ -1094,6 +1122,8 @@ impl<'a> Renderer<'a> {
     /// 使用中点圆算法绘制圆形轮廓。
     ///
     /// 利用八对称性绘制所有对称点，自动忽略超出帧缓冲边界的像素。
+    /// `radius` 被钳制到 `width + height`，迭代量因此与半径无关（详见
+    /// [`Self::walk_circle_points`]）。
     pub fn draw_circle(&mut self, center: Pixel, radius: usize, color: &Color) {
         if radius == 0 {
             return;
@@ -1120,7 +1150,8 @@ impl<'a> Renderer<'a> {
     /// 使用中点圆算法填充圆形区域。
     ///
     /// 利用八对称性生成水平跨度，通过 `fill_visible_horizontal_span` 写入。
-    /// 自动裁剪到帧缓冲边界。
+    /// 自动裁剪到帧缓冲边界。`radius` 被钳制到 `width + height`，迭代量因此
+    /// 与半径无关（详见 [`Self::walk_circle_points`]）。
     pub fn fill_circle(&mut self, center: Pixel, radius: usize, color: Color) {
         if radius == 0 || self.info.width == 0 || self.info.height == 0 {
             return;
@@ -1155,7 +1186,7 @@ impl<'a> Renderer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::Renderer;
+    use super::{CircleKind, Renderer};
     use crate::color::{Color, PixelFormat};
     use crate::framebuffer::FramebufferInfo;
     use crate::pixel::Pixel;
@@ -1285,24 +1316,158 @@ mod tests {
 
     #[test]
     fn draw_line_unchecked_matches_safe_path() {
-        let mut front_safe = [0u8; 48];
-        let mut front_unchecked = [0u8; 48];
-        let mut safe = Renderer::new(
-            FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24),
-            &mut front_safe,
-        );
-        let mut unchecked = Renderer::new(
-            FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24),
-            &mut front_unchecked,
-        );
-        let start = Pixel::new(0, 1);
-        let end = Pixel::new(3, 2);
         let color = Color::new(0x12, 0x34, 0x56);
+        // 覆盖屏内、恰好越界、次轴整体越界与 usize::MAX 量级端点。
+        //
+        // `draw_line_unchecked` 曾同时存在两个缺陷：对 `x1..=x2` 全长步进
+        // （端点为 usize::MAX 时是 DoS），以及不校验次轴就直接写
+        // （`y` 超出屏幕时越界写，实测 SIGSEGV）。两条断言同时守住这两个回归。
+        let cases: [(Pixel, Pixel); 8] = [
+            (Pixel::new(0, 1), Pixel::new(3, 2)),
+            (Pixel::new(0, 0), Pixel::new(usize::MAX, usize::MAX)),
+            (Pixel::new(0, 0), Pixel::new(usize::MAX, 0)),
+            (Pixel::new(0, 0), Pixel::new(0, usize::MAX)),
+            (Pixel::new(usize::MAX, 0), Pixel::new(0, 0)),
+            (Pixel::new(2, 0), Pixel::new(usize::MAX, 1)),
+            (Pixel::new(0, 100), Pixel::new(3, 100)),
+            (Pixel::new(100, 0), Pixel::new(100, usize::MAX)),
+        ];
 
-        safe.draw_line(start, end, &color);
-        unsafe { unchecked.draw_line_unchecked(start, end, &color) };
+        for (start, end) in cases {
+            let mut front_safe = [0u8; 48];
+            let mut front_unchecked = [0u8; 48];
+            let mut safe = Renderer::new(
+                FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24),
+                &mut front_safe,
+            );
+            let mut unchecked = Renderer::new(
+                FramebufferInfo::new(4, 4, 12, PixelFormat::Bgr24),
+                &mut front_unchecked,
+            );
 
-        assert_eq!(safe.buffer_mut(), unchecked.buffer_mut());
+            safe.draw_line(start, end, &color);
+            unsafe { unchecked.draw_line_unchecked(start, end, &color) };
+
+            assert_eq!(
+                safe.buffer(),
+                unchecked.buffer(),
+                "coverage mismatch for {start:?} -> {end:?}"
+            );
+        }
+    }
+
+    /// 圆测试的固定场景：4×4 帧缓冲、圆心 `(1, 2)`。
+    const CIRCLE_W: usize = 4;
+    const CIRCLE_H: usize = 4;
+    const CIRCLE_CX: usize = 1;
+    const CIRCLE_CY: usize = 2;
+    /// `radius` 的钳制上界 `width + height`。此半径的填充恰好覆盖整屏，
+    /// 故填充侧的等价性断言非平凡。
+    const CIRCLE_LIMIT: usize = CIRCLE_W + CIRCLE_H;
+    /// `Bgr24` 每像素字节数。
+    const BGR24_BYTES: usize = 3;
+    /// 固定场景下各半径的填充像素数实测值，作为"钳制不得改变
+    /// `radius <= CIRCLE_LIMIT` 行为"的锚点。
+    ///
+    /// 数值取自 `walk_circle_points` 的实际递推，不是欧氏圆盘：圆心 `(1, 2)`
+    /// 偏离正中，中点圆的边界像素本就与"距离 <= radius"判定不同
+    /// （如 `radius = 2` 时 `(0, 0)` 会被填，而它的欧氏距离是 2.24）。
+    const CIRCLE_FILL_PIXELS: [(usize, usize); 3] = [(1, 5), (2, 15), (3, 16)];
+
+    /// 统计缓冲中被实际着色（存在非零通道）的像素数。
+    fn painted_pixels(fb: &[u8]) -> usize {
+        fb.chunks_exact(BGR24_BYTES)
+            .filter(|pixel| pixel.iter().any(|byte| *byte != 0))
+            .count()
+    }
+
+    /// 在全新缓冲上按固定场景渲染一个圆，返回缓冲副本。
+    ///
+    /// 每次都重新清零并重建 `Renderer`，避免复用残留让相等断言平凡通过。
+    fn render_test_circle(radius: usize, kind: CircleKind) -> Vec<u8> {
+        let color = Color::new(0x12, 0x34, 0x56);
+        let center = Pixel::new(CIRCLE_CX, CIRCLE_CY);
+        let mut front = vec![0u8; CIRCLE_W * CIRCLE_H * BGR24_BYTES];
+        let mut renderer = Renderer::new(
+            FramebufferInfo::new(
+                CIRCLE_W,
+                CIRCLE_H,
+                CIRCLE_W * BGR24_BYTES,
+                PixelFormat::Bgr24,
+            ),
+            &mut front,
+        );
+
+        match kind {
+            CircleKind::Outline => renderer.draw_circle(center, radius, &color),
+            CircleKind::Filled => renderer.fill_circle(center, radius, color),
+        }
+
+        Vec::from(renderer.buffer())
+    }
+
+    #[test]
+    fn circle_clamps_huge_radius() {
+        // 半径超过 `width + height` 后，可见像素的着色结果不再变化。
+        // 本测试同时守住两件事，缺任何一条都失去意义：
+        //   1. 等价性——超大半径与上界半径输出逐字节相同（钳制生效）
+        //   2. 不挂死——未钳制时 `1_000_000_000` 会让 `while x <= y` 迭代约 7 亿次
+        let filled_at_limit = render_test_circle(CIRCLE_LIMIT, CircleKind::Filled);
+
+        // 基准必须非空，否则上面的相等断言两边都是全 0、无论钳制是否存在都通过。
+        assert!(
+            painted_pixels(&filled_at_limit) > 0,
+            "上界半径 {CIRCLE_LIMIT} 的填充未覆盖任何像素，等价性断言会平凡通过"
+        );
+
+        // 顺序有意义：`1_000_000_000` 排在最前，它是唯一会触发 DoS 的输入
+        // （无钳制时本测试会挂死）；`usize::MAX` 另需覆盖 `as i64` 把半径回绕成
+        // 负数、导致一个点都不画的情形。其余项覆盖刚过界与远超界两侧。
+        let radii = [
+            1_000_000_000,
+            usize::MAX,
+            10 * CIRCLE_LIMIT,
+            CIRCLE_LIMIT + 1,
+            64,
+        ];
+
+        for huge in radii {
+            for kind in [CircleKind::Outline, CircleKind::Filled] {
+                let clamped = render_test_circle(CIRCLE_LIMIT, kind);
+                let big = render_test_circle(huge, kind);
+
+                assert_eq!(big, clamped, "{kind:?} differs for r={huge}");
+            }
+        }
+    }
+
+    #[test]
+    fn circle_clamp_preserves_radii_within_limit() {
+        // 守住"钳制不过度"：`radius < width + height` 时钳制必须是恒等映射，
+        // 否则大半径会画出比应得面积更小的图形。
+        //
+        // 只与另一个半径互比守不住这一点（循环论证：钳到 1 时任意两半径都相等），
+        // 故锚定各半径的实测填充像素数。固定场景下 `radius >= 3` 即覆盖整屏，
+        // 因此这三个锚点已覆盖全部可观察差异——钳到 1 或 2 都会改变它们。
+        for (radius, expected_pixels) in CIRCLE_FILL_PIXELS {
+            let filled = render_test_circle(radius, CircleKind::Filled);
+
+            assert_eq!(
+                painted_pixels(&filled),
+                expected_pixels,
+                "半径 {radius} 的填充像素数被钳制改变"
+            );
+        }
+
+        // 上界半径必须覆盖整屏。钳制收得比 `width + height` 更紧会漏掉可见像素，
+        // 直接比对期望字节以同时校验覆盖范围与通道顺序。
+        let expected_fill = [0x56u8, 0x34, 0x12].repeat(CIRCLE_W * CIRCLE_H);
+
+        assert_eq!(
+            render_test_circle(CIRCLE_LIMIT, CircleKind::Filled),
+            expected_fill,
+            "上界半径未覆盖整屏，钳制上界过紧"
+        );
     }
 
     #[test]

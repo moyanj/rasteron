@@ -122,6 +122,7 @@ pub(crate) fn sat_i64(value: usize) -> i64 {
 ///
 /// 负值会被截断为 `0`。用于光栅化坐标转换。
 /// 对于非负值，截断（向零取整）等价于 floor。
+#[cfg(feature = "programmable")]
 #[inline(always)]
 pub(crate) fn floor_to_usize(value: f32) -> usize {
     if value < 0.0 { 0 } else { value as usize }
@@ -132,7 +133,7 @@ pub(crate) fn floor_to_usize(value: f32) -> usize {
 /// 对 4bpp 等能整除 16 的格式，模式固定为 16 字节：按 16 字节块**直接重复写入**，
 /// 而不是"复制已填部分来翻倍"。后者需要 `O(log n)` 次串行 `memcpy`，
 /// 每次的源区域都不同、无法向量化，且总写入量随步数累积；直接块写是
-/// 单一 stready-state 循环，流水线友好。
+/// 单一 steady-state 循环，流水线友好。
 ///
 /// 3bpp 无法整除 16，退回逐次倍增复制。
 #[inline(always)]

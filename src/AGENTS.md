@@ -7,11 +7,11 @@
 | 文件 | 行数 | 职责 | 扩展点 |
 |------|------|------|--------|
 | `lib.rs` | 94 | `#![no_std]`、feature 门控、文档首页 | 无 |
-| `core.rs` | 2077 | `Renderer` 与固定功能图元 | 新增图元 |
+| `core.rs` | 2343 | `Renderer` 与固定功能图元 | 新增图元 |
 | `programmable.rs` | 2145 | 2D 可编程管线 | 实现 `VertexShader` / `FragmentShader` / `Interpolate` |
 | `color.rs` | 977 | `Color`、`PixelFormat`、混合、SWAR 内核 | 新增像素格式 |
 | `simd.rs` | 211 | 分派 memcpy | 扩指令阶梯 |
-| `utils.rs` | 175 | 裁剪、饱和转换、模式填充 | 无（私有） |
+| `utils.rs` | 176 | 裁剪、饱和转换、模式填充 | 无（私有） |
 | `framebuffer.rs` | 80 | 布局描述与不变量断言 | 无 |
 | `pixel.rs` | 49 | 坐标类型与宏 | 无 |
 | `main.rs` | 39 | 演示二进制，非库的一部分 | 无 |
@@ -21,13 +21,13 @@
 自上而下四段，调用方向单向向下，不允许反向回跳：
 
 ```
-宏层      write_rgb{,_blend,_blend_ptr,_ptr}!        core.rs:12-88
+宏层      write_rgb{,_blend,_blend_ptr,_ptr}!        core.rs:15-88
    ↓ 消除 RGB/BGR 字节序分支
-门面      struct Renderer + new/buffer/info          core.rs:113-273
+门面      struct Renderer + new/buffer/info          core.rs:125-285
    ↓ 缓存 fmt_* 四个格式属性
-跨度层    fill_span_opaque / fill_span_alpha         core.rs:447-580
+跨度层    fill_span_opaque / fill_span_alpha         core.rs:459-600
    ↓ 不透明 → 4 字节块直写 / pattern_fill；半透明 → swar 或逐像素
-图元层    clear/line/triangle/rect/circle/blit       core.rs:667-1155
+图元层    clear/line/triangle/rect/circle/blit       core.rs:679-1177
    ↑ 各自负责裁剪，再下沉到跨度层；热路径无边界检查
 ```
 
@@ -35,17 +35,35 @@
 
 | 函数 | 位置 | 作用 |
 |------|------|------|
-| `draw_line_internal` | `core.rs:811` | 迭代区间收窄的 Bresenham。开头的注释承诺"收窄不改变像素覆盖"，该承诺正由两个失败的测试守护 |
-| `interpolate_scan_x` | `core.rs:582` | Bresenham 递推的纯函数形式，便于单测独立验证 |
-| `fill_span_opaque` | `core.rs:447` | 不透明跨度。用 `get_unchecked_mut` 取整行切片后按 4 字节块写，安全性完全依赖调用方已裁剪 |
-| `fill_span_alpha` | `core.rs:491` | 半透明跨度。`bpp == 4 && row.align_offset(4) == 0` 才进 SWAR，否则逐像素。SWAR 路径独立成函数是为避免挤占不透明路径的代码布局 |
-| `fill_visible_horizontal_span` | `core.rs:551` | 自动裁剪到可见区域，裁剪完才下沉到 `fill_span_*` |
-| `build_pattern` | `core.rs:738` | 生成 16 字节填充模式；3bpp 无法整除 16，退回 3 字节单像素模式 |
-| `clear_unchecked` | `core.rs:690` | `clear` 的无检查内核。`pitch == row_len` 时一次 `pattern_fill` 铺满整个 buffer；否则铺满首行后逐行 `memcpy`。`init_len = pattern_len.min(total_bytes)` 这个钳制不可去掉——1×1 的 4bpp 只有 4 字节 |
+| `draw_line_internal` | `core.rs:831` | **唯一的 Bresenham 实现**。迭代区间收窄到 `[x_lo, x_hi]`（主轴可见范围），次轴在循环内校验上界。`draw_line` 与 `draw_line_unchecked` 都委托到这里 |
+| `interpolate_scan_x` | `core.rs:594` | Bresenham 递推的纯函数形式，便于单测独立验证 |
+| `walk_circle_points` | `core.rs:1083` | 中点圆递推。**在此钳制 `radius`**（见下），`draw_circle`/`fill_circle` 的共享入口 |
+| `fill_span_opaque` | `core.rs:459` | 不透明跨度。用 `get_unchecked_mut` 取整行切片后按 4 字节块写，安全性完全依赖调用方已裁剪 |
+| `fill_span_alpha` | `core.rs:503` | 半透明跨度。`bpp == 4 && row.align_offset(4) == 0` 才进 SWAR（判定在 `522`，调用在 `530`），否则逐像素。SWAR 路径独立成函数是为避免挤占不透明路径的代码布局 |
+| `fill_visible_horizontal_span` | `core.rs:563` | 自动裁剪到可见区域，裁剪完才下沉到 `fill_span_*` |
+| `build_pattern` | `core.rs:750` | 生成 16 字节填充模式；3bpp 无法整除 16，退回 3 字节单像素模式 |
+| `clear_unchecked` | `core.rs:702` | `clear` 的无检查内核。`pitch == row_len` 时一次 `pattern_fill` 铺满整个 buffer；否则铺满首行后逐行 `memcpy`。`init_len = pattern_len.min(total_bytes)` 这个钳制不可去掉——1×1 的 4bpp 只有 4 字节 |
 
-`swap_buffers`（`core.rs:1145`）实为 `front_buffer.copy_from_slice(&back_buffer)`——单向 present，不是指针交换，且不重置 `back_buffer`。依赖"交换后后台缓冲为空"的调用方会读到上一帧内容。
+`swap_buffers`（`core.rs:1175`）实为 `front_buffer.copy_from_slice(&back_buffer)`——单向 present，不是指针交换，且不重置 `back_buffer`。依赖"交换后后台缓冲为空"的调用方会读到上一帧内容。
 
 `draw_line_internal` 开头就说明了为何必须用 `sat_i64` 而非 `as i64`：`usize::MAX as i64 == -1` 会把端点折到画布另一侧，覆盖结果完全错误。
+
+### 圆半径的钳制
+
+`walk_circle_points` 把 `radius` 钳到 `width + height`。上界的正确性来自：任意可见像素到圆心的距离不超过画布对角线，而 `sqrt(w² + h²) < w + h`。因此半径超过该上界时，屏幕外不画（由 `visit` 的边界检查丢弃），可见像素的着色结果不变，而迭代量从 `O(radius)` 降到 `O(width + height)`。
+
+`FramebufferInfo::new` 只校验 `pitch`，不限制 `width`/`height`，故加法用 `saturating_add`；又因递推式 `d = 3 - 2 * radius` 要求 `2 * radius` 不溢出 `i64`，另有局部常量 `MAX_RADIUS = i64::MAX / 2` 兜底。半径转 `i64` 必须走 `sat_i64`——`as i64` 会把 `usize::MAX` 回绕成 −1，使 `while x <= y` 一次都不进。
+
+**改此处必须让两条测试同时通过，它们各守一个方向：**
+
+| 测试 | 守护 |
+|------|------|
+| `circle_clamps_huge_radius` | 钳制**缺失**。半径表把 `1_000_000_000` 排在最前：无钳制时 `while x <= y` 迭代约 7 亿次，测试直接挂死 |
+| `circle_clamp_preserves_radii_within_limit` | 钳制**过度**。锚定半径 1/2/3 的实测填充像素数 5/15/16（4×4 屏、圆心 `(1,2)`），并比对全屏期望字节 |
+
+两条都经过变异验证：拆掉 `.min(limit)` 会挂起，改成 `.min(limit).min(2)` 会让第二条报「半径 3 的填充像素数被钳制改变」。
+
+注意 4×4 屏上半径 ≥ 3 即覆盖整屏，所以"钳到 3 以上"的过度收紧在该场景下不可观察——锚点只需覆盖半径 1 与 2。
 
 ### 五条写入路径
 
@@ -53,9 +71,9 @@
 
 | 策略 | 用在哪 | 前提 |
 |------|--------|------|
-| `chunks_exact_mut(4)` / `pattern_fill` | `fill_span_opaque`（定义 `core.rs:447`）、`clear_unchecked`（`core.rs:690`） | 不透明整段覆盖。4bpp 按 4 字节块写；3bpp 退回倍增复制 |
-| `color::swar::blend_span_alpha_4bpp` | `fill_span_alpha`（定义 `core.rs:491`，SWAR 调用 `518`） | **仅 4bpp 且行首 4 字节对齐** |
-| `color::swar::blend_masked_row_4bpp` | `blit_mask`（定义 `core.rs:330`，SWAR 调用 `395`） | 同上，掩码 alpha 逐字节驱动 |
+| `chunks_exact_mut(4)` / `pattern_fill` | `fill_span_opaque`（定义 `core.rs:459`）、`clear_unchecked`（定义 `core.rs:702`） | 不透明整段覆盖。4bpp 按 4 字节块写；3bpp 退回倍增复制 |
+| `color::swar::blend_span_alpha_4bpp` | `fill_span_alpha`（定义 `core.rs:503`，SWAR 调用 `530`） | **仅 4bpp 且行首 4 字节对齐** |
+| `color::swar::blend_masked_row_4bpp` | `blit_mask`（定义 `core.rs:342`，SWAR 调用 `407`） | 同上，掩码 alpha 逐字节驱动 |
 | 逐像素 `write_rgb_blend_ptr!` | 上述两条的回退分支 | 3bpp 或未对齐 |
 | `PixelFormat::write_color` | 不作为热路径 | 标量参考实现，等价性基准 |
 
@@ -84,7 +102,7 @@
 
 ## color.rs
 
-`PixelFormat` 六变体，每个都要同时维护三处语义：`red/green/blue/alpha_shift`（`const fn`）、`bytes_per_pixel`、以及 `core.rs:165-172` 的 `fmt_*` 缓存值。`write_color` / `read_color` 是字节序的唯一权威实现，任何"更快"的写入都要与它们对齐。
+`PixelFormat` 六变体，每个都要同时维护三处语义：`red/green/blue/alpha_shift`（`const fn`）、`bytes_per_pixel`、以及 `core.rs:177-184` 的 `fmt_*` 缓存值。`write_color` / `read_color` 是字节序的唯一权威实现，任何"更快"的写入都要与它们对齐。
 
 `pub(crate) mod swar`（`color.rs:432`）只服务 4bpp；放在这里是因为它要复用 `PixelFormat` 的 shift 与 alpha 语义。
 
@@ -98,21 +116,28 @@
 
 ## utils.rs
 
-`clip_line` 的溢出防护是硬性要求：端点来自 `usize`，经 `sat_i64` 可能取到 `i64::MAX`，与 `t`（最大 `height-1`）相乘会溢出，所以中间运算走 `i128`（`intersect_axis`，`utils.rs:107`）。改动此函数必须保留 `i128`。
+`clip_line` 的溢出防护是硬性要求：端点来自 `usize`，经 `sat_i64` 可能取到 `i64::MAX`，与 `t`（最大 `height-1`）相乘会溢出，所以中间运算走 `i128`（`intersect_axis`，`utils.rs:103`）。改动此函数必须保留 `i128`。
 
-`floor_to_usize` 用 `as usize`（向零取整），对非负值等价于 floor；`programmable.rs` 里坐标转像素索引依赖此语义。
+`floor_to_usize` 用 `as usize`（向零取整），对非负值等价于 floor；`programmable.rs` 里坐标转像素索引依赖此语义。它带 `#[cfg(feature = "programmable")]`——漏掉该 `cfg` 会让 `--no-default-features` 构建报 `dead_code`。
 
 ## 测试分布
 
-单测写在文件内的 `#[cfg(test)] mod tests` 中，共 5 处：
+单测写在文件内的 `#[cfg(test)]` 模块中，共 6 处：
 
 | 位置 | 覆盖对象 |
 |------|----------|
-| `core.rs:1157` | `Renderer` 全部公开方法、`*_unchecked` 等价性、图元裁剪 |
+| `core.rs:1187` | `Renderer` 全部公开方法、`*_unchecked` 等价性、图元裁剪、迭代量上界、圆半径钳制双向 |
+| `core.rs:2242` | `diff_probe` 差分探针，`#[ignore]`，人工比对用（见下） |
 | `color.rs:875` | `Color` 构造/解析/混合、`PixelFormat::write_color`/`read_color` |
-| `color.rs:625` | **内嵌在 `mod swar` 内**，直接测 `blend_word` / `source_word` / `blend_span_alpha_4bpp` / `blend_masked_row_4bpp` |
+| `color.rs:626` | **内嵌在 `mod swar` 内**，直接测 `blend_word` / `source_word` / `blend_span_alpha_4bpp` / `blend_masked_row_4bpp` |
 | `programmable.rs:1535` | 裁剪、插值、viewport/scissor、纹理采样、着色器 |
-| `framebuffer.rs:61` | `buffer_size` 派生与 `pitch` 下限断言 |
+| `framebuffer.rs:62` | `buffer_size` 派生与 `pitch` 下限断言 |
+
+`diff_probe`（`core.rs:2242`）默认 `#[ignore]`，它不是回归断言，而是跨实现比对工具：穷举 4 组尺寸 × 3 个圆心 × 13 个半径 × 2 种图元，把「非背景像素数 + FNV-1a 摘要」写进 `PROBE_OUT`（默认 `diff-probe.txt`）供人工 diff 两次实现的输出。触发方式：`PROBE_OUT=/tmp/a cargo test --lib diff_probe -- --ignored`。
+
+摘要刻意用 FNV-1a 手写实现而非 `DefaultHasher`——后者的摘要不保证跨 Rust 版本稳定，会让比对在工具链升级后静默失效。
+
+该模块需要 `extern crate alloc;` 与 `extern crate std;`：`#![no_std]` 下两者都不在 extern prelude，即使只在 `#[cfg(test)]` 里也必须显式引入。
 
 `utils.rs` / `simd.rs` / `pixel.rs` 无单测——它们的行为通过上述集成路径间接覆盖。`simd.rs` 尤其无测试，因为验证它需要真实向量指令集，只能靠 `cargo bench` 观察。
 
@@ -126,19 +151,23 @@
 | `_rejects_*` / `_does_nothing` | 非法输入被静默拒绝 |
 | `#[should_panic(expected = "...")]` | 构造期不变量，断言 panic 文案 |
 
-穷举型单测的写法值得照抄：`color.rs:625` 的 `SAMPLES: [u8; 11]` 覆盖 0/1/2/63/64/127/128/129/192/254/255——刻意包含**每个位宽的分界点**，因为混合公式的错误几乎全出现在进位边界上。4bpp 测试还把 4 个通道填成互不相同的字节，一次调用同时校验 4 条通道并能暴露"某槽被相邻槽污染"。
+穷举型单测的写法值得照抄：`color.rs:626` 的 `SAMPLES: [u8; 11]` 覆盖 0/1/2/63/64/127/128/129/192/254/255——刻意包含**每个位宽的分界点**，因为混合公式的错误几乎全出现在进位边界上。4bpp 测试还把 4 个通道填成互不相同的字节，一次调用同时校验 4 条通道并能暴露"某槽被相邻槽污染"。
 
 新增优化路径时，前两类单测是准入条件，不是可选项。
 
+**耗时类断言不写时间数**。`no_std` 测试里没有 `Instant`，而旧实现（按 `usize::MAX` 迭代）在 `timeout` 下也跑不完——让测试挂起本身就是失败信号。断言输出等价即可，量级由 `cargo bench` 把关。
+
 ## unsafe 与 SAFETY 注释
 
-`unsafe` 共 71 处，分布在 5 个文件：`core.rs` 36、`simd.rs` 19、`color.rs` 14、`utils.rs` 1、`lib.rs` 1（后者是 `#![allow(unsafe_op_in_unsafe_fn)]` 属性）。
+`unsafe` 共 72 处，分布在 5 个文件：`core.rs` 37、`simd.rs` 19、`color.rs` 14、`utils.rs` 1、`lib.rs` 1（后者是 `#![allow(unsafe_op_in_unsafe_fn)]` 属性）。
 
 两级注释是强约定：
 
-- `pub unsafe fn` 上方写 `/// # Safety` + 「调用方必须保证 ……」，说明**前置条件**。全库共 8 个：`core.rs` 5 个（`set_pixel_unchecked`、`set_pixel_at_unchecked`、`get_pixel_unchecked`、`get_pixel_at_unchecked`、`draw_line_unchecked`）、`color::swar` 2 个（`pub(crate)`）、`simd::memcpy` 1 个。前 7 个均已写全。
-- 块内写 `// SAFETY: <局部推理>`，说明**此处为何安全**。现有 11 处（`core.rs` 3、`color.rs` 8），都紧邻需要论证的裸指针访问，例：`color.rs:534`「调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，故 idx * 4 + 4 <= pixel_count * 4，且每次 u32 访问都对齐」；`core.rs:460`「调用方 fill_visible_horizontal_span 保证 x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，故 start + row_len <= buffer.len()」。
+- `unsafe fn` 上方写 `/// # Safety`，说明**前置条件**。现有 9 处：`core.rs` 7 个（5 个 `pub`——`set_pixel_unchecked`、`set_pixel_at_unchecked`、`get_pixel_unchecked`、`get_pixel_at_unchecked`、`draw_line_unchecked`；加 `pub(crate)` 的 `fill_span_alpha` 与私有的 `clear_unchecked`）、`color::swar` 2 个 `pub(crate)`。**唯一缺失是 `simd::memcpy`（`simd.rs:145`）**。
+- 块内写 `// SAFETY: <局部推理>`，说明**此处为何安全**。现有 11 处：`core.rs` 3 处（`251`/`426`/`472`）、`color.rs` 8 处（`534`/`557`/`602`/`608`/`743`/`763`/`804`/`832`），都紧邻需要论证的裸指针访问。例：`color.rs:534`「调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，故 idx * 4 + 4 <= pixel_count * 4，且每次 u32 访问都对齐」；`core.rs:472`「调用方 fill_visible_horizontal_span 保证 x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，故 start + row_len <= buffer.len()」。
 
 `lib.rs:82` 已开 `unsafe_op_in_unsafe_fn`，因此 `unsafe fn` 体内每处裸指针操作仍需显式 `unsafe {}` 块。新增裸指针代码时，块内 `// SAFETY:` 是硬性要求。
 
-**现存缺口**：`simd::memcpy`（`simd.rs:145`）是唯一的 `pub unsafe fn` 缺 `# Safety` 段；`utils.rs:167` 与 `simd.rs` 内的裸指针块也没有 `// SAFETY:`。补 unsafe 时顺手把这三处补齐。
+`draw_line_unchecked`（`core.rs:948`）是**无附加前置条件**的特例：实现已收窄迭代区间并逐轴校验坐标。它的 `# Safety` 段只声明"帧缓冲切片仍有效"这一与 `draw_line` 相同的前提，不再声称需要调用方提供坐标保证。写这类"保留 `unsafe` 但实际无要求"的函数时，`# Safety` 段必须与正文描述一致，不要一边说"不需要保证"一边列一堆前置条件。
+
+**现存缺口**（`cargo clippy` 的警告全部属于既存问题）。lib 3 条：`simd.rs:145` 缺 `# Safety` 段；`core.rs:220` 的 `as usize` 冗余转换；`programmable.rs:1111` 循环变量只用于索引。examples 只有 2 个问题位置——`shared/bmp.rs:113` 无效位运算、`:157` 手写 `is_multiple_of`——但因 `basic` 与 `programmable` 共用该文件，各报两次。
