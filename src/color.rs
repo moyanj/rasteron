@@ -1,3 +1,5 @@
+use crate::error::ColorParseError;
+
 /// 具有 8 位通道的 RGBA 颜色。
 ///
 /// 大多数绘制方法接受 `&Color`，以便在热路径中做出零成本的混合决策，
@@ -161,15 +163,6 @@ impl Color {
     pub fn invert(&self) -> Color {
         Color::new(!self.r, !self.g, !self.b)
     }
-}
-
-/// 解析十六进制颜色字符串时可能发生的错误。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorParseError {
-    /// 字符串长度不是 6 或 8 个字符（不含 `#`）。
-    InvalidLength,
-    /// 包含无效的十六进制字符。
-    InvalidDigit,
 }
 
 /// 像素格式描述，定义了内存中通道的布局和字节对齐。
@@ -962,7 +955,8 @@ pub(crate) mod swar {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, ColorParseError, PixelFormat};
+    use super::{Color, PixelFormat};
+    use crate::error::ColorParseError;
 
     #[test]
     fn from_hex_parses_rgb_and_defaults_alpha_to_opaque() {

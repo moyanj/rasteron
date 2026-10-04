@@ -1,6 +1,8 @@
 use crate::Pixel;
 use crate::core::Renderer;
 use crate::framebuffer::FramebufferInfo;
+#[cfg(feature = "programmable")]
+use crate::programmable::{Vec2, Viewport};
 #[cfg(feature = "simd")]
 use crate::simd;
 
@@ -272,4 +274,13 @@ pub(crate) fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
         }
         filled += copy_len;
     }
+}
+
+#[cfg(feature = "programmable")]
+pub fn normalized_to_screen(position: Vec2, viewport: Viewport) -> Vec2 {
+    let vx = viewport.x as f32;
+    let vy = viewport.y as f32;
+    let vw = viewport.width.max(1) as f32;
+    let vh = viewport.height.max(1) as f32;
+    [vx + position[0] * (vw - 1.0), vy + position[1] * (vh - 1.0)]
 }

@@ -103,6 +103,7 @@
 pub mod angle;
 pub mod color;
 pub mod core;
+pub mod error;
 pub mod framebuffer;
 pub mod pixel;
 #[cfg(feature = "programmable")]
