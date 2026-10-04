@@ -98,7 +98,7 @@ fn main() {
         &BLACK,
     );
     // 门（圆角矩形）
-    renderer.fill_rounded_rect(Pixel::new(100, 270), 40, 50, 6, Color::new(139, 69, 19));
+    renderer.fill_rect(Pixel::new(100, 270), 40, 50, Color::new(139, 69, 19));
     renderer.draw_rect(Pixel::new(100, 270), 40, 50, &BLACK);
     // 窗户（矩形轮廓）
     renderer.draw_rect(Pixel::new(70, 240), 24, 24, &BLACK);
