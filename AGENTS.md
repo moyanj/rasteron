@@ -6,9 +6,9 @@
 
 ## 概述
 
-`no_std` 软件光栅化库。在原始帧缓冲字节切片上直接绘制像素、线段、三角形、矩形、圆形，
-可选双缓冲与 Alpha 混合。开启 `programmable` 后额外提供一条显式参数式的 2D 可编程管线
-（顶点/片元着色器、varying 插值、viewport/scissor、纹理采样）。
+`no_std` 软件光栅化库。在原始帧缓冲字节切片上直接绘制像素、线段、三角形、矩形、圆形、
+圆弧与扇形，可选双缓冲与 Alpha 混合。开启 `programmable` 后额外提供一条显式参数式的 2D
+可编程管线（顶点/片元着色器、varying 插值、viewport/scissor、纹理采样）。
 
 Rust edition 2024，MSRV 1.79。**零运行时依赖**，唯一 dev-dependency 是 criterion。
 
@@ -19,6 +19,7 @@ rasteron/
 ├── src/                 # 库本体，唯一实现目录（详见 src/AGENTS.md）
 │   ├── lib.rs           # #![no_std] 门面 + feature 声明 + 顶部文档
 │   ├── core.rs          # Renderer，固定功能管线与光栅化热路径
+│   ├── angle.rs         # 定点角度 Angle / 楔形 Wedge，圆弧扇形的几何内核
 │   ├── programmable.rs  # 可编程管线（着色器/插值/裁剪/纹理）
 │   ├── color.rs         # Color / PixelFormat / SWAR 混合内核
 │   ├── framebuffer.rs   # FramebufferInfo 布局描述
@@ -59,7 +60,10 @@ rasteron/
 | `Renderer::blit` | fn | `core.rs:287` | 区域拷贝，格式不一致时静默返回 |
 | `Renderer::blit_mask` | fn | `core.rs:342` | 8bpp 掩码绘制，抗锯齿路径 |
 | `Renderer::draw_circle` / `fill_circle` | fn | `core.rs:1126,1154` | 半径在 `walk_circle_points`（`core.rs:1083`）内钳制 |
+| `Renderer::draw_arc` / `fill_arc` | fn | `core.rs:1173,1237` | 圆弧 / 扇形。复用 `walk_circle_points`，回调内用 `Wedge` 筛角度 |
 | `Renderer::swap_buffers` | fn | `core.rs:1175` | 仅 `double_buffer`。实为 back→front 单向拷贝，非指针交换 |
+| `Angle` | struct | `angle.rs` | 定点角度，整圈 `2^32` 圈值，加减自动环绕 |
+| `Wedge` | struct | `angle.rs` | 起止角区间，构造时预算单位向量，判定只做叉积 |
 | `PixelFormat` | enum | `color.rs:186` | 6 种格式，shift/bpp 均 `const fn` |
 | `PixelFormat::write_color` | fn | `color.rs:288` | **标量参考实现**，所有优化路径的等价性基准 |
 | `color::swar` | mod | `color.rs:432` | SWAR 批量混合内核（`pub(crate)`） |
@@ -114,6 +118,9 @@ rasteron/
 - **不要把 `radius` 直接喂给迭代次数**。`walk_circle_points`（`core.rs:1083`）已把半径钳到 `width + height`——任意可见像素到圆心的距离都小于 `sqrt(w² + h²) < w + h`，故该钳制不改变任何可见像素的着色结果，屏幕外的点由 `visit` 的边界检查丢弃。加法须用 `saturating_add`（`FramebufferInfo::new` 不限制 `width`/`height`），转换须用 `sat_i64`（`as i64` 会把 `usize::MAX` 回绕成负半径而一个点都不画）。
   改动此处必须让两条测试同时通过，它们各守一个方向：`circle_clamps_huge_radius` 抓**钳制缺失**（半径表把 `1_000_000_000` 排在最前，无钳制时测试直接挂死），`circle_clamp_preserves_radii_within_limit` 抓**钳制过度**（锚定半径 1/2/3 的实测填充像素数 5/15/16）。
 - 不要在 `draw_line` 的迭代收窄中改动 Bresenham 相位或丢弃原始端点，否则像素覆盖会变（`draw_line_iteration_narrowing_preserves_coverage` 守护）。
+- **不要把大跨度楔形写成「补集」**。`span > 180°` 时直接取小楔形的补，会把恰好落在起点射线上的像素误排除（该点位于缺口楔形的边界）。正确写法是从中点拆成两个 `< 180°` 的小楔形再取**并集**——`Wedge::contains` 就是这么做的，`angle.rs::wedge_major_arc_includes_start_ray` 守护。
+- **不要在 `fill_arc` 里照抄 `fill_circle` 的四条对称跨度**。中点圆的八对称在 `x == y` 的对角位置会让多条跨度覆盖同一像素；对不透明色重复写无害，**半透明色重复混合会逐次加深**（实测 alpha=128 叠两次得到 191 而非 128）。`fill_arc` 因此先把 `(行, 半宽)` 归并去重再写，`fill_arc_alpha_blends_into_background` 守护。
+- 不要去掉 `Wedge` 叉积判定里的容差项。定点三角在"像素恰好落在边界射线上"（如轴向像素 `(1,0)`）会有舍入抖动，无容差会把边界像素随机判到界外；容差按操作数同阶缩放，`wedge_tolerance_does_not_widen_arc` 守护它没有取得过宽。
 - 不要引入 OpenGL 风格 clip space `[-1,1]`。`programmable` 全程用 normalized `[0,1]`。
 - 不要把 SWAR 内核从 `color::swar` 挪走——它与 `PixelFormat` 的字节序/alpha 语义强耦合。
 - 不要用 `alloc::vec![None; n]` 之外的可变状态缓存顶点着色结果，`draw_indexed` 依赖它免去重复着色。
@@ -122,8 +129,8 @@ rasteron/
 
 ```bash
 cargo build                          # 默认三特性全开
-cargo test --lib                     # 78 个单测（core 44 / color 16 / programmable 16 / framebuffer 2），1 个 ignored
-cargo test                           # lib 78 + doctest 7（1 个 ignored）
+cargo test --lib                     # 106 个单测（angle 17 / core 55 / color 16 / programmable 16 / framebuffer 2），1 个 ignored
+cargo test                           # lib 106 + doctest 15（1 个 ignored）
 cargo bench                          # criterion，harness = false
 cargo run --example basic            # → basic-example.bmp
 cargo run --example programmable --features programmable   # → programmable-example.bmp
@@ -139,7 +146,7 @@ cargo build --no-default-features --features programmable
 
 ## 已知缺口
 
-`cargo test` 全绿（lib 78 + doctest 7）。2 个 `ignored`：一在 `lib.rs:40` 的 ` ```ignore ` 示例，一在 `core.rs:2242` 的 `diff_probe` 差分探针。
+`cargo test` 全绿（lib 106 + doctest 15）。2 个 `ignored`：一在 `lib.rs` 的 ` ```ignore ` 示例，一在 `core.rs` 的 `diff_probe` 差分探针。
 以下为已知但未修的项：
 
 - `simd::memcpy`（`simd.rs:145`）是全库唯一缺 `/// # Safety` 段的 `pub unsafe fn`（`cargo clippy` 会报 `missing_safety_doc`）；`utils.rs:168` 与 `simd.rs` 内的裸指针块也没有 `// SAFETY:` 注释。

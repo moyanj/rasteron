@@ -6,8 +6,9 @@
 
 | 文件 | 行数 | 职责 | 扩展点 |
 |------|------|------|--------|
-| `lib.rs` | 94 | `#![no_std]`、feature 门控、文档首页 | 无 |
-| `core.rs` | 2343 | `Renderer` 与固定功能图元 | 新增图元 |
+| `lib.rs` | 111 | `#![no_std]`、feature 门控、文档首页 | 无 |
+| `core.rs` | 2835 | `Renderer` 与固定功能图元 | 新增图元 |
+| `angle.rs` | 642 | 定点 `Angle` + 楔形 `Wedge` | 改角度精度 / 三角实现 |
 | `programmable.rs` | 2145 | 2D 可编程管线 | 实现 `VertexShader` / `FragmentShader` / `Interpolate` |
 | `color.rs` | 977 | `Color`、`PixelFormat`、混合、SWAR 内核 | 新增像素格式 |
 | `simd.rs` | 211 | 分派 memcpy | 扩指令阶梯 |
@@ -27,7 +28,7 @@
    ↓ 缓存 fmt_* 四个格式属性
 跨度层    fill_span_opaque / fill_span_alpha         core.rs:459-600
    ↓ 不透明 → 4 字节块直写 / pattern_fill；半透明 → swar 或逐像素
-图元层    clear/line/triangle/rect/circle/blit       core.rs:679-1177
+图元层    clear/line/triangle/rect/circle/arc/blit  core.rs:679-1320
    ↑ 各自负责裁剪，再下沉到跨度层；热路径无边界检查
 ```
 
@@ -81,6 +82,41 @@
 
 任何优化档的改动都必须跑 `color.rs` 里的穷举单测（`blend_*_matches_*_reference` 系列）。
 
+## angle.rs 定点角度
+
+`Angle` 是圈值（整圈 `2^32` 圈值）的 `u32` 新类型，加减用 `wrapping_*` 自动环绕，
+不做任何取模分支——`>> 30` 直接得象限号，三角函数的四象限折叠由此而来。
+
+选「圈值」而非「度 × 系数」是为了让加减天然环绕；选 `u32` 而非 `u16` 是因为一圈
+`2^32` 个刻度（约 8.4e-8 度）远细于像素级判定所需精度。
+
+`SIN_TABLE`（257 项 `i16`）是脚本生成的字面量，**不是 `const fn` 算出来的**——
+MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本生成，不要手改数值。
+实测最大误差 1.54 LSB（`SIN_SCALE = 32767`），折算成半径 `r` 处约 `0.0001 × r` 像素；
+`sin(0°/90°/180°/270°)` 为精确值。
+
+`from_degrees` 必须**先对 360 取模再乘**。不取模时 `deg = 360` 会算出 `2^32`，
+`as u32` 回绕成 0 而 `deg = 361` 变成 104——正是 doctest 断言 `from_degrees(720) == ZERO`
+要防的情形。同理 `from_millidegrees` 对 360_000 取模。
+
+`Wedge` 在构造时预算 start/end/mid 三条射线，使 `contains` 每次判定只做 2 次叉积，
+无除法、无三角运算。判定分两种路径：
+
+| 跨度 | 写法 | 守护 |
+|------|------|------|
+| `<= 180°` | `cross(start,p) >= 0 && cross(p,end) >= 0` | — |
+| `> 180°` | 拆成 `start..mid` 与 `mid..end` 两个小楔形**取并集** | `wedge_major_arc_includes_start_ray` |
+
+大跨度**不能取补集**：恰好落在起点射线上的点位于缺口楔形边界，取补会被误排除。
+这正是该测试存在的理由。
+
+叉积带与操作数同阶的容差（`|a|_1 × |p|_inf / 2^15`），用于吸收定点三角的舍入抖动——
+无容差时轴向像素 `(1,0)` 会被随机判到界外。`wedge_tolerance_does_not_widen_arc`
+守护容差没有取得过宽（边界外 1° 的方向不得被误收）。
+
+圆心（零向量）在 `Wedge::contains` 中恒判为**在区间内**——它是任何扇形的一部分。
+`fill_arc` 与 `draw_arc` 都靠这一条保证圆心像素不被漏掉。
+
 ## programmable.rs 管线
 
 四阶段顺序固定，坐标空间每阶段都不同：
@@ -122,12 +158,13 @@
 
 ## 测试分布
 
-单测写在文件内的 `#[cfg(test)]` 模块中，共 6 处：
+单测写在文件内的 `#[cfg(test)]` 模块中，共 7 处：
 
 | 位置 | 覆盖对象 |
 |------|----------|
-| `core.rs:1187` | `Renderer` 全部公开方法、`*_unchecked` 等价性、图元裁剪、迭代量上界、圆半径钳制双向 |
+| `core.rs:1187` | `Renderer` 全部公开方法、`*_unchecked` 等价性、图元裁剪、迭代量上界、圆半径钳制双向、圆弧/扇形 |
 | `core.rs:2242` | `diff_probe` 差分探针，`#[ignore]`，人工比对用（见下） |
+| `angle.rs:404` | `Angle` 定点三角（基准角精确、单位恒等式、往返）、`Wedge` 楔形判定（含大跨度与容差） |
 | `color.rs:875` | `Color` 构造/解析/混合、`PixelFormat::write_color`/`read_color` |
 | `color.rs:626` | **内嵌在 `mod swar` 内**，直接测 `blend_word` / `source_word` / `blend_span_alpha_4bpp` / `blend_masked_row_4bpp` |
 | `programmable.rs:1535` | 裁剪、插值、viewport/scissor、纹理采样、着色器 |

@@ -3,8 +3,11 @@
 //! # 概述
 //!
 //! rasteron 提供了轻量级的 [`Renderer`]，支持在原始帧缓冲字节切片上直接绘制
-//! 像素、线段、三角形、矩形和圆形。支持多种像素格式、可选的双缓冲、Alpha 混合
-//! 以及 Cohen–Sutherland 线段裁剪。
+//! 像素、线段、三角形、矩形、圆形、圆弧与扇形。支持多种像素格式、可选的双缓冲、
+//! Alpha 混合以及 Cohen–Sutherland 线段裁剪。
+//!
+//! 圆弧与扇形由定点角度类型 [`Angle`] 驱动（整圈 `2^32` 圈值 + 四分之一波表），
+//! 因此即使关闭 `programmable` feature 也能使用，不引入浮点运算。
 //!
 //! 开启 `programmable` feature 后，还会额外暴露一条显式参数式的 2D 可编程管线：
 //! 顶点缓冲、索引缓冲、顶点着色器、varying 插值、片元着色器、viewport、scissor
@@ -34,6 +37,22 @@
 //!   `kernel_fpu_begin/end`（或 `kernel_neon_begin/end`）使用。
 //! * **缓冲区大小**：[`Renderer::new`] 要求传入的切片不小于 `pitch × height`，
 //!   否则恐慌（详见该函数文档）。
+//!
+//! # 固定功能图元
+//!
+//! | 方法 | 形态 |
+//! |------|------|
+//! | [`Renderer::set_pixel`] / `set_pixel_at` | 单像素 |
+//! | [`Renderer::draw_line`] / `draw_line_unchecked` | 线段 |
+//! | [`Renderer::draw_rect`] / `fill_rect` | 矩形 |
+//! | [`Renderer::draw_triangle`] / `fill_triangle` | 三角形 |
+//! | [`Renderer::draw_circle`] / `fill_circle` | 圆形 |
+//! | [`Renderer::draw_arc`] / `fill_arc` | 圆弧 / 扇形（角度用 [`Angle`]） |
+//!
+//! # 坐标约定
+//!
+//! **Y 轴向下**，`(0,0)` 在帧缓冲左上角。角度沿屏幕坐标增大：`0°` 指向右、
+//! `90°` 指向下。详见 [`angle`] 模块文档。
 //!
 //! # 可编程管线示例
 //!
@@ -81,6 +100,7 @@
 #![no_std]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+pub mod angle;
 pub mod color;
 pub mod core;
 pub mod framebuffer;
@@ -90,5 +110,6 @@ pub mod programmable;
 #[cfg(feature = "simd")]
 pub mod simd;
 pub mod utils;
+pub use angle::Angle;
 pub use core::Renderer;
 pub use pixel::Pixel;

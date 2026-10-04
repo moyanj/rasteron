@@ -6,6 +6,7 @@
 //!   cargo run --example basic
 
 use rasteron::Renderer;
+use rasteron::angle::Angle;
 use rasteron::color::{BLACK, BLUE, Color, GRAY, GREEN, PixelFormat, RED, WHITE, YELLOW};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::pixel::Pixel;
@@ -39,6 +40,36 @@ fn main() {
         let ey = (80.0 + rad.sin() * r) as usize;
         renderer.draw_line(Pixel::new(520, 80), Pixel::new(ex, ey), &YELLOW);
     }
+
+    // ── 圆弧与扇形（定点角度，无浮点） ──
+    // 彩虹扇形：从 180°（左）扫掠 180° 到 0°（右），覆盖上半圈。
+    let hub = Pixel::new(520, 300);
+    let bands = [(90, RED), (70, YELLOW), (50, GREEN), (30, BLUE)];
+    for (r, color) in bands {
+        renderer.draw_arc(hub, r, Angle::DOWN_LEFT, Angle::ZERO, &color);
+    }
+    // 三个示例扇形，展示不同跨度（含跨界与大跨度）
+    renderer.fill_arc(
+        Pixel::new(160, 400),
+        60,
+        Angle::ZERO,
+        Angle::from_degrees(120),
+        Color::with_alpha(255, 255, 255, 90),
+    );
+    renderer.fill_arc(
+        Pixel::new(320, 400),
+        60,
+        Angle::from_degrees(350),
+        Angle::from_degrees(10),
+        Color::with_alpha(0, 255, 255, 110),
+    );
+    renderer.fill_arc(
+        Pixel::new(480, 400),
+        60,
+        Angle::ZERO,
+        Angle::from_degrees(270),
+        Color::with_alpha(255, 0, 255, 70),
+    );
 
     // ── 远山（填充三角形） ──
     renderer.fill_triangle(

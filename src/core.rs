@@ -1,3 +1,4 @@
+use crate::angle::{Angle, Wedge};
 use crate::color::Color;
 use crate::framebuffer::{FramebufferInfo, PixelFormat};
 use crate::pixel::Pixel;
@@ -1169,6 +1170,178 @@ impl<'a> Renderer<'a> {
         });
     }
 
+    /// 绘制圆弧轮廓：从 `start_angle` 沿角度增大方向扫掠到 `end_angle`。
+    ///
+    /// 复用 `walk_circle_points` 的中点圆递推，只在回调内用
+    /// [`Wedge`] 筛掉区间外的对称点，因此半径钳制与迭代量上界与
+    /// [`Self::draw_circle`] 完全一致。
+    ///
+    /// # 角度约定
+    ///
+    /// 角度沿屏幕坐标增大（Y 轴向下）：`0°` 指向右、`90°` 指向下。
+    /// 区间含两端；`start_angle == end_angle` 表示**整圈**。
+    /// 圆弧跨过 `0°` 时直接用更小的终止角即可，例如 `350°→10°`。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use rasteron::{Angle, Pixel, Renderer};
+    /// # use rasteron::color::Color;
+    /// # use rasteron::framebuffer::{FramebufferInfo, PixelFormat};
+    /// let info = FramebufferInfo::new(16, 16, 16 * 4, PixelFormat::Rgba8888);
+    /// let mut fb = vec![0u8; info.buffer_size()];
+    /// let mut renderer = Renderer::new(info, &mut fb);
+    /// // 屏幕右下象限的四分之一圆弧
+    /// renderer.draw_arc(
+    ///     Pixel::new(8, 8),
+    ///     6,
+    ///     Angle::ZERO,
+    ///     Angle::RIGHT_DOWN,
+    ///     &Color::new(255, 0, 0),
+    /// );
+    /// ```
+    pub fn draw_arc(
+        &mut self,
+        center: Pixel,
+        radius: usize,
+        start_angle: Angle,
+        end_angle: Angle,
+        color: &Color,
+    ) {
+        if radius == 0 {
+            return;
+        }
+        // 整圈时无需逐点判定楔形，直接走整圆轮廓路径。
+        let wedge = Wedge::new(start_angle, end_angle);
+        if wedge.is_full() {
+            self.draw_circle(center, radius, color);
+            return;
+        }
+
+        self.walk_circle_points(center, radius, |renderer, cx, cy, x, y| {
+            for (px, py) in [
+                (cx + x, cy + y),
+                (cx + x, cy - y),
+                (cx - x, cy + y),
+                (cx - x, cy - y),
+                (cx + y, cy + x),
+                (cx + y, cy - x),
+                (cx - y, cy + x),
+                (cx - y, cy - x),
+            ] {
+                // 判定用相对圆心的偏移，负坐标同样有效（纯代数，无边界依赖）。
+                if wedge.contains(px - cx, py - cy) && px >= 0 && py >= 0 {
+                    renderer.set_pixel(px as usize, py as usize, color);
+                }
+            }
+        });
+    }
+
+    /// 填充扇形：从 `center` 出发，介于 `start_angle` 与 `end_angle` 之间的
+    /// 圆盘区域。
+    ///
+    /// 对每一扫描行先求出圆在该行的水平跨度，再逐像素做楔形判定。
+    /// 迭代量取决于 `radius`（已被钳制为 `O(width + height)`）与跨度宽度，
+    /// 不取决于角度。
+    ///
+    /// # 角度约定
+    ///
+    /// 与 [`Self::draw_arc`] 相同：含两端，`start == end` 表示整圈。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use rasteron::{Angle, Pixel, Renderer};
+    /// # use rasteron::color::Color;
+    /// # use rasteron::framebuffer::{FramebufferInfo, PixelFormat};
+    /// let info = FramebufferInfo::new(16, 16, 16 * 4, PixelFormat::Rgba8888);
+    /// let mut fb = vec![0u8; info.buffer_size()];
+    /// let mut renderer = Renderer::new(info, &mut fb);
+    /// // 屏幕右下方向的 90° 扇形
+    /// renderer.fill_arc(
+    ///     Pixel::new(8, 8),
+    ///     6,
+    ///     Angle::ZERO,
+    ///     Angle::RIGHT_DOWN,
+    ///     Color::new(0, 255, 0),
+    /// );
+    /// ```
+    pub fn fill_arc(
+        &mut self,
+        center: Pixel,
+        radius: usize,
+        start_angle: Angle,
+        end_angle: Angle,
+        color: Color,
+    ) {
+        if radius == 0 || self.info.width == 0 || self.info.height == 0 {
+            return;
+        }
+        // 完全透明无需写入（与 fill_circle 一致，提前返回避免无谓迭代）。
+        if color.a == 0 {
+            return;
+        }
+
+        let wedge = Wedge::new(start_angle, end_angle);
+        // 整圈时退化为 fill_circle，直接走跨度快路径。
+        if wedge.is_full() {
+            self.fill_circle(center, radius, color);
+            return;
+        }
+
+        let cx = sat_i64(center.x);
+        let cy = sat_i64(center.y);
+        // 中点圆递推给出每个扫描行的半宽，据此逐行填充。
+        //
+        // 这里按「行」而非按八对称点驱动：中点圆的八对称在 `x == y` 的对角
+        // 位置会让多条跨度覆盖同一像素（`fill_circle` 对不透明色重复写无害，
+        // 但**半透明色重复混合会逐次加深**，实测 alpha=128 叠两次得到 191 而
+        // 非 128）。故此处每行只写一次。
+        let width = self.info.width as i64;
+        let height = self.info.height as i64;
+
+        self.walk_circle_points(center, radius, |renderer, _cx, _cy, x, y| {
+            // 四条对称跨度先归并成 `(行, 半宽)`，同一行只保留最大半宽，
+            // 避免重复写入同一像素。
+            let mut rows: [(i64, i64); 4] = [(cy, -1); 4];
+            let mut n = 0usize;
+            for (py, half) in [(cy + y, x), (cy - y, x), (cy + x, y), (cy - x, y)] {
+                let mut merged = false;
+                for entry in rows.iter_mut().take(n) {
+                    if entry.0 == py {
+                        if half > entry.1 {
+                            entry.1 = half;
+                        }
+                        merged = true;
+                        break;
+                    }
+                }
+                if !merged {
+                    rows[n] = (py, half);
+                    n += 1;
+                }
+            }
+
+            for (py, half) in rows.iter().take(n) {
+                let (py, half) = (*py, *half);
+                if py < 0 || py >= height || half < 0 {
+                    continue;
+                }
+                // 该行的水平范围裁到帧缓冲，迭代量因此受 width 约束。
+                let lo = (cx - half).max(0);
+                let hi = (cx + half).min(width - 1);
+                let row_off = py - cy;
+                let mut px = lo;
+                while px <= hi {
+                    if wedge.contains(px - cx, row_off) {
+                        renderer.set_pixel(px as usize, py as usize, &color);
+                    }
+                    px += 1;
+                }
+            }
+        });
+    }
+
     /// 如果启用双缓冲，将后台缓冲区交换到前台（即刷新到显存）。
     ///
     /// 只拷贝每行可见的 `width × bytes_per_pixel` 字节：行间填充不属于可见像素，
@@ -1212,6 +1385,7 @@ impl<'a> Renderer<'a> {
 #[cfg(test)]
 mod tests {
     use super::{CircleKind, Renderer};
+    use crate::angle::Angle;
     use crate::color::{Color, PixelFormat};
     use crate::framebuffer::FramebufferInfo;
     use crate::pixel::Pixel;
@@ -1678,6 +1852,425 @@ mod tests {
         assert_eq!(renderer.get_pixel(1, 3), Some(color));
         assert_eq!(renderer.get_pixel(5, 3), Some(color));
         assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0, 0, 0)));
+    }
+
+    // ── draw_arc / fill_arc ──
+
+    /// 圆弧与扇形测试用的统一场景：一个远离原点的圆心，避免四边裁剪干扰。
+    const ARC_CX: usize = 10;
+    const ARC_CY: usize = 10;
+    const ARC_R: usize = 6;
+
+    /// 在 ARC 场景的缓冲上执行一次绘制，返回缓冲副本。
+    ///
+    /// `op` 拿到的是 `&mut Renderer`，因为单缓冲下的绘制直接写 front。
+    fn render_arc<F: FnOnce(&mut Renderer)>(op: F) -> Vec<u8> {
+        let (w, h) = (21, 21);
+        let mut front = vec![0u8; w * h * BGR24_BYTES];
+        let mut renderer = Renderer::new(
+            FramebufferInfo::new(w, h, w * BGR24_BYTES, PixelFormat::Bgr24),
+            &mut front,
+        );
+        op(&mut renderer);
+        Vec::from(renderer.buffer())
+    }
+
+    /// 统计缓冲中被实际着色（非零通道）的像素坐标集合。
+    fn painted_set(fb: &[u8], w: usize, h: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * BGR24_BYTES;
+                if fb[i..i + BGR24_BYTES].iter().any(|b| *b != 0) {
+                    out.push((x, y));
+                }
+            }
+        }
+        out
+    }
+
+    /// 90° 扇形（0°→90°，屏幕右下象限）只填右下象限，其余三象限保持空白。
+    #[test]
+    fn fill_arc_quarter_covers_only_target_screen_quadrant() {
+        let fb = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                Color::new(0x12, 0x34, 0x56),
+            );
+        });
+        let painted = painted_set(&fb, 21, 21);
+        assert!(!painted.is_empty(), "扇形未覆盖任何像素");
+
+        let (cx, cy) = (ARC_CX as i64, ARC_CY as i64);
+        for (x, y) in &painted {
+            let dx = *x as i64 - cx;
+            let dy = *y as i64 - cy;
+            // 右下闭象限：dx >= 0 且 dy >= 0
+            assert!(
+                dx >= 0 && dy >= 0,
+                "像素 ({x},{y}) 落在楔形外，相对圆心偏移 ({dx},{dy})"
+            );
+        }
+        // 圆心本身必须被填充
+        assert!(painted.contains(&(ARC_CX, ARC_CY)), "扇形未包含圆心");
+    }
+
+    /// 半圆扇形（0°→180°）恰好填满下半屏：圆心所在行及其下方有像素，
+    /// 圆心上方必须一个都没有。
+    #[test]
+    fn fill_arc_semicircle_fills_exactly_lower_half() {
+        let fb = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Angle::ZERO,
+                Angle::DOWN_LEFT,
+                Color::new(0x12, 0x34, 0x56),
+            );
+        });
+        let painted = painted_set(&fb, 21, 21);
+        assert!(!painted.is_empty());
+
+        for (x, y) in &painted {
+            assert!(
+                *y >= ARC_CY,
+                "像素 ({x},{y}) 在半圆扇形上方（圆心行 = {ARC_CY}）"
+            );
+        }
+        // 圆心行上左右两侧都应被覆盖（0° 与 180° 两条边界射线）
+        assert!(
+            painted.contains(&(ARC_CX + ARC_R, ARC_CY)),
+            "未覆盖 0° 边界"
+        );
+        assert!(
+            painted.contains(&(ARC_CX - ARC_R, ARC_CY)),
+            "未覆盖 180° 边界"
+        );
+        // 圆心正下方（90°）在扇形内
+        assert!(
+            painted.contains(&(ARC_CX, ARC_CY + ARC_R)),
+            "未覆盖 90° 方向"
+        );
+    }
+
+    /// 大跨度扇形（0°→270°）必须填满除右上象限以外的全部区域。
+    ///
+    /// 这条守护"大跨度取补集"的错误实现：补集写法会漏掉起点射线附近
+    /// 的像素，以及缺口边界上的整条射线。
+    #[test]
+    fn fill_arc_major_sweep_excludes_only_the_gap() {
+        let fb = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Angle::ZERO,
+                Angle::LEFT_UP,
+                Color::new(0x12, 0x34, 0x56),
+            );
+        });
+        let painted = painted_set(&fb, 21, 21);
+        assert!(!painted.is_empty());
+
+        let (cx, cy) = (ARC_CX as i64, ARC_CY as i64);
+        for (x, y) in &painted {
+            let dx = *x as i64 - cx;
+            let dy = *y as i64 - cy;
+            // 缺口是 270°..360°，即右上（dx > 0 且 dy < 0）
+            let in_gap = dx > 0 && dy < 0;
+            assert!(!in_gap, "像素 ({x},{y}) 落在缺口象限内");
+        }
+        // 三个保留象限都应有像素（此处用 usize 常量直接比较坐标）
+        assert!(
+            painted.iter().any(|(x, y)| *x >= ARC_CX && *y >= ARC_CY),
+            "右下象限应有像素"
+        );
+        assert!(
+            painted.iter().any(|(x, y)| *x <= ARC_CX && *y >= ARC_CY),
+            "左下象限应有像素"
+        );
+        assert!(
+            painted.iter().any(|(x, y)| *x <= ARC_CX && *y <= ARC_CY),
+            "左上象限应有像素"
+        );
+    }
+
+    /// `start == end` 的圆弧与扇形必须与整圆逐字节相同。
+    #[test]
+    fn arc_full_sweep_matches_draw_and_fill_circle() {
+        let a = Angle::from_degrees(45);
+        let outlined = render_arc(|r| {
+            r.draw_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                a,
+                a,
+                &Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        let full_outline = render_arc(|r| {
+            r.draw_circle(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                &Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        assert_eq!(
+            outlined, full_outline,
+            "整圈 draw_arc 与 draw_circle 不一致"
+        );
+
+        let filled = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                a,
+                a,
+                Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        let full_fill = render_arc(|r| {
+            r.fill_circle(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        assert_eq!(filled, full_fill, "整圈 fill_arc 与 fill_circle 不一致");
+    }
+
+    /// 圆弧描边只画圆周上的点，不填充扇形内部。
+    #[test]
+    fn draw_arc_draws_only_outline_not_interior() {
+        let fb = render_arc(|r| {
+            r.draw_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                &Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        let painted = painted_set(&fb, 21, 21);
+        assert!(!painted.is_empty(), "圆弧未画出任何像素");
+        // 圆心不应被描边（描边只覆盖圆周）
+        assert!(!painted.contains(&(ARC_CX, ARC_CY)), "圆弧不应填充圆心");
+        // 描边像素数必须远少于扇形：圆周是 O(r)，扇形是 O(r²)。
+        let sector = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        let sector_count = painted_set(&sector, 21, 21).len();
+        assert!(
+            painted.len() * 3 < sector_count,
+            "圆弧像素数 {} 相对扇形 {} 过大，可能误填了内部",
+            painted.len(),
+            sector_count
+        );
+    }
+
+    /// 角度按屏幕坐标增大：0°→90° 是右下象限而非数学上的第一象限。
+    ///
+    /// 这条守护 Y 轴向下这一全库约定不被圆弧实现误用。
+    #[test]
+    fn arc_uses_screen_coordinate_convention() {
+        // 0° 指向右：圆心右侧的像素应在扇形内
+        let fb = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        let painted = painted_set(&fb, 21, 21);
+        // 90° 指向下：正下方在扇形内，正上方不在
+        assert!(
+            painted.contains(&(ARC_CX, ARC_CY + ARC_R)),
+            "90° 应指向屏幕下方"
+        );
+        assert!(
+            !painted.contains(&(ARC_CX, ARC_CY - ARC_R)),
+            "270° 方向不应出现在 0..90 扇形内"
+        );
+        // 0° 指向右：正右在扇形内，正左不在
+        assert!(
+            painted.contains(&(ARC_CX + ARC_R, ARC_CY)),
+            "0° 应指向屏幕右方"
+        );
+        assert!(
+            !painted.contains(&(ARC_CX - ARC_R, ARC_CY)),
+            "180° 方向不应在扇形内"
+        );
+    }
+
+    /// 跨越 0° 的扇形（350°→10°）应正确覆盖右上方的一条窄楔形。
+    #[test]
+    fn fill_arc_wraps_across_zero_degrees() {
+        let fb = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Angle::from_degrees(350),
+                Angle::from_degrees(10),
+                Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        let painted = painted_set(&fb, 21, 21);
+        assert!(!painted.is_empty(), "跨界扇形未覆盖任何像素");
+
+        let (cx, cy) = (ARC_CX as i64, ARC_CY as i64);
+        for (x, y) in &painted {
+            let dx = *x as i64 - cx;
+            let dy = *y as i64 - cy;
+            // 圆心本身（零向量）按约定属于扇形内部，跳过方向判定。
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            // 楔形是右方偏上/偏下的一条窄带：|dy| 小、dx > 0
+            assert!(
+                dx > 0 && dy.abs() * 2 <= dx.abs() + ARC_R as i64,
+                "像素 ({x},{y}) 超出 350°..10° 窄楔形"
+            );
+        }
+        // 正右方必在楔形内
+        assert!(
+            painted.contains(&(ARC_CX + ARC_R, ARC_CY)),
+            "0° 方向应落在跨界扇形内"
+        );
+    }
+
+    /// 半径为 0 时两个图元都静默不画。
+    #[test]
+    fn arc_and_sector_reject_zero_radius() {
+        let outlined = render_arc(|r| {
+            r.draw_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                0,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                &Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        assert!(
+            painted_set(&outlined, 21, 21).is_empty(),
+            "半径 0 的圆弧画了像素"
+        );
+
+        let filled = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                0,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        assert!(
+            painted_set(&filled, 21, 21).is_empty(),
+            "半径 0 的扇形画了像素"
+        );
+    }
+
+    /// 完全透明的扇形不得写入任何像素。
+    #[test]
+    fn fill_arc_transparent_color_does_nothing() {
+        let fb = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                Color::with_alpha(0x12, 0x34, 0x56, 0),
+            )
+        });
+        assert!(
+            painted_set(&fb, 21, 21).is_empty(),
+            "完全透明的扇形写入了像素"
+        );
+    }
+
+    /// 半透明扇形必须走混合路径：结果介于背景与原色之间，而非直接覆盖。
+    #[test]
+    fn fill_arc_alpha_blends_into_background() {
+        let fb = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                ARC_R,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                Color::with_alpha(255, 255, 255, 128),
+            )
+        });
+        // BGR24 覆盖黑色背景，alpha=128 的白色应得到约一半亮度
+        let i = (ARC_CY * 21 + ARC_CX) * BGR24_BYTES;
+        assert_eq!(
+            &fb[i..i + BGR24_BYTES],
+            &[128, 128, 128],
+            "半透明扇形未按混合写入"
+        );
+    }
+
+    /// 超大半径必须被钳制，迭代量与半径无关，且结果与上界半径一致。
+    ///
+    /// 与 `circle_clamps_huge_radius` 同源，守护圆弧复用同一条钳制路径。
+    /// 基准半径取 `width + height`（即 `walk_circle_points` 的钳制上界），
+    /// 取更小的值不会触发钳制，超大半径自然与它不同。
+    #[test]
+    fn arc_clamps_huge_radius() {
+        // render_arc 用的是 21x21 缓冲，钳制上界为 21 + 21。
+        const LIMIT: usize = 42;
+        let at_limit = render_arc(|r| {
+            r.fill_arc(
+                Pixel::new(ARC_CX, ARC_CY),
+                LIMIT,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        assert!(
+            !painted_set(&at_limit, 21, 21).is_empty(),
+            "上界半径的扇形未覆盖任何像素，等价性断言会平凡通过"
+        );
+
+        // `usize::MAX` 若未经钳制，`walk_circle_points` 会迭代约 7 亿次而挂死。
+        for huge in [1_000_000_000usize, usize::MAX] {
+            let big = render_arc(|r| {
+                r.fill_arc(
+                    Pixel::new(ARC_CX, ARC_CY),
+                    huge,
+                    Angle::ZERO,
+                    Angle::RIGHT_DOWN,
+                    Color::new(0x12, 0x34, 0x56),
+                )
+            });
+            assert_eq!(big, at_limit, "半径 {huge} 与上界半径的扇形输出不一致");
+        }
+    }
+
+    /// 圆心在屏幕外时不得崩溃，且可见部分仍被正确绘制。
+    #[test]
+    fn arc_with_center_outside_framebuffer_is_clipped() {
+        let fb = render_arc(|r| {
+            r.draw_arc(
+                Pixel::new(0, 0),
+                5,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                &Color::new(0x12, 0x34, 0x56),
+            )
+        });
+        // 圆心在 (0,0)，圆弧向下向右延伸；不能 panic，且确有可见像素
+        assert!(!painted_set(&fb, 21, 21).is_empty());
     }
 
     // ── blit ──
