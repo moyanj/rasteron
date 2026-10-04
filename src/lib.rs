@@ -89,6 +89,6 @@ pub mod pixel;
 pub mod programmable;
 #[cfg(feature = "simd")]
 pub mod simd;
-mod utils;
+pub mod utils;
 pub use core::Renderer;
 pub use pixel::Pixel;

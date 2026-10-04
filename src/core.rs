@@ -1171,10 +1171,35 @@ impl<'a> Renderer<'a> {
 
     /// 如果启用双缓冲，将后台缓冲区交换到前台（即刷新到显存）。
     ///
+    /// 只拷贝每行可见的 `width × bytes_per_pixel` 字节：行间填充不属于可见像素，
+    /// 可见区域之外的字节保持前台原样。这一点对
+    /// [`sub_view`](crate::utils::sub_view) 构造的子渲染器是必需的——子渲染器的
+    /// 切片按父缓冲区的 `pitch` 跨行，整段拷贝会连面板以外的像素一起覆盖。
+    ///
     /// 单缓冲模式下此方法不可用。
     #[cfg(feature = "double_buffer")]
     pub fn swap_buffers(&mut self) {
-        self.front_buffer.copy_from_slice(&self.back_buffer);
+        let row_len = self.info.width * self.info.bytes_per_pixel();
+        let height = self.info.height;
+        if row_len == 0 || height == 0 {
+            return;
+        }
+
+        let pitch = self.info.pitch;
+        if pitch == row_len {
+            // 无行间填充：一次拷贝。切片可能比 `buffer_size()` 更长，故显式取前
+            // `pitch × height` 字节，而不是整体 `copy_from_slice`（长度不等会 panic）。
+            let total = pitch * height;
+            self.front_buffer[..total].copy_from_slice(&self.back_buffer[..total]);
+            return;
+        }
+
+        // 有行间填充：逐行只拷贝可见部分，填充字节与相邻区域不被触碰。
+        for y in 0..height {
+            let off = y * pitch;
+            self.front_buffer[off..off + row_len]
+                .copy_from_slice(&self.back_buffer[off..off + row_len]);
+        }
     }
 
     /// 返回帧缓冲布局信息的引用。

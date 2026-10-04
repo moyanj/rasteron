@@ -1,6 +1,105 @@
 use crate::Pixel;
+use crate::core::Renderer;
+use crate::framebuffer::FramebufferInfo;
 #[cfg(feature = "simd")]
 use crate::simd;
+
+/// 按可见窗口构造子渲染器，实现无状态裁剪。
+///
+/// # 必须注意的前提
+///
+/// 1. **双缓冲下每个子渲染器画完都要 `swap_buffers()`。** 与父渲染器一样，
+///    绘制写入的是各自的后台缓冲，不 present 不会写回 `fb`。
+///    `swap_buffers` 只写回窗口内 `width × bytes_per_pixel` 的可见字节，
+///    故 present 不会波及面板以外的像素（切片本身按父缓冲区的 `pitch` 跨行，
+///    整段拷贝会连相邻行一起覆盖）。
+///
+/// # 收缩规则
+///
+/// 越界部分静默收缩，不 panic：
+///
+/// * `width`/`height` 超出可视区时，按 `info.width - x` / `info.height - y` 收缩。
+/// * 行数另受可用字节限制——窗口起点 `off` 之后必须还放得下每行 `pitch` 字节
+///   （`new` 的断言按 `pitch × height` 口径要求），故行数收缩到
+///   `(fb.len() - off) / pitch`。窗口贴住缓冲区末尾时**可能少最后一行**，
+///   这是 `pitch` 行填充被计入的必然结果，不是缺陷。
+///
+/// # 示例
+///
+/// ```
+/// # use rasteron::{Renderer, Pixel};
+/// # use rasteron::framebuffer::FramebufferInfo;
+/// # use rasteron::color::{Color, PixelFormat};
+/// # use rasteron::utils::sub_view;
+/// let pitch = 64 * 4;
+/// let info = FramebufferInfo::new(64, 64, pitch, PixelFormat::Rgba8888);
+/// let mut fb = vec![0u8; info.buffer_size()];
+///
+/// // 在 (8, 8) 处开一个 16x16 的窗口
+/// let mut panel = sub_view(&mut fb, &info, 8, 8, 16, 16).unwrap();
+/// assert_eq!((panel.info().width, panel.info().height), (16, 16));
+/// // pitch 不变，故窗口内像素仍落在正确的物理位置
+/// assert_eq!(panel.info().pitch, pitch);
+///
+/// // 画一个远超窗口的矩形，溢出部分被自动裁掉
+/// panel.fill_rect(Pixel::new(0, 0), 1000, 1000, Color::new(255, 0, 0));
+///
+/// // 双缓冲下必须 present 才写回 fb；单缓冲下没有该方法（编译期即不可用）。
+/// #[cfg(feature = "double_buffer")]
+/// panel.swap_buffers();
+/// ```
+///
+/// # 返回值
+///
+/// 返回 `None` 表示窗口完全不可用：尺寸为 0、起点落在可视区之外、或起点之后
+/// 已放不下任何完整行。
+pub fn sub_view<'a>(
+    fb: &'a mut [u8],
+    info: &FramebufferInfo,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Option<Renderer<'a>> {
+    if width == 0 || height == 0 || x >= info.width || y >= info.height {
+        return None;
+    }
+
+    // 上述检查保证 `info.width > 0`，故 `info.pitch >= info.width * bpp > 0`，
+    // 下面的除法不会除零。
+    let pitch = info.pitch;
+    if pitch == 0 {
+        return None;
+    }
+    let bpp = info.bytes_per_pixel();
+
+    // 先收缩到可视区：窗口可能比屏幕还大。
+    let sub_w = width.min(info.width - x);
+    let sub_h = height.min(info.height - y);
+
+    // 窗口左上角在缓冲区中的字节偏移。用 checked_* 而非裸算术，因为
+    // `FramebufferInfo::new` 不限制 width/height，`y * pitch` 在极端输入下会溢出。
+    let off = y.checked_mul(pitch)?.checked_add(x.checked_mul(bpp)?)?;
+    let avail = fb.len().checked_sub(off)?;
+
+    // 可用完整行数：每行必须占据完整的 `pitch` 字节，含行填充。
+    let rows = avail / pitch;
+    let sub_h = sub_h.min(rows);
+    if sub_h == 0 {
+        return None;
+    }
+
+    // 切片长度取 `pitch × sub_h`：`Renderer::new` 的断言按此口径要求可用字节。
+    // 可见像素的写入上界是 `(sub_h - 1) * pitch + sub_w * bpp`，故切片末尾那段
+    // 属于父缓冲区下一行的字节不会被任何绘制或 present 触碰（见 `swap_buffers`）。
+    let len = pitch.checked_mul(sub_h)?;
+    if len > avail {
+        return None;
+    }
+
+    let sub_info = FramebufferInfo::new(sub_w, sub_h, pitch, info.format);
+    Some(Renderer::new(sub_info, &mut fb[off..off + len]))
+}
 
 /// Cohen–Sutherland 线段裁剪算法，针对矩形视口。
 ///
@@ -137,7 +236,7 @@ pub(crate) fn floor_to_usize(value: f32) -> usize {
 ///
 /// 3bpp 无法整除 16，退回逐次倍增复制。
 #[inline(always)]
-pub fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
+pub(crate) fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
     let len = row.len();
     let pattern_len = pattern.len();
     if pattern_len == 0 || len <= pattern_len {

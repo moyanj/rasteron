@@ -9,7 +9,7 @@ edition = "2024"
 criterion = { version = "0.7", default-features = false }
 
 [features]
-default = ["double_buffer", "programmable", "simd"]
+default = ["programmable", "simd"]
 double_buffer = []
 programmable = []
 simd = []
