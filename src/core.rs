@@ -88,7 +88,7 @@ macro_rules! write_rgb_ptr {
     };
 }
 
-/// 圆图元的种类，供 `tests` 与 `diff_probe` 共用。
+/// 圆图元的种类，供 `tests` 中的参考实现对照使用。
 ///
 /// 显式枚举而非 `bool` 参数，避免调用点出现无法自解释的 `true` / `false`。
 #[cfg(test)]
@@ -1069,29 +1069,22 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// 中点圆递推，回调八对称点。`draw_circle` / `fill_circle` 的共享入口。
+    /// 圆与圆弧共用的参数归一：饱和转换圆心，并把 `radius` 钳到 `width + height`。
     ///
-    /// `radius` 在此钳制到 `width + height`。依据：任意可见像素到圆心的距离不超过
-    /// 画布对角线，而 `sqrt(width² + height²) < width + height`，故半径超过该上界时
-    /// 可见像素的着色结果与恰好等于该上界时完全一致——屏幕外的点由 `visit` 内的
-    /// 边界检查丢弃，不会写入缓冲。钳制把 `while x <= y` 的迭代量从 `O(radius)`
-    /// 压到 `O(width + height)`，避免调用方传入 `usize::MAX` 量级的半径时把渲染
-    /// 线程钉死。
+    /// 钳制的依据：任意可见像素到圆心的距离不超过画布对角线，而
+    /// `sqrt(width² + height²) < width + height`，故半径超过该上界时可见像素的
+    /// 着色结果与恰好等于该上界时完全一致——屏幕外的行由各图元的边界检查丢弃。
+    /// 钳制把迭代量从 `O(radius)` 压到 `O(height)`，避免调用方传入 `usize::MAX`
+    /// 量级的半径时把渲染线程钉死。
+    ///
+    /// `MAX_RADIUS` 只用于保证后续 `r²` 在 `u128` 内可表示（`(i64::MAX / 2)²`
+    /// 远小于 `u128::MAX`），真实帧缓冲到不了这个量级。
     ///
     /// 半径小于上界时钳制无效果，故不影响既有覆盖。两个方向各由一条测试守护：
     /// `circle_clamps_huge_radius` 抓钳制缺失，`circle_clamp_preserves_radii_within_limit`
     /// 抓钳制过度。
     #[inline(always)]
-    fn walk_circle_points(
-        &mut self,
-        center: Pixel,
-        radius: usize,
-        mut visit: impl FnMut(&mut Self, i64, i64, i64, i64),
-    ) {
-        // 递推式 `d = 3 - 2 * radius` 要求 `2 * radius` 不溢出 `i64`。
-        // 真实帧缓冲到不了这个量级（`Renderer::new` 要求 `pitch * height` 字节可用，
-        // 且 `pitch >= width * bytes_per_pixel`），此处显式钳到该上界只为让后续算术
-        // 在任意输入下都不回绕。
+    fn disk_params(&self, center: Pixel, radius: usize) -> (i64, i64, i64) {
         const MAX_RADIUS: usize = (i64::MAX / 2) as usize;
 
         let limit = self
@@ -1100,81 +1093,200 @@ impl<'a> Renderer<'a> {
             .saturating_add(self.info.height)
             .min(MAX_RADIUS);
         // 用 `sat_i64` 而非 `as i64`：后者会把超出 `i64::MAX` 的值回绕成负数，
-        // 使 `y` 变负而 `while x <= y` 一次都不进（`usize::MAX` 即如此）。
-        let mut y = sat_i64(radius.min(limit));
+        // 使半径变成负数而一行都不画（`usize::MAX` 即如此）。
+        (
+            sat_i64(center.x),
+            sat_i64(center.y),
+            sat_i64(radius.min(limit)),
+        )
+    }
 
-        let cx = sat_i64(center.x);
-        let cy = sat_i64(center.y);
-        let mut x = 0i64;
-        let mut d = 3 - 2 * y;
+    /// 精确圆盘第 `k = |dy|` 行的半宽 `floor(sqrt(r² − k²))`，用**增量收缩**求取。
+    ///
+    /// `half` 是跨行复用的状态：半宽随 `|dy|` 单调不增，故只需从上一行的半宽
+    /// 继续向下收缩，全程总收缩次数 `<= r`，均摊 `O(1)`。这样既不需要浮点
+    /// （`no_std` 且关闭 `programmable` 时没有 `f32`），也不需要逐位整数开方。
+    ///
+    /// 前置条件：`k` 必须**单调递增**地调用，且 `k <= r`（由调用方保证，
+    /// 故 `r2 - k2` 不会下溢）。返回值恒 `>= 0`。
+    #[inline(always)]
+    fn disk_half_at(r2: u128, k: i64, half: &mut i64) -> i64 {
+        let k2 = (k as u128) * (k as u128);
+        while (*half as u128) * (*half as u128) > r2 - k2 {
+            *half -= 1;
+        }
+        *half
+    }
 
-        while x <= y {
-            visit(self, cx, cy, x, y);
-            if d < 0 {
-                d += 4 * x + 6;
-            } else {
-                d += 4 * (x - y) + 10;
-                y -= 1;
-            }
-            x += 1;
+    /// 精确圆盘的逐扫描行遍历：对 `k = 0, 1, …` 回调 `(cx, cy, k, half)`。
+    ///
+    /// 半宽只取决于 `|dy|`，故 `cy - k` 与 `cy + k` 两行的半宽都是 `half`，
+    /// 由调用方自行展开（`k == 0` 时两行重合，需只写一次）。
+    ///
+    /// **每行恰好回调一次**，填充路径因此天然不会对同一像素重复写入——这是
+    /// 「半透明色只混合一次」的结构性保证，不依赖任何去重后处理。
+    ///
+    /// 迭代量 `k <= min(r, height)`：`|dy| >= height` 的行必在帧缓冲外，
+    /// 故与半径无关（半径已由 [`Self::disk_params`] 钳制）。
+    #[inline(always)]
+    fn walk_disk_rows(
+        &mut self,
+        center: Pixel,
+        radius: usize,
+        mut visit: impl FnMut(&mut Self, i64, i64, i64, i64),
+    ) {
+        let (cx, cy, r) = self.disk_params(center, radius);
+        let max_k = r.min(sat_i64(self.info.height));
+        let r2 = (r as u128) * (r as u128);
+        let mut half = r;
+
+        for k in 0..=max_k {
+            let row_half = Self::disk_half_at(r2, k, &mut half);
+            visit(self, cx, cy, k, row_half);
         }
     }
 
-    /// 使用中点圆算法绘制圆形轮廓。
+    /// 精确圆盘边界的逐像素遍历：回调 `(px, py, dx, dy)`，每个边界像素恰好一次。
     ///
-    /// 利用八对称性绘制所有对称点，自动忽略超出帧缓冲边界的像素。
-    /// `radius` 被钳制到 `width + height`，迭代量因此与半径无关（详见
-    /// [`Self::walk_circle_points`]）。
+    /// `(px, py)` 是已做饱和转换的绝对像素坐标，`(dx, dy)` 是相对圆心的偏移
+    /// （圆弧的楔形判定用后者，因为楔形定义在圆心坐标系里）。
+    ///
+    /// 边界定义为**落在圆盘 `dx² + dy² <= r²` 内、且存在 4 邻域落在盘外**的像素
+    /// （数字圆盘的内边界）：第 `k` 行是 `|dx| ∈ (H(k+1), H(k)]`，外加半宽像素
+    /// `H(k)` 本身——当 `H(k+1) == H(k)` 时该区间为空，但 `(H(k) + 1, k)` 已在盘外，
+    /// 故 `(H(k), k)` 仍属边界。该定义给出单像素宽、8-连通的轮廓。
+    ///
+    /// 半径钳制与迭代上界同 [`Self::walk_disk_rows`]。
+    #[inline(always)]
+    fn walk_disk_boundary(
+        &mut self,
+        center: Pixel,
+        radius: usize,
+        mut visit: impl FnMut(&mut Self, i64, i64, i64, i64),
+    ) {
+        let (cx, cy, r) = self.disk_params(center, radius);
+        let max_k = r.min(sat_i64(self.info.height));
+        let r2 = (r as u128) * (r as u128);
+        let mut half = r;
+
+        // 第 `k` 行的边界需要 `H(k+1)`，故发射滞后一行。
+        let mut pending: Option<(i64, i64)> = None;
+        for k in 0..=max_k {
+            let row_half = Self::disk_half_at(r2, k, &mut half);
+            if let Some((prev_k, prev_half)) = pending {
+                self.emit_boundary_row(cx, cy, prev_k, prev_half, row_half, &mut visit);
+            }
+            pending = Some((k, row_half));
+        }
+
+        // 收尾：仅当最后一行是圆盘末行（`H(k) == 0`，即 `k == r`）时才需补发，
+        // 此时 `H(k+1)` 不存在，边界退化为单像素 `(cx, cy ± k)`。
+        // 若 `k == height < r`，该行必在帧缓冲外，无需补发。
+        if let Some((k, 0)) = pending {
+            self.emit_boundary_row(cx, cy, k, 0, -1, &mut visit);
+        }
+    }
+
+    /// 发射精确圆盘边界在 `cy ± k` 两行上的像素。
+    ///
+    /// `half` 是 `H(k)`，`next_half` 是 `H(k+1)`（末行取 `-1`，即视作盘外）。
+    /// `next_half <= half` 恒成立，故区间 `(next_half, half]` 与半宽像素本身
+    /// 的并集总是非空。
+    #[inline(always)]
+    fn emit_boundary_row(
+        &mut self,
+        cx: i64,
+        cy: i64,
+        k: i64,
+        half: i64,
+        next_half: i64,
+        visit: &mut impl FnMut(&mut Self, i64, i64, i64, i64),
+    ) {
+        let (lo, hi) = if next_half < half {
+            (next_half + 1, half)
+        } else {
+            // 区间为空：该行与相邻行半宽相同，只有半宽像素本身在边界上。
+            (half, half)
+        };
+
+        for dx in lo..=hi {
+            // 横向与纵向都用饱和运算：圆心可能被 `sat_i64` 顶到 `i64::MAX`，
+            // 裸加会在 debug 构建下溢出 panic（越界像素本就会被丢弃）。
+            let (xp, xm) = (cx.saturating_add(dx), cx.saturating_sub(dx));
+            let (yp, ym) = (cy.saturating_add(k), cy.saturating_sub(k));
+
+            // 行 `cy + k`（`k == 0` 时与 `cy - k` 同行，故只发一次）。
+            visit(self, xp, yp, dx, k);
+            if dx != 0 {
+                visit(self, xm, yp, -dx, k);
+            }
+            if k != 0 {
+                visit(self, xp, ym, dx, -k);
+                if dx != 0 {
+                    visit(self, xm, ym, -dx, -k);
+                }
+            }
+        }
+    }
+
+    /// 使用精确圆盘边界绘制圆形轮廓。
+    ///
+    /// 轮廓像素定义为「落在圆盘 `dx² + dy² <= radius²` 内、且存在 4 邻域落在盘外」
+    /// 的像素，即数字圆盘的内边界：单像素宽、8-连通，且**每个像素只写一次**，
+    /// 故半透明色不会被重复混合。
+    ///
+    /// 与 [`Self::fill_circle`] 共用同一套逐行半宽，故轮廓恰好是填充的最外圈——
+    /// `draw_circle` 画出的像素必然也出现在同参数的 `fill_circle` 结果里。
+    ///
+    /// 自动忽略超出帧缓冲边界的像素。`radius` 被钳制到 `width + height`，
+    /// 迭代量因此与半径无关（详见 `disk_params`）。
     pub fn draw_circle(&mut self, center: Pixel, radius: usize, color: &Color) {
         if radius == 0 {
             return;
         }
 
-        self.walk_circle_points(center, radius, |renderer, cx, cy, x, y| {
-            for (px, py) in [
-                (cx + x, cy + y),
-                (cx + x, cy - y),
-                (cx - x, cy + y),
-                (cx - x, cy - y),
-                (cx + y, cy + x),
-                (cx + y, cy - x),
-                (cx - y, cy + x),
-                (cx - y, cy - x),
-            ] {
-                if px >= 0 && py >= 0 {
-                    renderer.set_pixel(px as usize, py as usize, color);
-                }
+        self.walk_disk_boundary(center, radius, |renderer, px, py, _dx, _dy| {
+            if px >= 0 && py >= 0 {
+                renderer.set_pixel(px as usize, py as usize, color);
             }
         });
     }
 
-    /// 使用中点圆算法填充圆形区域。
+    /// 使用精确圆盘填充圆形区域：`dx² + dy² <= radius²` 的像素全部着色。
     ///
-    /// 利用八对称性生成水平跨度，通过 `fill_visible_horizontal_span` 写入。
-    /// 自动裁剪到帧缓冲边界。`radius` 被钳制到 `width + height`，迭代量因此
-    /// 与半径无关（详见 [`Self::walk_circle_points`]）。
+    /// 每个扫描行只调用一次跨度填充，故**每个像素只写一次**——半透明色不会被
+    /// 重复混合，无需任何去重后处理。自动裁剪到帧缓冲边界，`radius` 被钳制到
+    /// `width + height`，迭代量因此与半径无关（详见 `disk_params`）。
+    ///
+    /// # 与中点圆递推的差异
+    ///
+    /// 本函数直接按圆方程取整求每行半宽，而不是复用中点圆递推的八对称跨度。
+    /// 后者在极点附近会把 `cy ± radius` 那一行画成一条宽约 `sqrt(2 · radius)`
+    /// 的横线（半径 200 时宽 29 px），面积比真圆盘大 0.5%（半径 200）到 10%
+    /// （半径 10）；前者就是精确圆盘。
     pub fn fill_circle(&mut self, center: Pixel, radius: usize, color: Color) {
         if radius == 0 || self.info.width == 0 || self.info.height == 0 {
             return;
         }
+        // 完全透明无需写入（与 fill_arc 一致，提前返回避免无谓迭代）。
+        if color.a == 0 {
+            return;
+        }
 
-        self.walk_circle_points(center, radius, |renderer, cx, cy, x, y| {
-            for (sx, ex, py) in [
-                (cx - x, cx + x, cy + y),
-                (cx - x, cx + x, cy - y),
-                (cx - y, cx + y, cy + x),
-                (cx - y, cx + y, cy - x),
-            ] {
-                renderer.fill_visible_horizontal_span(sx, ex, py, &color);
+        self.walk_disk_rows(center, radius, |renderer, cx, cy, k, half| {
+            // `k == 0` 时 `cy + 0 == cy - 0` 是同一行，只写一次。
+            renderer.fill_visible_horizontal_span(cx - half, cx + half, cy + k, &color);
+            if k != 0 {
+                renderer.fill_visible_horizontal_span(cx - half, cx + half, cy - k, &color);
             }
         });
     }
 
     /// 绘制圆弧轮廓：从 `start_angle` 沿角度增大方向扫掠到 `end_angle`。
     ///
-    /// 复用 `walk_circle_points` 的中点圆递推，只在回调内用
-    /// [`Wedge`] 筛掉区间外的对称点，因此半径钳制与迭代量上界与
-    /// [`Self::draw_circle`] 完全一致。
+    /// 与 [`Self::draw_circle`] 共用同一条精确圆盘边界，只在回调内用
+    /// [`Wedge`] 筛掉区间外的像素，因此半径钳制与迭代量上界与
+    /// [`Self::draw_circle`] 完全一致，且每个像素只写一次。
     ///
     /// # 角度约定
     ///
@@ -1218,21 +1330,10 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        self.walk_circle_points(center, radius, |renderer, cx, cy, x, y| {
-            for (px, py) in [
-                (cx + x, cy + y),
-                (cx + x, cy - y),
-                (cx - x, cy + y),
-                (cx - x, cy - y),
-                (cx + y, cy + x),
-                (cx + y, cy - x),
-                (cx - y, cy + x),
-                (cx - y, cy - x),
-            ] {
-                // 判定用相对圆心的偏移，负坐标同样有效（纯代数，无边界依赖）。
-                if wedge.contains(px - cx, py - cy) && px >= 0 && py >= 0 {
-                    renderer.set_pixel(px as usize, py as usize, color);
-                }
+        self.walk_disk_boundary(center, radius, |renderer, px, py, dx, dy| {
+            // 判定用相对圆心的偏移，负坐标同样有效（纯代数，无边界依赖）。
+            if wedge.contains(dx, dy) && px >= 0 && py >= 0 {
+                renderer.set_pixel(px as usize, py as usize, color);
             }
         });
     }
@@ -1240,9 +1341,9 @@ impl<'a> Renderer<'a> {
     /// 填充扇形：从 `center` 出发，介于 `start_angle` 与 `end_angle` 之间的
     /// 圆盘区域。
     ///
-    /// 对每一扫描行先求出圆在该行的水平跨度，再逐像素做楔形判定。
-    /// 迭代量取决于 `radius`（已被钳制为 `O(width + height)`）与跨度宽度，
-    /// 不取决于角度。
+    /// 对每一扫描行先求出圆盘在该行的水平跨度，再逐像素做楔形判定。每行只
+    /// 遍历一次，故**每个像素只写一次**，半透明色不会被重复混合。
+    /// 迭代量取决于 `radius`（已被钳制为 `O(height)`）与跨度宽度，不取决于角度。
     ///
     /// # 角度约定
     ///
@@ -1289,45 +1390,21 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        let cx = sat_i64(center.x);
-        let cy = sat_i64(center.y);
-        // 中点圆递推给出每个扫描行的半宽，据此逐行填充。
-        //
-        // 这里按「行」而非按八对称点驱动：中点圆的八对称在 `x == y` 的对角
-        // 位置会让多条跨度覆盖同一像素（`fill_circle` 对不透明色重复写无害，
-        // 但**半透明色重复混合会逐次加深**，实测 alpha=128 叠两次得到 191 而
-        // 非 128）。故此处每行只写一次。
-        let width = self.info.width as i64;
-        let height = self.info.height as i64;
+        let width = sat_i64(self.info.width);
+        let height = sat_i64(self.info.height);
 
-        self.walk_circle_points(center, radius, |renderer, _cx, _cy, x, y| {
-            // 四条对称跨度先归并成 `(行, 半宽)`，同一行只保留最大半宽，
-            // 避免重复写入同一像素。
-            let mut rows: [(i64, i64); 4] = [(cy, -1); 4];
-            let mut n = 0usize;
-            for (py, half) in [(cy + y, x), (cy - y, x), (cy + x, y), (cy - x, y)] {
-                let mut merged = false;
-                for entry in rows.iter_mut().take(n) {
-                    if entry.0 == py {
-                        if half > entry.1 {
-                            entry.1 = half;
-                        }
-                        merged = true;
-                        break;
-                    }
-                }
-                if !merged {
-                    rows[n] = (py, half);
-                    n += 1;
-                }
-            }
+        // 逐行取精确圆盘的跨度，再逐像素做楔形判定：每行只遍历一次，
+        // 故同一像素不会被重复混合。
+        self.walk_disk_rows(center, radius, |renderer, cx, cy, k, half| {
+            // `k == 0` 时 `cy + k` 与 `cy - k` 是同一行，只扫一次。
+            let rows = [cy - k, cy + k];
+            let row_count = if k == 0 { 1 } else { 2 };
 
-            for (py, half) in rows.iter().take(n) {
-                let (py, half) = (*py, *half);
-                if py < 0 || py >= height || half < 0 {
+            for &py in rows.iter().take(row_count) {
+                if py < 0 || py >= height {
                     continue;
                 }
-                // 该行的水平范围裁到帧缓冲，迭代量因此受 width 约束。
+                // 该行的水平范围裁到帧缓冲，内层迭代量因此受 width 约束。
                 let lo = (cx - half).max(0);
                 let hi = (cx + half).min(width - 1);
                 let row_off = py - cy;
@@ -1568,10 +1645,9 @@ mod tests {
     /// 固定场景下各半径的填充像素数实测值，作为"钳制不得改变
     /// `radius <= CIRCLE_LIMIT` 行为"的锚点。
     ///
-    /// 数值取自 `walk_circle_points` 的实际递推，不是欧氏圆盘：圆心 `(1, 2)`
-    /// 偏离正中，中点圆的边界像素本就与"距离 <= radius"判定不同
-    /// （如 `radius = 2` 时 `(0, 0)` 会被填，而它的欧氏距离是 2.24）。
-    const CIRCLE_FILL_PIXELS: [(usize, usize); 3] = [(1, 5), (2, 15), (3, 16)];
+    /// 数值就是欧氏圆盘 `dx² + dy² <= radius²` 的像素数（圆心 `(1, 2)` 偏离
+    /// 正中，故不等于 `πr²`）。`radius >= 3` 时该场景已覆盖整屏。
+    const CIRCLE_FILL_PIXELS: [(usize, usize); 3] = [(1, 5), (2, 11), (3, 16)];
 
     /// 统计缓冲中被实际着色（存在非零通道）的像素数。
     fn painted_pixels(fb: &[u8]) -> usize {
@@ -1835,6 +1911,62 @@ mod tests {
         assert_eq!(renderer.get_pixel(3, 3), Some(Color::new(0, 0, 0)));
     }
 
+    /// 半透明 `draw_circle` 必须对每个像素**只混合一次**。
+    ///
+    /// 旧的八对称展开在 `x == 0`（4 个基点像素）与 `x == y`（4 个对角像素）处
+    /// 会对同一像素写两次，半透明色因此加深（alpha=128 得 191 而非 128）。
+    /// 半径 11 与 20 的递推里 `x == y` 成立、18 不成立，三者合起来覆盖两类重合。
+    #[test]
+    fn draw_circle_alpha_blends_once() {
+        let (w, h) = (61usize, 61usize);
+        let center = Pixel::new(30, 30);
+        let alpha = 128u8;
+        let src = Color::with_alpha(255, 255, 255, alpha);
+        let inv = 255 - alpha as u16;
+        let expect = PixelFormat::blend_channel(src.r, 0, alpha as u16, inv) as u8;
+
+        for radius in [11usize, 18, 20] {
+            let mut front = vec![0u8; w * h * BGR24_BYTES];
+            let mut renderer = Renderer::new(
+                FramebufferInfo::new(w, h, w * BGR24_BYTES, PixelFormat::Bgr24),
+                &mut front,
+            );
+            renderer.clear(Color::new(0, 0, 0));
+            renderer.draw_circle(center, radius, &src);
+
+            let mut painted = 0usize;
+            for y in 0..h {
+                for x in 0..w {
+                    let got = renderer.get_pixel(x, y).expect("像素应可读").r;
+                    if got == 0 {
+                        continue;
+                    }
+                    painted += 1;
+                    assert_eq!(
+                        got, expect,
+                        "半径 {radius} 的轮廓像素 ({x},{y}) 被混合了多次：期望 {expect}，实际 {got}"
+                    );
+                }
+            }
+            assert!(painted > 8, "半径 {radius} 的轮廓像素过少，断言会失去意义");
+
+            // 4 个基点像素在旧实现里必然被写两次，显式断言它们被画到，
+            // 以免测试在"轮廓恰好没覆盖到重合位置"时空转。
+            for (x, y) in [
+                (center.x + radius, center.y),
+                (center.x - radius, center.y),
+                (center.x, center.y + radius),
+                (center.x, center.y - radius),
+            ] {
+                assert_eq!(
+                    renderer.get_pixel(x, y).expect("基点像素应可读").r,
+                    expect,
+                    "半径 {radius} 的基点像素 ({x},{y}) 未按单次混合写入"
+                );
+            }
+        }
+    }
+
     // ── fill_circle ──
 
     #[test]
@@ -1852,6 +1984,185 @@ mod tests {
         assert_eq!(renderer.get_pixel(1, 3), Some(color));
         assert_eq!(renderer.get_pixel(5, 3), Some(color));
         assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0, 0, 0)));
+    }
+
+    /// 半透明 `fill_circle` 必须对每个像素**只混合一次**。
+    ///
+    /// 守护的是四条对称跨度在 `x == 0`（首轮）与 `x == y`（末轮）落到
+    /// 同一行造成的重复写入。不透明色重复写是幂等的（看不出来），半透明
+    /// 却是累积混合——未修复时圆心行会被叠到 191/223 而非单次的 128。
+    ///
+    /// 断言方式：纯黑底 + 半透明白覆盖整个圆，圆内**每个**像素都应等于
+    /// 单次混合的结果。任何一次重复写都会让该像素变亮而失败。
+    #[test]
+    fn fill_circle_alpha_blends_once() {
+        let (w, h) = (41usize, 41usize);
+        let center = Pixel::new(20, 20);
+        let radius = 18usize;
+        let alpha = 128u8;
+        let src = Color::with_alpha(255, 255, 255, alpha);
+
+        let mut front = vec![0u8; w * h * BGR24_BYTES];
+        let mut renderer = Renderer::new(
+            FramebufferInfo::new(w, h, w * BGR24_BYTES, PixelFormat::Bgr24),
+            &mut front,
+        );
+        renderer.clear(Color::new(0, 0, 0));
+        renderer.fill_circle(center, radius, src);
+
+        // 单次混合的期望值（对黑底混合一次）
+        let inv = 255 - alpha as u16;
+        let expect = PixelFormat::blend_channel(src.r, 0, alpha as u16, inv);
+
+        let mut checked = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                // 只检查圆盘内部
+                let dx = x as i64 - center.x as i64;
+                let dy = y as i64 - center.y as i64;
+                if dx * dx + dy * dy > (radius as i64) * (radius as i64) {
+                    continue;
+                }
+                let got = renderer.get_pixel(x, y).expect("圆内像素应可读").r;
+                assert_eq!(
+                    got, expect as u8,
+                    "像素 ({x},{y}) 的半透明圆被混合了多次：期望 {expect}，实际 {got}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "检查的像素过少，断言会失去意义");
+    }
+
+    /// 精确圆盘参考实现：逐像素判定 `dx² + dy² <= radius²`。
+    ///
+    /// 与被测实现完全独立的朴素写法，用作填充语义的基准。
+    fn reference_disk_pixels(
+        w: usize,
+        h: usize,
+        center: Pixel,
+        radius: usize,
+    ) -> Vec<(usize, usize)> {
+        let (cx, cy) = (center.x as i64, center.y as i64);
+        let r2 = (radius as i64) * (radius as i64);
+
+        let mut out = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (x as i64 - cx, y as i64 - cy);
+                if dx * dx + dy * dy <= r2 {
+                    out.push((x, y));
+                }
+            }
+        }
+        out
+    }
+
+    /// 精确圆盘边界参考实现：盘中且存在 4 邻域落在盘外的像素。
+    ///
+    /// 邻域判定用**纯圆方程**，不把帧缓冲外当作盘外——被测实现先算几何边界再
+    /// 裁剪，故屏幕边缘的像素不会因为"邻居在屏幕外"而被算成边界像素。
+    fn reference_disk_boundary(
+        w: usize,
+        h: usize,
+        center: Pixel,
+        radius: usize,
+    ) -> Vec<(usize, usize)> {
+        let (cx, cy) = (center.x as i64, center.y as i64);
+        let r2 = (radius as i64) * (radius as i64);
+        let inside = |x: i64, y: i64| {
+            let (dx, dy) = (x - cx, y - cy);
+            dx * dx + dy * dy <= r2
+        };
+
+        let mut out = Vec::new();
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let is_boundary = inside(x, y)
+                    && (!inside(x - 1, y)
+                        || !inside(x + 1, y)
+                        || !inside(x, y - 1)
+                        || !inside(x, y + 1));
+                if is_boundary {
+                    out.push((x as usize, y as usize));
+                }
+            }
+        }
+        out
+    }
+
+    /// 圆测试的多组场景 `(width, height, center_x, center_y)`：覆盖圆心居中、
+    /// 贴边、贴角与偶数尺寸，避免只在一个对称场景上通过。
+    const CIRCLE_SCENES: [(usize, usize, usize, usize); 4] =
+        [(9, 9, 4, 4), (11, 7, 2, 5), (8, 8, 0, 0), (13, 13, 6, 6)];
+
+    /// 在给定场景下渲染一次圆，返回被着色像素的集合（行优先序）。
+    fn render_circle_pixels(
+        scene: (usize, usize, usize, usize),
+        radius: usize,
+        kind: CircleKind,
+    ) -> Vec<(usize, usize)> {
+        let (w, h, cx, cy) = scene;
+        let color = Color::new(0x12, 0x34, 0x56);
+        let mut front = vec![0u8; w * h * BGR24_BYTES];
+        let mut renderer = Renderer::new(
+            FramebufferInfo::new(w, h, w * BGR24_BYTES, PixelFormat::Bgr24),
+            &mut front,
+        );
+
+        match kind {
+            CircleKind::Outline => renderer.draw_circle(Pixel::new(cx, cy), radius, &color),
+            CircleKind::Filled => renderer.fill_circle(Pixel::new(cx, cy), radius, color),
+        }
+
+        painted_set(renderer.buffer(), w, h)
+    }
+
+    /// `fill_circle` 必须逐像素等于精确圆盘 `dx² + dy² <= radius²`。
+    ///
+    /// 这是填充语义的基准：实现不再复用中点圆递推的八对称跨度（后者在极点
+    /// 附近会把 `cy ± radius` 画成一条宽横线，面积偏大）。
+    #[test]
+    fn fill_circle_matches_exact_disk_reference() {
+        let mut checked = 0usize;
+        for scene in CIRCLE_SCENES {
+            for radius in 1..=10usize {
+                let got = render_circle_pixels(scene, radius, CircleKind::Filled);
+                let expected =
+                    reference_disk_pixels(scene.0, scene.1, Pixel::new(scene.2, scene.3), radius);
+
+                checked += expected.len();
+                assert_eq!(
+                    got, expected,
+                    "场景 {scene:?} 半径 {radius} 的填充与精确圆盘不一致"
+                );
+            }
+        }
+        assert!(checked > 500, "参考圆盘覆盖的像素总数过少，断言会失去意义");
+    }
+
+    /// `draw_circle` 必须逐像素等于精确圆盘边界（盘中且有 4 邻域在盘外）。
+    ///
+    /// 该定义同时保证轮廓单像素宽、8-连通，且不会画到圆盘之外。
+    /// 半径大于场景尺寸时边界整个落在屏幕外，参考集与实测集**都**为空，
+    /// 故非平凡性由累计像素数把关。
+    #[test]
+    fn draw_circle_matches_exact_disk_boundary() {
+        let mut checked = 0usize;
+        for scene in CIRCLE_SCENES {
+            for radius in 1..=10usize {
+                let got = render_circle_pixels(scene, radius, CircleKind::Outline);
+                let expected =
+                    reference_disk_boundary(scene.0, scene.1, Pixel::new(scene.2, scene.3), radius);
+
+                checked += expected.len();
+                assert_eq!(
+                    got, expected,
+                    "场景 {scene:?} 半径 {radius} 的轮廓与精确圆盘边界不一致"
+                );
+            }
+        }
+        assert!(checked > 200, "参考边界覆盖的像素总数过少，断言会失去意义");
     }
 
     // ── draw_arc / fill_arc ──
@@ -2219,10 +2530,106 @@ mod tests {
         );
     }
 
+    /// 半透明 `fill_arc` 必须对**每个**像素只混合一次。
+    ///
+    /// 旧的逐轮归并只处理同一轮内的重合，跨轮重复（同一个 `y` 横跨多轮、半宽
+    /// 递增）会让边缘行被混合 2~5 次。上面的
+    /// `fill_arc_alpha_blends_into_background` 只检查圆心像素，恰好落在单轮归并
+    /// 覆盖的 `x == 0` 情形上，抓不到这一类。
+    #[test]
+    fn fill_arc_alpha_blends_once() {
+        let (w, h) = (41usize, 41usize);
+        let center = Pixel::new(20, 20);
+        let radius = 18usize;
+        let alpha = 128u8;
+        let src = Color::with_alpha(255, 255, 255, alpha);
+        let inv = 255 - alpha as u16;
+        let expect = PixelFormat::blend_channel(src.r, 0, alpha as u16, inv) as u8;
+
+        // 半径 18 的递推里 `y = 18` 横跨 5 轮、`y = 16` 横跨 2 轮，
+        // 正是跨轮重复的两个典型位置。
+        for (start, end) in [(0u32, 180u32), (0, 90), (350, 10)] {
+            let mut front = vec![0u8; w * h * BGR24_BYTES];
+            let mut renderer = Renderer::new(
+                FramebufferInfo::new(w, h, w * BGR24_BYTES, PixelFormat::Bgr24),
+                &mut front,
+            );
+            renderer.clear(Color::new(0, 0, 0));
+            renderer.fill_arc(
+                center,
+                radius,
+                Angle::from_degrees(start),
+                Angle::from_degrees(end),
+                src,
+            );
+
+            let mut painted = 0usize;
+            for y in 0..h {
+                for x in 0..w {
+                    let got = renderer.get_pixel(x, y).expect("像素应可读").r;
+                    if got == 0 {
+                        continue;
+                    }
+                    painted += 1;
+                    assert_eq!(
+                        got, expect,
+                        "扇形 {start}°..{end}° 的像素 ({x},{y}) 被混合了多次：期望 {expect}，实际 {got}"
+                    );
+                }
+            }
+            assert!(
+                painted > 10,
+                "扇形 {start}°..{end}° 覆盖像素过少，断言会失去意义"
+            );
+        }
+    }
+
+    /// 圆弧轮廓的像素必须是同参数扇形填充的子集。
+    ///
+    /// 两者共用同一条逐行半宽，这条断言守护"轮廓恰好落在填充的最外圈"，
+    /// 同时守住轮廓不会画到圆盘之外。
+    #[test]
+    fn draw_arc_pixels_are_subset_of_fill_arc() {
+        for (start, end) in [(0u32, 90u32), (0, 180), (0, 270), (350, 10), (45, 45)] {
+            let color = Color::new(0x12, 0x34, 0x56);
+            let outlined = render_arc(|r| {
+                r.draw_arc(
+                    Pixel::new(ARC_CX, ARC_CY),
+                    ARC_R,
+                    Angle::from_degrees(start),
+                    Angle::from_degrees(end),
+                    &color,
+                )
+            });
+            let filled = render_arc(|r| {
+                r.fill_arc(
+                    Pixel::new(ARC_CX, ARC_CY),
+                    ARC_R,
+                    Angle::from_degrees(start),
+                    Angle::from_degrees(end),
+                    color,
+                )
+            });
+
+            let outline_pixels = painted_set(&outlined, 21, 21);
+            let fill_pixels = painted_set(&filled, 21, 21);
+            assert!(
+                !outline_pixels.is_empty(),
+                "圆弧 {start}°..{end}° 未画出任何像素"
+            );
+            for pixel in &outline_pixels {
+                assert!(
+                    fill_pixels.contains(pixel),
+                    "圆弧 {start}°..{end}° 的像素 {pixel:?} 不在同参数扇形填充内"
+                );
+            }
+        }
+    }
+
     /// 超大半径必须被钳制，迭代量与半径无关，且结果与上界半径一致。
     ///
     /// 与 `circle_clamps_huge_radius` 同源，守护圆弧复用同一条钳制路径。
-    /// 基准半径取 `width + height`（即 `walk_circle_points` 的钳制上界），
+    /// 基准半径取 `width + height`（即 `disk_params` 的钳制上界），
     /// 取更小的值不会触发钳制，超大半径自然与它不同。
     #[test]
     fn arc_clamps_huge_radius() {
@@ -2242,7 +2649,8 @@ mod tests {
             "上界半径的扇形未覆盖任何像素，等价性断言会平凡通过"
         );
 
-        // `usize::MAX` 若未经钳制，`walk_circle_points` 会迭代约 7 亿次而挂死。
+        // `usize::MAX` 若未经钳制，`disk_params` 会算出天文数字的半径，
+        // 逐行半宽的收缩循环与 `O(radius)` 的迭代会把线程钉死。
         for huge in [1_000_000_000usize, usize::MAX] {
             let big = render_arc(|r| {
                 r.fill_arc(

@@ -7,7 +7,7 @@
 | 文件 | 行数 | 职责 | 扩展点 |
 |------|------|------|--------|
 | `lib.rs` | 111 | `#![no_std]`、feature 门控、文档首页 | 无 |
-| `core.rs` | 2835 | `Renderer` 与固定功能图元 | 新增图元 |
+| `core.rs` | 3267 | `Renderer` 与固定功能图元 | 新增图元 |
 | `angle.rs` | 642 | 定点 `Angle` + 楔形 `Wedge` | 改角度精度 / 三角实现 |
 | `programmable.rs` | 2145 | 2D 可编程管线 | 实现 `VertexShader` / `FragmentShader` / `Interpolate` |
 | `color.rs` | 977 | `Color`、`PixelFormat`、混合、SWAR 内核 | 新增像素格式 |
@@ -38,7 +38,10 @@
 |------|------|------|
 | `draw_line_internal` | `core.rs:831` | **唯一的 Bresenham 实现**。迭代区间收窄到 `[x_lo, x_hi]`（主轴可见范围），次轴在循环内校验上界。`draw_line` 与 `draw_line_unchecked` 都委托到这里 |
 | `interpolate_scan_x` | `core.rs:594` | Bresenham 递推的纯函数形式，便于单测独立验证 |
-| `walk_circle_points` | `core.rs:1083` | 中点圆递推。**在此钳制 `radius`**（见下），`draw_circle`/`fill_circle` 的共享入口 |
+| `disk_params` | `core.rs:1087` | 圆与圆弧共用的参数归一。**在此钳制 `radius`**（见下） |
+| `disk_half_at` | `core.rs:1113` | 精确圆盘第 `k` 行的半宽 `floor(sqrt(r² − k²))`，增量收缩求取，无浮点 |
+| `walk_disk_rows` | `core.rs:1132` | 逐行回调 `(cx, cy, k, half)`，**每行恰好一次**。`fill_circle`/`fill_arc` 的共享入口 |
+| `walk_disk_boundary` | `core.rs:1161` | 精确圆盘边界逐像素回调 `(px, py, dx, dy)`，**每像素恰好一次**。`draw_circle`/`draw_arc` 的共享入口 |
 | `fill_span_opaque` | `core.rs:459` | 不透明跨度。用 `get_unchecked_mut` 取整行切片后按 4 字节块写，安全性完全依赖调用方已裁剪 |
 | `fill_span_alpha` | `core.rs:503` | 半透明跨度。`bpp == 4 && row.align_offset(4) == 0` 才进 SWAR（判定在 `522`，调用在 `530`），否则逐像素。SWAR 路径独立成函数是为避免挤占不透明路径的代码布局 |
 | `fill_visible_horizontal_span` | `core.rs:563` | 自动裁剪到可见区域，裁剪完才下沉到 `fill_span_*` |
@@ -51,16 +54,16 @@
 
 ### 圆半径的钳制
 
-`walk_circle_points` 把 `radius` 钳到 `width + height`。上界的正确性来自：任意可见像素到圆心的距离不超过画布对角线，而 `sqrt(w² + h²) < w + h`。因此半径超过该上界时，屏幕外不画（由 `visit` 的边界检查丢弃），可见像素的着色结果不变，而迭代量从 `O(radius)` 降到 `O(width + height)`。
+`disk_params`（`core.rs:1087`）把 `radius` 钳到 `width + height`。上界的正确性来自：任意可见像素到圆心的距离不超过画布对角线，而 `sqrt(w² + h²) < w + h`。因此半径超过该上界时，屏幕外不画（由各图元自己的边界检查丢弃），可见像素的着色结果不变，而迭代量从 `O(radius)` 降到 `O(height)`——`walk_disk_rows` 的 `k` 上限是 `min(r, height)`，比旧中点圆递推的 `O(width + height)` 还紧一档。
 
-`FramebufferInfo::new` 只校验 `pitch`，不限制 `width`/`height`，故加法用 `saturating_add`；又因递推式 `d = 3 - 2 * radius` 要求 `2 * radius` 不溢出 `i64`，另有局部常量 `MAX_RADIUS = i64::MAX / 2` 兜底。半径转 `i64` 必须走 `sat_i64`——`as i64` 会把 `usize::MAX` 回绕成 −1，使 `while x <= y` 一次都不进。
+`FramebufferInfo::new` 只校验 `pitch`，不限制 `width`/`height`，故加法用 `saturating_add`；另有局部常量 `MAX_RADIUS = i64::MAX / 2` 兜底，它保证 `r²` 在 `u128` 内可表示。半径转 `i64` 必须走 `sat_i64`——`as i64` 会把 `usize::MAX` 回绕成 −1，一行都不画。
 
 **改此处必须让两条测试同时通过，它们各守一个方向：**
 
 | 测试 | 守护 |
 |------|------|
-| `circle_clamps_huge_radius` | 钳制**缺失**。半径表把 `1_000_000_000` 排在最前：无钳制时 `while x <= y` 迭代约 7 亿次，测试直接挂死 |
-| `circle_clamp_preserves_radii_within_limit` | 钳制**过度**。锚定半径 1/2/3 的实测填充像素数 5/15/16（4×4 屏、圆心 `(1,2)`），并比对全屏期望字节 |
+| `circle_clamps_huge_radius` | 钳制**缺失**。半径表把 `1_000_000_000` 排在最前：无钳制时迭代量随半径爆炸，测试直接挂死 |
+| `circle_clamp_preserves_radii_within_limit` | 钳制**过度**。锚定半径 1/2/3 的精确圆盘像素数 5/11/16（4×4 屏、圆心 `(1,2)`），并比对全屏期望字节 |
 
 两条都经过变异验证：拆掉 `.min(limit)` 会挂起，改成 `.min(limit).min(2)` 会让第二条报「半径 3 的填充像素数被钳制改变」。
 
@@ -158,21 +161,16 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 
 ## 测试分布
 
-单测写在文件内的 `#[cfg(test)]` 模块中，共 7 处：
+单测写在文件内的 `#[cfg(test)]` 模块中，共 6 处：
 
 | 位置 | 覆盖对象 |
 |------|----------|
-| `core.rs:1187` | `Renderer` 全部公开方法、`*_unchecked` 等价性、图元裁剪、迭代量上界、圆半径钳制双向、圆弧/扇形 |
-| `core.rs:2242` | `diff_probe` 差分探针，`#[ignore]`，人工比对用（见下） |
+| `core.rs:1463` | `Renderer` 全部公开方法、`*_unchecked` 等价性、图元裁剪、迭代量上界、圆半径钳制双向、精确圆盘/边界参考等价性、圆弧/扇形 |
 | `angle.rs:404` | `Angle` 定点三角（基准角精确、单位恒等式、往返）、`Wedge` 楔形判定（含大跨度与容差） |
 | `color.rs:875` | `Color` 构造/解析/混合、`PixelFormat::write_color`/`read_color` |
 | `color.rs:626` | **内嵌在 `mod swar` 内**，直接测 `blend_word` / `source_word` / `blend_span_alpha_4bpp` / `blend_masked_row_4bpp` |
 | `programmable.rs:1535` | 裁剪、插值、viewport/scissor、纹理采样、着色器 |
 | `framebuffer.rs:62` | `buffer_size` 派生与 `pitch` 下限断言 |
-
-`diff_probe`（`core.rs:2242`）默认 `#[ignore]`，它不是回归断言，而是跨实现比对工具：穷举 4 组尺寸 × 3 个圆心 × 13 个半径 × 2 种图元，把「非背景像素数 + FNV-1a 摘要」写进 `PROBE_OUT`（默认 `diff-probe.txt`）供人工 diff 两次实现的输出。触发方式：`PROBE_OUT=/tmp/a cargo test --lib diff_probe -- --ignored`。
-
-摘要刻意用 FNV-1a 手写实现而非 `DefaultHasher`——后者的摘要不保证跨 Rust 版本稳定，会让比对在工具链升级后静默失效。
 
 该模块需要 `extern crate alloc;` 与 `extern crate std;`：`#![no_std]` 下两者都不在 extern prelude，即使只在 `#[cfg(test)]` 里也必须显式引入。
 
