@@ -17,7 +17,7 @@
 //!
 //! # `no_std` 下的 trait 集合
 //!
-//! 本库是 `#![no_std]`，MSRV 1.79 早于 `core::error::Error`（1.81 稳定），
+//! 本库是 `#![no_std]`，且刻意不实现 `std::error::Error`（MSRV 早于其稳定版本），
 //! 因此所有错误类型仅实现 [`core::fmt::Debug`] + [`core::fmt::Display`]。
 //! 需要 `std::error::Error` 的调用方可在自有边界处自行补一个 impl 包装。
 //!

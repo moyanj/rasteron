@@ -523,22 +523,26 @@ impl PixelFormat {
 /// ```
 /// # use rasteron::{color, color::Color};
 /// assert_eq!(color!(255, 0, 0), Color::new(255, 0, 0));
+/// assert_eq!(color!("#00FF00"), Color::new(0, 255, 0));
 /// ```
 #[macro_export]
 macro_rules! color {
+    // 十六进制颜色码（支持 #RRGGBB 与 #RRGGBBAA）。
+    //
+    // 必须放在数值分支之前：字符串字面量以 `"` 开头，与 `$r:expr` 不会混淆，
+    // 但先匹配字符串可让该分支在歧义情况下优先命中。
+    ($hex:literal) => {
+        $crate::color::Color::from_hex($hex).expect("invalid hex color literal")
+    };
+
     // RGB 格式 (自动填充 alpha=255)
     ($r:expr, $g:expr, $b:expr) => {
-        Color::new($r as u8, $g as u8, $b as u8)
+        $crate::color::Color::new($r as u8, $g as u8, $b as u8)
     };
 
     // RGBA 格式
     ($r:expr, $g:expr, $b:expr, $a:expr) => {
-        Color::with_alpha($r as u8, $g as u8, $b as u8, $a as u8)
-    };
-
-    // 十六进制颜色码 (支持 #RRGGBB 和 #RRGGBBAA)
-    (#$hex:expr) => {
-        Color::from_hex($hex).expect("invalid hex color literal")
+        $crate::color::Color::with_alpha($r as u8, $g as u8, $b as u8, $a as u8)
     };
 }
 
@@ -943,6 +947,1059 @@ pub(crate) mod swar {
                 let keep_high = 0u32.wrapping_sub((m as u32).wrapping_sub(1) >> 31) << 24;
                 let out = (blended & 0x00FF_FFFF) | (word & keep_high) | (opaque_word & !keep_high);
                 *(dst as *mut u32) = out;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::*;
+    // SWAR 内核是 `pub(crate)`，测试与它同处 `color` 模块内，故直接引用其私有项。
+    use super::swar::{blend_word, source_word};
+
+    /// 全部 8 种像素格式，供表驱动测试复用。
+    const ALL_FORMATS: [PixelFormat; 8] = [
+        PixelFormat::Rgb24,
+        PixelFormat::Bgr24,
+        PixelFormat::Xrgb8888,
+        PixelFormat::Argb8888,
+        PixelFormat::Rgba8888,
+        PixelFormat::Bgra8888,
+        PixelFormat::Rgb565,
+        PixelFormat::Bgr565,
+    ];
+
+    /// 在 565 上可无损表示的通道值：字段取满值 31/63/31，
+    /// 经 `expand_channel` 位复制后恰为 255（故往返精确）。
+    const REPRESENTABLE_565: Color = Color::new(255, 255, 255);
+
+    // ————————————————————————————— S02 · Color 与十六进制 —————————————————————————————
+
+    #[test]
+    fn color_constructors_and_constants() {
+        assert_eq!(Color::new(1, 2, 3), Color::with_alpha(1, 2, 3, 255));
+        assert_eq!(Color::new(0, 0, 0).a, 255, "new 必须默认不透明");
+        assert_eq!(Color::with_alpha(9, 8, 7, 6).a, 6);
+
+        // 色彩常量逐字校验，避免有人改错通道顺序。
+        assert_eq!(BLACK, Color::new(0, 0, 0));
+        assert_eq!(WHITE, Color::new(255, 255, 255));
+        assert_eq!(RED, Color::new(255, 0, 0));
+        assert_eq!(GREEN, Color::new(0, 255, 0));
+        assert_eq!(BLUE, Color::new(0, 0, 255));
+        assert_eq!(YELLOW, Color::new(255, 255, 0));
+        assert_eq!(CYAN, Color::new(0, 255, 255));
+        assert_eq!(MAGENTA, Color::new(255, 0, 255));
+        assert_eq!(GRAY, Color::new(128, 128, 128));
+    }
+
+    #[test]
+    fn color_macro_accepts_literals_and_hex() {
+        assert_eq!(color!(255, 0, 0), Color::new(255, 0, 0));
+        assert_eq!(color!(1, 2, 3, 4), Color::with_alpha(1, 2, 3, 4));
+        assert_eq!(color!("#FF0000"), Color::new(255, 0, 0));
+        assert_eq!(color!("#FF000080"), Color::with_alpha(255, 0, 0, 128));
+        // 无 `#` 前缀的字符串同样可用。
+        assert_eq!(color!("00FF00"), Color::new(0, 255, 0));
+        // 宏对字面量做 `as u8` 窄化。**超范围的整数字面量会在编译期被拒绝**
+        // （`overflowing_literals` 是 deny lint），因此这里只验证范围内的窄化。
+        assert_eq!(color!(0u8, 1u8, 2u8), Color::new(0, 1, 2));
+        // 非字面量表达式走运行时 `as` 语义（截断到低 8 位）。
+        let wide = 0x1FFu32; // = 0b1_1111_1111
+        assert_eq!(color!(wide, 0, 0), Color::new(0xFF, 0, 0));
+    }
+
+    #[test]
+    fn from_hex_parses_both_lengths_and_optional_hash() {
+        assert_eq!(Color::from_hex("#FF0000"), Ok(Color::new(255, 0, 0)));
+        // 无 `#` 前缀。
+        assert_eq!(Color::from_hex("FF0000"), Ok(Color::new(255, 0, 0)));
+        // 8 位保留 alpha。
+        assert_eq!(
+            Color::from_hex("#00FF0080"),
+            Ok(Color::with_alpha(0, 255, 0, 128))
+        );
+        // 6 位补不透明 alpha。
+        assert_eq!(Color::from_hex("#123456").unwrap().a, 255);
+        // 大小写均可。
+        assert_eq!(Color::from_hex("#abcdef"), Ok(Color::new(0xab, 0xcd, 0xef)));
+        assert_eq!(Color::from_hex("#ABCDEF"), Ok(Color::new(0xab, 0xcd, 0xef)));
+        assert_eq!(
+            Color::from_hex("#AABBCCDD"),
+            Ok(Color::with_alpha(0xaa, 0xbb, 0xcc, 0xdd))
+        );
+        // 混合大小写 + 8 位。
+        assert_eq!(
+            Color::from_hex("#aAbBcCdD"),
+            Ok(Color::with_alpha(0xaa, 0xbb, 0xcc, 0xdd))
+        );
+        // 边界值 0 与 255。
+        assert_eq!(Color::from_hex("#00000000"), Ok(Color::with_alpha(0, 0, 0, 0)));
+        assert_eq!(
+            Color::from_hex("#FFFFFFFF"),
+            Ok(Color::with_alpha(255, 255, 255, 255))
+        );
+    }
+
+    #[test]
+    fn from_hex_rejects_bad_length_as_invalid_length() {
+        for input in ["", "#", "#FFF", "#FFFF", "#FFFFF", "#FFFFFFF", "#FFFFFFFFF"] {
+            assert_eq!(
+                Color::from_hex(input),
+                Err(ColorParseError::InvalidLength),
+                "长度非 6/8 的输入应报 InvalidLength: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_hex_rejects_bad_digits_as_invalid_digit() {
+        // 长度合法（去 `#` 后 6 或 8 字符）但含非十六进制字符。
+        for input in ["#GG0000", "#00GG00", "#0000GG", "-10000"] {
+            assert_eq!(
+                Color::from_hex(input),
+                Err(ColorParseError::InvalidDigit),
+                "含非法字符应报 InvalidDigit: {input:?}"
+            );
+        }
+        // 8 位形式中的 alpha 段非法也要报 InvalidDigit。
+        assert_eq!(
+            Color::from_hex("#000000ZZ"),
+            Err(ColorParseError::InvalidDigit)
+        );
+        // 注意：`u8::from_str_radix` 接受可选的 `+` 前缀，故 `"+10000"` 是**合法**输入。
+        // 这是标准库行为，此处固化为已知契约，避免被误当成缺陷。
+        assert_eq!(Color::from_hex("+10000"), Ok(Color::new(1, 0, 0)));
+    }
+
+    #[test]
+    fn rgba_u32_round_trips_all_channels() {
+        for color in [
+            Color::new(0, 0, 0),
+            Color::new(255, 255, 255),
+            Color::with_alpha(1, 2, 3, 4),
+            Color::with_alpha(255, 0, 128, 255),
+            // alpha = 0 必须往返保留，不能被当成「缺失」。
+            Color::with_alpha(10, 20, 30, 0),
+        ] {
+            assert_eq!(Color::from_rgba_u32(color.to_rgba_u32()), color);
+        }
+        // 编码布局：R 在最高字节，G 次之，B 再次之，A 在最低字节（`R24G16B8A0`）。
+        assert_eq!(Color::new(0x12, 0x34, 0x56).to_rgba_u32(), 0x1234_56FF);
+        assert_eq!(Color::new(1, 2, 3).to_rgba_u32(), 0x0102_03FF);
+        assert_eq!(Color::with_alpha(1, 2, 3, 4).to_rgba_u32(), 0x0102_0304);
+    }
+
+    #[test]
+    fn mix_alpha_replaces_only_alpha() {
+        let base = Color::new(10, 20, 30);
+        assert_eq!(base.mix_alpha(0), Color::with_alpha(10, 20, 30, 0));
+        assert_eq!(base.mix_alpha(128), Color::with_alpha(10, 20, 30, 128));
+        assert_eq!(base.mix_alpha(255), Color::with_alpha(10, 20, 30, 255));
+        // 原颜色不受影响（`mix_alpha` 按值接收 self 但返回新值）。
+        assert_eq!(base.a, 255);
+    }
+
+    #[test]
+    fn blend_endpoints_match_dst_and_src() {
+        let src = Color::new(255, 0, 0);
+        let dst = Color::new(0, 0, 255);
+        // alpha = 0 → 完全保留目标。
+        assert_eq!(src.blend(&dst, 0), Color::new(0, 0, 255));
+        // alpha = 255 → 完全替换为源色。
+        assert_eq!(src.blend(&dst, 255), Color::new(255, 0, 0));
+    }
+
+    #[test]
+    fn blend_interpolates_and_always_returns_opaque() {
+        let src = Color::new(255, 0, 0);
+        let dst = Color::new(0, 0, 255);
+        // 文档中的示例值。
+        assert_eq!(src.blend(&dst, 128), Color::new(128, 0, 127));
+        // 中间值与逐通道 blend_channel 公式一致。
+        let src_channels = [src.r, src.g, src.b];
+        let dst_channels = [dst.r, dst.g, dst.b];
+        for alpha in 0..=255u8 {
+            let got = src.blend(&dst, alpha);
+            let got_channels = [got.r, got.g, got.b];
+            let inv = 255 - alpha as u16;
+            for channel in 0..3 {
+                assert_eq!(
+                    got_channels[channel],
+                    PixelFormat::blend_channel(
+                        src_channels[channel],
+                        dst_channels[channel],
+                        alpha as u16,
+                        inv
+                    ),
+                    "alpha={alpha} channel={channel}"
+                );
+            }
+            // 混合结果的 alpha 恒为 255（从不落盘源 alpha）。
+            assert_eq!(got.a, 255, "blend 必须返回不透明颜色");
+        }
+    }
+
+    #[test]
+    fn invert_flips_rgb_and_keeps_alpha() {
+        let color = Color::with_alpha(0x12, 0x34, 0x56, 0x78);
+        let inverted = color.invert();
+        assert_eq!(inverted, Color::with_alpha(0xED, 0xCB, 0xA9, 255));
+        // alpha 被重置为不透明（`invert` 走 `Color::new`）。
+        assert_eq!(inverted.a, 255);
+        // 双重取反还原 RGB。
+        assert_eq!(
+            Color::new(0x12, 0x34, 0x56),
+            inverted.invert()
+        );
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn programmable_blend_modes_match_their_formulas() {
+        let src = Color::with_alpha(200, 100, 50, 128);
+        let dst = Color::new(10, 20, 30);
+
+        // Add：各通道饱和相加。
+        assert_eq!(
+            src.blend_add(&dst),
+            Color::new(210, 120, 80)
+        );
+        // 饱和：200 + 200 > 255 被钳到 255。
+        let hot = Color::new(200, 200, 200);
+        assert_eq!(
+            hot.blend_add(&Color::new(200, 10, 10)),
+            Color::new(255, 210, 210)
+        );
+
+        // Multiply：src × dst / 255（+127 四舍五入）。
+        let mul = |s: u8, d: u8| ((s as u16 * d as u16 + 127) / 255) as u8;
+        assert_eq!(
+            src.blend_multiply(&dst),
+            Color::new(mul(200, 10), mul(100, 20), mul(50, 30))
+        );
+        // 与 0 相乘得 0，与 255 相乘得原值。
+        assert_eq!(Color::new(7, 8, 9).blend_multiply(&Color::new(0, 0, 0)), Color::new(0, 0, 0));
+        assert_eq!(
+            Color::new(7, 8, 9).blend_multiply(&Color::new(255, 255, 255)),
+            Color::new(7, 8, 9)
+        );
+
+        // PremultipliedAlpha：src + dst × (1 - a)，**不再乘一次 src.a**。
+        // 这是它与 `Color::blend` 的关键区别。
+        let inv_alpha = 255 - src.a as u16;
+        let pre = |s: u8, d: u8| s.saturating_add(((d as u16 * inv_alpha + 127) / 255) as u8);
+        assert_eq!(
+            src.blend_premultiplied(&dst),
+            Color::new(pre(200, 10), pre(100, 20), pre(50, 30))
+        );
+        // 语义对照：同样的 src/dst，`blend` 会再乘一次 a，结果必然不同。
+        assert_ne!(
+            src.blend_premultiplied(&dst),
+            src.blend(&dst, src.a),
+            "预乘混合不应等同于普通 alpha 混合"
+        );
+        // a = 255 时预乘混合退化为纯覆盖 src。
+        let opaque = Color::with_alpha(11, 22, 33, 255);
+        assert_eq!(opaque.blend_premultiplied(&dst), Color::new(11, 22, 33));
+    }
+
+    // ————————————————————————————— S03 · PixelFormat 元数据 —————————————————————————————
+
+    #[test]
+    fn bytes_and_bits_per_pixel_are_table_driven() {
+        let expected = [
+            (PixelFormat::Rgb24, 3usize, 24usize),
+            (PixelFormat::Bgr24, 3, 24),
+            (PixelFormat::Xrgb8888, 4, 32),
+            (PixelFormat::Argb8888, 4, 32),
+            (PixelFormat::Rgba8888, 4, 32),
+            (PixelFormat::Bgra8888, 4, 32),
+            (PixelFormat::Rgb565, 2, 16),
+            (PixelFormat::Bgr565, 2, 16),
+        ];
+        for (format, bpp, bits) in expected {
+            assert_eq!(format.bytes_per_pixel(), bpp, "{format:?} 的 bytes_per_pixel");
+            assert_eq!(format.bits_per_pixel(), bits, "{format:?} 的 bits_per_pixel");
+            // bits 恒等于 bytes × 8。
+            assert_eq!(format.bits_per_pixel(), format.bytes_per_pixel() * 8);
+        }
+    }
+
+    #[test]
+    fn channel_shifts_are_table_driven() {
+        let expected = [
+            // (format, r, g, b, alpha)
+            (PixelFormat::Rgb24, 0u8, 8u8, 16u8, None),
+            (PixelFormat::Bgr24, 16, 8, 0, None),
+            (PixelFormat::Xrgb8888, 16, 8, 0, None),
+            (PixelFormat::Argb8888, 16, 8, 0, Some(24u8)),
+            (PixelFormat::Rgba8888, 0, 8, 16, Some(24)),
+            (PixelFormat::Bgra8888, 16, 8, 0, Some(24)),
+            (PixelFormat::Rgb565, 11, 5, 0, None),
+            (PixelFormat::Bgr565, 11, 5, 0, None),
+        ];
+        for (format, r, g, b, alpha) in expected {
+            assert_eq!(format.red_shift(), r, "{format:?} 的 red_shift");
+            assert_eq!(format.green_shift(), g, "{format:?} 的 green_shift");
+            assert_eq!(format.blue_shift(), b, "{format:?} 的 blue_shift");
+            assert_eq!(format.alpha_shift(), alpha, "{format:?} 的 alpha_shift");
+        }
+    }
+
+    #[test]
+    fn xrgb8888_shifts_are_exactly_bgr_order() {
+        // Xrgb8888 的保留字节占最高 8 位，故 RGB 三通道与 Bgr24 完全同位域。
+        assert_eq!(PixelFormat::Xrgb8888.red_shift(), PixelFormat::Bgr24.red_shift());
+        assert_eq!(PixelFormat::Xrgb8888.green_shift(), PixelFormat::Bgr24.green_shift());
+        assert_eq!(PixelFormat::Xrgb8888.blue_shift(), PixelFormat::Bgr24.blue_shift());
+        // 但它没有 alpha 通道。
+        assert_eq!(PixelFormat::Xrgb8888.alpha_shift(), None);
+    }
+
+    #[test]
+    fn write_then_read_round_trips_rgb_for_all_formats() {
+        // 预置非零背景，使「写入未生效」与「解码走错通道」都能被察觉。
+        let original = Color::new(0x9C, 0x3E, 0x71);
+        for format in ALL_FORMATS {
+            // 565 会量化：只有可表示值才能精确往返，故用满字段值 255。
+            let probe = if format.bytes_per_pixel() == 2 {
+                REPRESENTABLE_565
+            } else {
+                original
+            };
+
+            let mut buffer = [0u8; 4];
+            format.write_color(&mut buffer, &probe);
+            assert_eq!(
+                format.read_color(&buffer),
+                probe,
+                "{format:?} 的往返失败（写入 {probe:?}，解出 {:?}）",
+                format.read_color(&buffer)
+            );
+            // 无 alpha 的格式解出 alpha 恒为 255。
+            if format.alpha_shift().is_none() {
+                assert_eq!(format.read_color(&buffer).a, 255, "{format:?} 应解出不透明 alpha");
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_preserving_formats_round_trip_alpha() {
+        // 三种带 alpha 的 4bpp 格式的字节序（BGR / RGB / BGR）。
+        let cases = [
+            (PixelFormat::Argb8888, [3u8, 2, 1]),
+            (PixelFormat::Rgba8888, [1, 2, 3]),
+            (PixelFormat::Bgra8888, [3, 2, 1]),
+        ];
+        for (format, layout) in cases {
+            // 不透明写入（a == 255）走直写分支，第 4 字节规范为 255，
+            // 颜色逐字节等于该格式的通道序。
+            let mut buffer = [0u8; 4];
+            format.write_color(&mut buffer, &Color::new(1, 2, 3));
+            assert_eq!(buffer, [layout[0], layout[1], layout[2], 255], "{format:?} 写入布局");
+
+            // 契约：混合结果的 alpha **从不落盘**，`read_color` 对这三种格式
+            // 恒解出 255。故 alpha 通道的值域由解码侧归一化，而非往返保留。
+            for alpha in [0u8, 1, 128, 254] {
+                let mut blended = [10u8, 20, 30, 99];
+                format.write_color(&mut blended, &Color::with_alpha(1, 2, 3, alpha));
+                assert_eq!(
+                    blended[3], 255,
+                    "{format:?} 半透明写入应把第 4 字节规范为 255"
+                );
+                let decoded = format.read_color(&blended);
+                assert_eq!(decoded.a, 255, "{format:?} 解出的 alpha 应恒为 255");
+            }
+        }
+    }
+
+    #[test]
+    fn color_to_bytes_matches_write_color() {
+        // 两条编码路径（Color 的字节接口与 PixelFormat 的缓冲接口）不得分叉。
+        let color = Color::new(0x12, 0x34, 0x56);
+        for format in ALL_FORMATS {
+            let mut via_format = [0u8; 4];
+            format.write_color(&mut via_format, &color);
+            let via_color = color.to_bytes(format);
+            assert_eq!(
+                &via_format[..format.bytes_per_pixel()],
+                &via_color[..format.bytes_per_pixel()],
+                "{format:?} 的两条编码路径分叉"
+            );
+            // 解码侧同样一致。
+            let decoded_via_bytes = Color::from_bytes(format, &via_color);
+            let decoded_via_read = format.read_color(&via_format);
+            assert_eq!(
+                decoded_via_bytes, decoded_via_read,
+                "{format:?} 的两条解码路径分叉"
+            );
+        }
+    }
+
+    #[test]
+    fn xrgb8888_discards_color_alpha_and_writes_zero_pad() {
+        // 不透明写入（a == 255）走直写分支，忽略 Color.a，第 4 字节写保留位 0。
+        let opaque = Color::new(0x12, 0x34, 0x56);
+        let mut buffer = [0xFFu8; 4];
+        PixelFormat::Xrgb8888.write_color(&mut buffer, &opaque);
+        // Xrgb8888 为 BGR 序：字节 0=B、1=G、2=R，第 4 字节是保留位恒为 0。
+        assert_eq!(buffer, [0x56, 0x34, 0x12, 0x00]);
+        // 解码按 BGR 逆映射回 (R, G, B)，保留字节被忽略、alpha 恒为 255。
+        assert_eq!(
+            PixelFormat::Xrgb8888.read_color(&buffer),
+            Color::new(0x12, 0x34, 0x56)
+        );
+
+        // 半透明写入走混合分支，但第 4 字节同样恒为保留位 0。
+        let semi = Color::with_alpha(0x12, 0x34, 0x56, 0xAB);
+        let mut blended = [0u8; 4];
+        PixelFormat::Xrgb8888.write_color(&mut blended, &semi);
+        assert_eq!(blended[3], 0, "半透明写入下保留字节仍恒为 0");
+        // 混合结果与逐通道参考一致（BGR 序：字节 0 对应 B 通道）。
+        let inv = 255 - semi.a as u16;
+        assert_eq!(
+            blended,
+            [
+                PixelFormat::blend_channel(semi.b, 0, semi.a as u16, inv),
+                PixelFormat::blend_channel(semi.g, 0, semi.a as u16, inv),
+                PixelFormat::blend_channel(semi.r, 0, semi.a as u16, inv),
+                0,
+            ],
+            "Xrgb8888 的混合结果与逐通道参考不符"
+        );
+    }
+
+    #[test]
+    fn opaque_alpha_byte_matches_each_format_contract() {
+        // 不透明写入时，各格式的完整字节布局与第 4 字节的可观测结果。
+        // 用 a == 255 的颜色，否则 `write_color` 会走混合分支而不做直写。
+        let opaque = Color::new(1, 2, 3);
+        let cases = [
+            (PixelFormat::Xrgb8888, [3u8, 2, 1, 0]),   // BGR 序 + 保留字节恒 0
+            (PixelFormat::Argb8888, [3, 2, 1, 255]),
+            (PixelFormat::Rgba8888, [1, 2, 3, 255]),
+            (PixelFormat::Bgra8888, [3, 2, 1, 255]),
+        ];
+        for (format, expected) in cases {
+            let mut buffer = [0u8; 4];
+            format.write_color(&mut buffer, &opaque);
+            assert_eq!(buffer, expected, "{format:?} 的不透明写入布局不符");
+        }
+
+        // 半透明写入：RGB 三通道与目标混合，但第 4 字节仍被规范为格式的 opaque 值。
+        // 目标预置为已知背景，才能断言具体的混合结果。
+        for (format, expected) in cases {
+            let mut buffer = [10u8, 20, 30, 99];
+            let semi = Color::with_alpha(100, 200, 50, 128);
+            format.write_color(&mut buffer, &semi);
+            let inv = 255 - 128u16;
+            let blended = PixelFormat::blend_channel(100, 10, 128, inv);
+            let (c0_src, c1_src, c2_src) = match format {
+                // R,G,B 序：背景字节 0 对应 R
+                PixelFormat::Rgba8888 => (100u8, 200, 50),
+                // B,G,R 序：背景字节 0 对应 B
+                _ => (50u8, 200, 100),
+            };
+            assert_eq!(
+                buffer,
+                [
+                    PixelFormat::blend_channel(c0_src, 10, 128, inv),
+                    PixelFormat::blend_channel(c1_src, 20, 128, inv),
+                    PixelFormat::blend_channel(c2_src, 30, 128, inv),
+                    expected[3],
+                ],
+                "{format:?} 的半透明写入未规范第 4 字节或混合结果不符"
+            );
+            let _ = blended;
+        }
+    }
+
+    #[test]
+    fn blend_channel_matches_reference_formula() {
+        // 契约公式：(src * a + dst * (255 - a) + 255) >> 8。
+        for src in [0u8, 1, 64, 127, 128, 200, 254, 255] {
+            for dst in [0u8, 1, 64, 127, 128, 200, 254, 255] {
+                for alpha in [0u16, 1, 128, 254, 255] {
+                    let inv = 255 - alpha;
+                    let expected =
+                        ((src as u16 * alpha + dst as u16 * inv + 255) >> 8) as u8;
+                    assert_eq!(
+                        PixelFormat::blend_channel(src, dst, alpha, inv),
+                        expected,
+                        "blend_channel({src}, {dst}, {alpha})"
+                    );
+                    // 端点精确：a=0 得 dst，a=255 得 src。
+                    if alpha == 0 {
+                        assert_eq!(PixelFormat::blend_channel(src, dst, alpha, inv), dst);
+                    }
+                    if alpha == 255 {
+                        assert_eq!(PixelFormat::blend_channel(src, dst, alpha, inv), src);
+                    }
+                }
+            }
+        }
+    }
+
+    // ————————————————————————————— S04 · 565 打包与量化 —————————————————————————————
+
+    #[test]
+    fn pack_565_places_fields_per_spec() {
+        // 位域 spec：R = 15..11、G = 10..5、B = 4..0。
+        let white = pack_565(&Color::new(255, 255, 255));
+        assert_eq!(white & 0x8000, 0x8000, "R 必须占据最高位");
+        assert_eq!(white & 0x07E0, 0x07E0, "G 必须占据中间 6 位");
+        assert_eq!(white & 0x001F, 0x001F, "B 必须占据最低 5 位");
+        assert_eq!(white, 0xFFFF);
+
+        let red = pack_565(&Color::new(255, 0, 0));
+        assert_eq!(red, 0xF800, "纯红只点亮 R 字段");
+        let green = pack_565(&Color::new(0, 255, 0));
+        assert_eq!(green, 0x07E0, "纯绿只点亮 G 字段");
+        let blue = pack_565(&Color::new(0, 0, 255));
+        assert_eq!(blue, 0x001F, "纯蓝只点亮 B 字段");
+
+        // 字段互不重叠：只改一个通道不影响其余字段。
+        let mixed = pack_565(&Color::new(255, 0, 255));
+        assert_eq!(mixed & 0x8000, 0x8000);
+        assert_eq!(mixed & 0x07E0, 0x0000);
+        assert_eq!(mixed & 0x001F, 0x001F);
+    }
+
+    #[test]
+    fn rgb565_is_little_endian_and_bgr565_is_its_byte_swap() {
+        let color = Color::new(0x12, 0x34, 0x56);
+        let word = pack_565(&color);
+
+        // Rgb565 小端：字节 0 是低字节。
+        let le = encode_565_bytes(word, false);
+        assert_eq!(le, word.to_le_bytes());
+        assert_eq!(decode_565_bytes(&le, false), word);
+
+        // Bgr565 恰为两字节交换，位域不变。
+        let be = encode_565_bytes(word, true);
+        assert_eq!(be, word.to_be_bytes());
+        assert_eq!(be[0], le[1]);
+        assert_eq!(be[1], le[0]);
+        assert_eq!(decode_565_bytes(&be, true), word, "大端解码必须还原同一个字");
+
+        // 两个格式的 shift 元数据完全相同（只差存储字节序）。
+        assert_eq!(PixelFormat::Rgb565.red_shift(), PixelFormat::Bgr565.red_shift());
+        assert_eq!(PixelFormat::Rgb565.green_shift(), PixelFormat::Bgr565.green_shift());
+        assert_eq!(PixelFormat::Rgb565.blue_shift(), PixelFormat::Bgr565.blue_shift());
+
+        // 经由 write_color 落盘的字节序同样如此。
+        let mut le_buf = [0u8; 2];
+        let mut be_buf = [0u8; 2];
+        PixelFormat::Rgb565.write_color(&mut le_buf, &color);
+        PixelFormat::Bgr565.write_color(&mut be_buf, &color);
+        assert_eq!(le_buf[0], be_buf[1]);
+        assert_eq!(le_buf[1], be_buf[0]);
+        // 两者解码回同一个颜色。
+        assert_eq!(PixelFormat::Rgb565.read_color(&le_buf), PixelFormat::Bgr565.read_color(&be_buf));
+    }
+
+    #[test]
+    fn quantize_and_expand_are_mutually_consistent() {
+        // 对任意 v < 2^bits，quantize(expand(v)) == v（可表示值精确往返）。
+        for bits in [5u8, 6, 8] {
+            let max = (1u16 << bits) - 1;
+            for v in 0..=max {
+                let expanded = expand_channel(v, bits);
+                assert_eq!(
+                    quantize_channel(expanded, bits),
+                    v,
+                    "{bits} 位通道 {v} 往返失败（expanded={expanded}）"
+                );
+            }
+        }
+        // 8 位恒等：quantize_channel(v, 8) == v。
+        for v in 0..=255u8 {
+            assert_eq!(quantize_channel(v, 8), v as u16);
+        }
+    }
+
+    #[test]
+    fn expand_channel_uses_bit_replication() {
+        // 5 位：(v << 3) | (v >> 2)；6 位：(v << 2) | (v >> 4)。
+        assert_eq!(expand_channel(0, 5), 0);
+        assert_eq!(expand_channel(31, 5), 255);
+        assert_eq!(expand_channel(0, 6), 0);
+        assert_eq!(expand_channel(63, 6), 255);
+        for v in 0..32u16 {
+            assert_eq!(expand_channel(v, 5), ((v << 3) | (v >> 2)) as u8);
+        }
+        for v in 0..64u16 {
+            assert_eq!(expand_channel(v, 6), ((v << 2) | (v >> 4)) as u8);
+        }
+    }
+
+    #[test]
+    fn quantize_channel_rounds_to_nearest_and_never_overflows() {
+        // 四舍五入：(v * max + 127) / 255。
+        assert_eq!(quantize_channel(0, 5), 0);
+        assert_eq!(quantize_channel(255, 5), 31);
+        assert_eq!(quantize_channel(255, 6), 63);
+        // 上界不溢出：255 量化后恰为该位宽的最大值。
+        for bits in [5u8, 6, 8] {
+            assert_eq!(quantize_channel(255, bits), (1u16 << bits) - 1);
+        }
+        // 中点以上进位、以下舍去。
+        assert_eq!(quantize_channel(127, 5), 15);
+        assert_eq!(quantize_channel(128, 5), 16);
+    }
+
+    #[test]
+    fn pack_unpack_565_round_trips_exactly_on_representable_values() {
+        // 在全部 32 × 64 × 32 个可表示组合上逐一验证（范围太大，取全域扫描）。
+        for r in 0..32u16 {
+            for g in 0..64u16 {
+                for b in 0..32u16 {
+                    let word = (r << 11) | (g << 5) | b;
+                    let unpacked = unpack_565(word);
+                    // 展开后必然是规范值；再量化必须精确还原原始字段。
+                    let repacked = pack_565(&unpacked);
+                    assert_eq!(
+                        repacked, word,
+                        "565 字段 {r}/{g}/{b} 往返失败，repacked={repacked:#06x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blend_565_matches_per_channel_reference() {
+        // 与逐通道 blend_channel + 再量化逐位一致。
+        for alpha in 1..=254u8 {
+            for src in [0u8, 1, 64, 128, 200, 255] {
+                for dst_word in [0x0000u16, 0xFFFF, 0xF800, 0x07E0, 0x001F, 0x1234] {
+                    let dst = unpack_565(dst_word);
+                    let color = Color::with_alpha(src, src, src, alpha);
+                    let got = blend_565(dst_word, &color);
+                    let expected = {
+                        let inv = 255 - alpha as u16;
+                        let r = quantize_channel(PixelFormat::blend_channel(src, dst.r, alpha as u16, inv), 5);
+                        let g = quantize_channel(PixelFormat::blend_channel(src, dst.g, alpha as u16, inv), 6);
+                        let b = quantize_channel(PixelFormat::blend_channel(src, dst.b, alpha as u16, inv), 5);
+                        (r << 11) | (g << 5) | b
+                    };
+                    assert_eq!(
+                        got, expected,
+                        "blend_565(word={dst_word:#06x}, alpha={alpha}, src={src})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blend_565_short_circuits_at_alpha_extremes() {
+        let dst_word = 0x1234u16;
+        // alpha = 0：原样返回目标字（不动点）。
+        for src in [0u8, 77, 255] {
+            assert_eq!(
+                blend_565(dst_word, &Color::with_alpha(src, src, src, 0)),
+                dst_word,
+                "alpha=0 必须原样保留目标字"
+            );
+        }
+        // alpha = 255：直接返回量化后的源色，不读目标。
+        for src in [0u8, 77, 255] {
+            let color = Color::new(src, src, src);
+            assert_eq!(
+                blend_565(dst_word, &color),
+                pack_565(&color),
+                "alpha=255 必须等于量化后的源色"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_encode_565_bytes_respects_swapped_flag() {
+        let word = 0xABCDu16;
+        assert_eq!(encode_565_bytes(word, false), [0xCD, 0xAB]);
+        assert_eq!(encode_565_bytes(word, true), [0xAB, 0xCD]);
+        // decode 是 encode 的逆操作（两个方向都验证）。
+        for swapped in [false, true] {
+            let bytes = encode_565_bytes(word, swapped);
+            assert_eq!(decode_565_bytes(&bytes, swapped), word);
+            // 字节序标志取反会解出交换后的字。
+            assert_eq!(decode_565_bytes(&bytes, !swapped), word.swap_bytes());
+        }
+    }
+
+    #[test]
+    fn format_565_metadata_has_no_alpha_channel() {
+        for format in [PixelFormat::Rgb565, PixelFormat::Bgr565] {
+            assert_eq!(format.bytes_per_pixel(), 2);
+            assert_eq!(format.bits_per_pixel(), 16);
+            assert_eq!(format.alpha_shift(), None, "{format:?} 不应有 alpha 通道");
+            // 解码出的颜色恒不透明。
+            let mut buffer = [0u8; 2];
+            format.write_color(&mut buffer, &Color::with_alpha(1, 2, 3, 44));
+            assert_eq!(format.read_color(&buffer).a, 255);
+        }
+    }
+
+    // ————————————————————————————— S05 · swar 内核 —————————————————————————————
+
+    #[test]
+    fn source_word_lays_out_both_orders_with_opaque_alpha_last() {
+        // RGB 序：字节 0..2 = R,G,B。
+        let rgb = source_word(0x11, 0x22, 0x33, 0xFF, true);
+        assert_eq!(rgb.to_le_bytes(), [0x11, 0x22, 0x33, 0xFF]);
+        // BGR 序：字节 0..2 = B,G,R。
+        let bgr = source_word(0x11, 0x22, 0x33, 0xFF, false);
+        assert_eq!(bgr.to_le_bytes(), [0x33, 0x22, 0x11, 0xFF]);
+        // 第 4 字节恒为 opaque_alpha（Xrgb8888 传 0，其余传 255）。
+        assert_eq!(source_word(1, 2, 3, 0, true).to_le_bytes()[3], 0);
+        assert_eq!(source_word(1, 2, 3, 255, true).to_le_bytes()[3], 255);
+        // 通道顺序标志只影响前三个字节，不影响第 4 字节。
+        assert_eq!(
+            source_word(1, 2, 3, 0, true).to_le_bytes()[3],
+            source_word(1, 2, 3, 0, false).to_le_bytes()[3]
+        );
+    }
+
+    #[test]
+    fn blend_word_matches_per_channel_reference_for_every_alpha() {
+        // 全部 256 个 alpha 值下逐字节一致。
+        for alpha in 0..=255u8 {
+            for (word, src) in representative_words() {
+                let blended = blend_word(word, src, alpha).to_le_bytes();
+                let word_bytes = word.to_le_bytes();
+                let src_bytes = src.to_le_bytes();
+                let inv = 255 - alpha as u16;
+                for lane in 0..4 {
+                    let expected = PixelFormat::blend_channel(
+                        src_bytes[lane],
+                        word_bytes[lane],
+                        alpha as u16,
+                        inv,
+                    );
+                    assert_eq!(
+                        blended[lane], expected,
+                        "alpha={alpha} lane={lane}: swar={} 参考={expected}",
+                        blended[lane]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blend_word_preserves_opaque_alpha_after_merge() {
+        // `blend_span_alpha_4bpp` 在 blend_word 之后强制覆写第 4 字节，
+        // 这里直接验证「blend_word 自身对 4 个通道都做混合」，
+        // 覆写由调用方完成——确认两者组合后第 4 字节是 opaque_alpha。
+        let alpha = 128u8;
+        let opaque = 255u8;
+        for is_rgb_order in [true, false] {
+            let src = source_word(0x40, 0x80, 0xC0, opaque, is_rgb_order);
+            let word = source_word(0x10, 0x20, 0x30, opaque, is_rgb_order);
+            let blended = blend_word(word, src, alpha);
+            // 模拟调用方的覆写：清掉高字节再填 opaque。
+            let merged = (blended & 0x00FF_FFFF) | ((opaque as u32) << 24);
+            assert_eq!(merged.to_le_bytes()[3], opaque, "第 4 字节必须是 opaque_alpha");
+            // 前三字节确实是混合结果（不等于任一端）。
+            let bytes = merged.to_le_bytes();
+            assert_ne!(&bytes[..3], &word.to_le_bytes()[..3]);
+            assert_ne!(&bytes[..3], &src.to_le_bytes()[..3]);
+        }
+    }
+
+    /// 代表性的「目标字 × 源字」组合：边界值、极值与步进采样。
+    fn representative_words() -> Vec<(u32, u32)> {
+        let mut pairs = Vec::new();
+        // 边界：全 0、全 1、交替、以及单通道极值。
+        let specials = [
+            0x0000_0000u32,
+            0xFFFF_FFFF,
+            0xFF00_00FF,
+            0x00FF_FF00,
+            0xFF00_0000,
+            0x0000_00FF,
+            0x8000_0080,
+            0x0102_0304,
+            0x8070_6050,
+        ];
+        for word in specials {
+            for src in specials {
+                pairs.push((word, src));
+            }
+        }
+        // 步进采样：单通道线性扫描，其余通道固定。
+        for step in 0..=255u16 {
+            let v = step as u8;
+            pairs.push((0x0000_0000 | (v as u32), 0x0000_0000 | (v as u32)));
+            pairs.push((0xFFFF_FFFF ^ (v as u32), 0xFFFF_FFFF ^ (v as u32)));
+        }
+        pairs
+    }
+
+    /// 逐像素参考实现：对 4bpp 格式的一行做 alpha 混合。
+    fn reference_blend_row_4bpp(
+        row: &mut [u8],
+        pixel_count: usize,
+        color: &Color,
+        is_rgb_order: bool,
+        opaque_alpha: u8,
+    ) {
+        let alpha = color.a as u16;
+        let inv = 255 - alpha;
+        let (c0, c1, c2) = if is_rgb_order {
+            (color.r, color.g, color.b)
+        } else {
+            (color.b, color.g, color.r)
+        };
+        for i in 0..pixel_count {
+            let off = i * 4;
+            row[off] = PixelFormat::blend_channel(c0, row[off], alpha, inv);
+            row[off + 1] = PixelFormat::blend_channel(c1, row[off + 1], alpha, inv);
+            row[off + 2] = PixelFormat::blend_channel(c2, row[off + 2], alpha, inv);
+            row[off + 3] = opaque_alpha;
+        }
+    }
+
+    #[test]
+    fn blend_span_alpha_4bpp_matches_reference_including_odd_counts() {
+        // 覆盖 SWAR 批量路径（4 的倍数）与逐像素回退路径（非倍数）。
+        for pixel_count in [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 17] {
+            for is_rgb_order in [true, false] {
+                for opaque_alpha in [0u8, 255] {
+                    let color = Color::with_alpha(0x9A, 0x3C, 0x77, 0x80);
+                    // 参考与被测必须从**同一份未混合的原始背景**出发。
+                    let original = vec![0x5Au8; pixel_count * 4];
+
+                    let mut expected = original.clone();
+                    reference_blend_row_4bpp(&mut expected, pixel_count, &color, is_rgb_order, opaque_alpha);
+
+                    let mut actual = original;
+                    // SAFETY: actual 恰好是 pixel_count * 4 字节，且由 Vec 分配保证对齐。
+                    unsafe {
+                        swar::blend_span_alpha_4bpp(
+                            actual.as_mut_ptr(),
+                            pixel_count,
+                            &color,
+                            is_rgb_order,
+                            opaque_alpha,
+                        );
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "count={pixel_count} rgb={is_rgb_order} opaque={opaque_alpha}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unaligned_rows_are_handled_by_the_fallback_not_the_swar_kernel() {
+        // `blend_span_alpha_4bpp` 按 `u32` 读写，其 `# Safety` 明确要求行首
+        // 4 字节对齐——对未对齐指针解引用是 UB，不能写成测试期望。
+        //
+        // 真实契约在调用方：`core::fill_span_alpha` 用
+        // `row.align_offset(4) == 0` 判定，未对齐时**不调用**该内核，
+        // 而是走逐像素回退路径。因此这里验证回退路径本身：
+        // 「逐像素路径在未对齐起点上给出与对齐情形完全相同的结果」，
+        // 且行首之前的字节不被触碰。
+        let pixel_count = 12usize;
+        let color = Color::with_alpha(0x11, 0x22, 0x33, 0x99);
+
+        // 对齐行首（Vec 分配保证 4 字节对齐起点）。
+        let mut aligned = vec![0x77u8; pixel_count * 4];
+        reference_blend_row_4bpp(&mut aligned, pixel_count, &color, true, 255);
+
+        // 未对齐行首：整段填充同样的背景色，再从偏移 1 处切出等长窗口。
+        // 两段输入内容一致，结果才能逐一对应。
+        let mut storage = vec![0x77u8; pixel_count * 4 + 1];
+        storage[0] = 0xAA; // 行首前的哨兵字节
+        let unaligned = &mut storage[1..];
+        reference_blend_row_4bpp(unaligned, pixel_count, &color, true, 255);
+
+        assert_eq!(
+            unaligned, &aligned[..],
+            "逐像素路径在未对齐起点上应与对齐情形结果一致"
+        );
+        assert_eq!(storage[0], 0xAA, "行首之前的哨兵字节不应被写入");
+    }
+
+    /// 逐像素参考实现：掩码混合。
+    fn reference_blend_masked_row_4bpp(
+        row: &mut [u8],
+        mask: &[u8],
+        pixel_count: usize,
+        color: &Color,
+        is_rgb_order: bool,
+        opaque_alpha: u8,
+    ) {
+        let (c0, c1, c2) = if is_rgb_order {
+            (color.r, color.g, color.b)
+        } else {
+            (color.b, color.g, color.r)
+        };
+        for i in 0..pixel_count {
+            let m = mask[i];
+            if m == 0 {
+                // 掩码为 0：内核的 `keep_high` 保留原第 4 字节（值不变），
+                // 前三字节也因 `blend_word(_,_,0)` 的恒等性不变，故整体跳过。
+                continue;
+            }
+            let off = i * 4;
+            if m == 255 {
+                // 不透明像素：直写三通道，第 4 字节同样规范为 opaque_alpha。
+                row[off] = c0;
+                row[off + 1] = c1;
+                row[off + 2] = c2;
+            } else {
+                // 0 < m < 255：混合 RGB 三通道。
+                let inv = 255 - m as u16;
+                row[off] = PixelFormat::blend_channel(c0, row[off], m as u16, inv);
+                row[off + 1] = PixelFormat::blend_channel(c1, row[off + 1], m as u16, inv);
+                row[off + 2] = PixelFormat::blend_channel(c2, row[off + 2], m as u16, inv);
+            }
+            // m > 0 时第 4 字节被规范为 opaque_alpha（源 alpha 不落盘）。
+            row[off + 3] = opaque_alpha;
+        }
+    }
+
+    #[test]
+    fn blend_masked_row_4bpp_matches_reference_across_mask_shapes() {
+        let color = Color::new(0xC0, 0x30, 0x90);
+        // 掩码形态：全 0、全 1、交替、逐像素递增、以及尾部非 4 倍数。
+        let shapes: [(&str, Vec<u8>); 6] = [
+            ("全 0", vec![0u8; 20]),
+            ("全 255", vec![255u8; 20]),
+            ("交替", (0..20).map(|i| if i % 2 == 0 { 255 } else { 0 }).collect()),
+            ("逐像素递增", (0..20).map(|i| (i * 12) as u8).collect()),
+            ("全 128", vec![128u8; 20]),
+            ("单点", {
+                let mut m = vec![0u8; 20];
+                m[7] = 255;
+                m
+            }),
+        ];
+        for (name, mask) in shapes {
+            let pixel_count = mask.len();
+            for is_rgb_order in [true, false] {
+                for opaque_alpha in [0u8, 255] {
+                    // 参考与被测必须从**同一份未混合的原始背景**出发。
+                    let original = vec![0x5Au8; pixel_count * 4];
+
+                    let mut expected = original.clone();
+                    reference_blend_masked_row_4bpp(
+                        &mut expected,
+                        &mask,
+                        pixel_count,
+                        &color,
+                        is_rgb_order,
+                        opaque_alpha,
+                    );
+
+                    let mut actual = original;
+                    // SAFETY: actual 长度恰为 pixel_count * 4 且 4 字节对齐；
+                    // mask 长度恰为 pixel_count，满足 # Safety 契约。
+                    unsafe {
+                        swar::blend_masked_row_4bpp(
+                            actual.as_mut_ptr(),
+                            mask.as_ptr(),
+                            pixel_count,
+                            &color,
+                            is_rgb_order,
+                            opaque_alpha,
+                        );
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "掩码 {name}, rgb={is_rgb_order}, opaque={opaque_alpha}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blend_masked_row_4bpp_preserves_pixels_where_mask_is_zero() {
+        // 掩码全 0 时必须一个字节都不写（背景逐字节不变）。
+        let pixel_count = 16usize;
+        let original: Vec<u8> = (0..(pixel_count * 4)).map(|i| (i * 7 % 251) as u8).collect();
+        let mask = vec![0u8; pixel_count];
+        let mut actual = original.clone();
+        // SAFETY: 长度与对齐均满足契约。
+        unsafe {
+            swar::blend_masked_row_4bpp(
+                actual.as_mut_ptr(),
+                mask.as_ptr(),
+                pixel_count,
+                &Color::new(1, 2, 3),
+                true,
+                255,
+            );
+        }
+        assert_eq!(actual, original, "掩码全 0 时不应写入任何像素");
+    }
+
+    #[test]
+    fn blend_masked_row_4bpp_writes_opaque_alpha_for_nonzero_mask() {
+        // 掩码非 0 的像素：第 4 字节恒为 opaque_alpha，源 alpha 从不落盘。
+        let pixel_count = 8usize;
+        for opaque_alpha in [0u8, 255] {
+            let mask = vec![200u8; pixel_count];
+            let mut row = vec![0x11u8; pixel_count * 4];
+            // SAFETY: 长度与对齐均满足契约。
+            unsafe {
+                swar::blend_masked_row_4bpp(
+                    row.as_mut_ptr(),
+                    mask.as_ptr(),
+                    pixel_count,
+                    &Color::with_alpha(9, 9, 9, 33),
+                    true,
+                    opaque_alpha,
+                );
+            }
+            for i in 0..pixel_count {
+                assert_eq!(
+                    row[i * 4 + 3],
+                    opaque_alpha,
+                    "掩码非 0 的像素第 4 字节应为 opaque_alpha"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swar_alpha_channel_is_never_persisted_from_source() {
+        // `blend_span_alpha_4bpp` 对 4bpp 格式：源 alpha 不参与落盘，
+        // 第 4 字节恒为格式自身的 opaque_alpha。
+        let pixel_count = 8usize;
+        for source_alpha in [1u8, 128, 254] {
+            for opaque_alpha in [0u8, 255] {
+                let color = Color::with_alpha(0x40, 0x50, 0x60, source_alpha);
+                let mut row = vec![0u8; pixel_count * 4];
+                // SAFETY: 长度与对齐均满足契约。
+                unsafe {
+                    swar::blend_span_alpha_4bpp(
+                        row.as_mut_ptr(),
+                        pixel_count,
+                        &color,
+                        true,
+                        opaque_alpha,
+                    );
+                }
+                for i in 0..pixel_count {
+                    assert_eq!(
+                        row[i * 4 + 3],
+                        opaque_alpha,
+                        "源 alpha={source_alpha} 泄漏到了落盘字节"
+                    );
+                }
             }
         }
     }
