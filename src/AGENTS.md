@@ -1,18 +1,21 @@
 # src/ 库本体
 
-`no_std` 实现，唯一有业务逻辑的目录。无子目录，全部平铺在 `src/` 下。
+`no_std` 实现，唯一有业务逻辑的目录。`programmable/` 是唯一子目录（管线阶段与顶点缓存），其余文件平铺在 `src/` 下。
 
 ## 文件职责
 
 | 文件 | 行数 | 职责 | 扩展点 |
 |------|------|------|--------|
-| `lib.rs` | 111 | `#![no_std]`、feature 门控、文档首页 | 无 |
-| `core.rs` | 3267 | `Renderer` 与固定功能图元 | 新增图元 |
-| `angle.rs` | 642 | 定点 `Angle` + 楔形 `Wedge` | 改角度精度 / 三角实现 |
-| `programmable.rs` | 2145 | 2D 可编程管线 | 实现 `VertexShader` / `FragmentShader` / `Interpolate` |
-| `color.rs` | 977 | `Color`、`PixelFormat`、混合、SWAR 内核 | 新增像素格式 |
+| `lib.rs` | 129 | `#![no_std]`、feature 门控、文档首页 | 无 |
+| `core.rs` | 3846 | `Renderer` 与固定功能图元 | 新增图元 |
+| `angle.rs` | 630 | 定点 `Angle` + 楔形 `Wedge` | 改角度精度 / 三角实现 |
+| `programmable/mod.rs` | 892 | 图元装配与光栅化、`draw_arrays` / `draw_indexed` | 新增图元类型 |
+| `programmable/shader.rs` | 34 | 内建透传顶点着色器 `Passthrough2D` | 新增内建着色器 |
+| `programmable/cache.rs` | 252 | 顶点缓存：借用调用方槽位的 `VertexCache` | 新增缓存策略 |
+| `color.rs` | 1517 | `Color`、`PixelFormat`、混合、SWAR 内核 | 新增像素格式 |
+| `error.rs` | 213 | 全库错误类型的唯一定义处 | 新增错误类别 |
 | `simd.rs` | 211 | 分派 memcpy | 扩指令阶梯 |
-| `utils.rs` | 176 | 裁剪、饱和转换、模式填充 | 无（私有） |
+| `utils.rs` | 458 | 裁剪、饱和转换、模式填充、视口变换 | 无（多为私有） |
 | `framebuffer.rs` | 80 | 布局描述与不变量断言 | 无 |
 | `pixel.rs` | 49 | 坐标类型与宏 | 无 |
 | `main.rs` | 39 | 演示二进制，非库的一部分 | 无 |
@@ -124,24 +127,44 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 圆心（零向量）在 `Wedge::contains` 中恒判为**在区间内**——它是任何扇形的一部分。
 `fill_arc` 与 `draw_arc` 都靠这一条保证圆心像素不被漏掉。
 
-## programmable.rs 管线
+## programmable/ 管线
 
 四阶段顺序固定，坐标空间每阶段都不同：
 
 | 阶段 | 输入 → 输出 | 坐标空间 |
 |------|-------------|----------|
-| 顶点着色 | `VS::Input` → `ProgramVertex` | normalized `[0,1]²` |
-| 图元裁剪 | 半平面裁剪 | normalized `[0,1]²`，保证顶点全部落在内部 |
-| 视口变换 | `ndc_to_screen` | viewport 内浮点像素 |
-| 光栅化 + 片元着色 | 重心权重插值 → `shade_fragment` → `BlendMode` 写入 | 屏幕像素 |
+| 顶点着色 | `VS::Input` → `FragmentInput`（即 `Vertex2D`） | normalized `[0,1]²` |
+| 视口变换 | [`utils::normalized_to_screen`] | viewport 内浮点像素 |
+| 图元裁剪 | 点二值判定 / 线段参数域裁剪 / 三角形 bbox 求交 | 屏幕像素（`Bounds`） |
+| 光栅化 + 片元着色 | 重心权重插值 → `shade_fragment` → `BlendMode` 写入 | 光栅化按屏幕像素定位；回传给 `shade_fragment` 的 `FragmentInput.position` 仍是 normalized `[0,1]²` |
 
-裁剪上界：`MAX_CLIP_VERTICES = 8`（`programmable.rs:45`），四个半平面各切一刀，3 顶点凸多边形最多长到 7。改裁剪逻辑时不得让中间顶点数组溢出这个常量。
+**裁剪统一收敛到 `Bounds`**（`programmable/mod.rs:286`）：帧缓冲 ∩ viewport ∩ scissor 由 `visible_bounds`（`mod.rs:453`）在装配前算一次，为空则整次绘制调用直接成功返回，连顶点着色都不执行。三种图元各用各的裁剪手段，**没有多边形半平面裁剪**：
 
-插值契约（`programmable.rs:127`）：`Interpolate` 实现必须满足 `interpolate(a, a, a, ..) == a`，否则同一片元在不同顶点顺序下结果不同。`lerp` 由 `interpolate` 默认提供，自定义类型只实现一个方法即可。
+| 图元 | 手段 | 位置 |
+|------|------|------|
+| 点 | `Bounds::contains_normalized` 二值判定。必须在浮点域做——先 `as usize` 会让负坐标饱和成 `0` 而误通过下界检查 | `rasterize_point`（`mod.rs:512`） |
+| 线段 | `Bounds::clip_segment_t` 参数域裁剪（Liang–Barsky），只对可见子线段步进 | `rasterize_line`（`mod.rs:541`） |
+| 三角形 | bbox 与 `bound` 求交后逐像素边函数判定，不做几何裁剪 | `rasterize_triangle`（`mod.rs:605`） |
 
-`FragmentInput.position` 是**相对 viewport 原点**的 `[x+0.5, y+0.5]`，viewport 不在 `(0,0)` 时它不等于帧缓冲绝对坐标。着色器里要写绝对像素必须自己加 viewport 原点。
+迭代量因此只取决于 `bound` 尺寸，与端点/顶点坐标解耦（线段 `steps` 的上界另有 `debug_assert!` 兜底）。三角形的有符号面积取 `edge(v1, v2, v0)` **单项**——三项相加会把面积放大 3 倍，使权重和退化成 `1/3`，插值结果被整体缩小。
 
-`draw_indexed` 用 `alloc::vec![None; n]` 做惰性着色缓存，索引越界返回 `None` 并静默跳过该图元。这是本模块链接 `alloc` 的唯一原因。
+插值契约（`programmable/mod.rs:34`）：`Interpolate` 实现必须满足 `interpolate(a, a, a, ..) == a`，否则同一片元在不同顶点顺序下结果不同。`lerp` 由 `interpolate` 默认提供，自定义类型只实现一个方法即可。
+
+`FragmentInput.position` 是 **normalized `[0,1]` viewport 坐标**，与顶点着色器输出的 `position` 同处一个坐标系（`[0,0]` 为 viewport 左上角，Y 轴向下），**不是**帧缓冲绝对像素坐标。光栅化内部按屏幕像素定位，但交给 `shade_fragment` 的 `position` 仍是归一化值。着色器里要写绝对像素必须自己调 `utils::normalized_to_screen`。
+
+注意归一化距离只在**正方形 viewport** 下各向同性；viewport 非正方形时 x/y 缩放比不同，着色器里做径向判定会退化成椭圆。
+
+**混合落点**：`Renderer::write_fragment_color`（`programmable/mod.rs:477`）是唯一的混合分派点，公式下沉在 `color.rs`。`BlendMode::None` 与 `Alpha` **直接委托** `Renderer::set_pixel_unchecked`（字节层权威，`core.rs`）——`None` 先调 `mix_alpha(255)` 绕开 `a == 0` 短路，否则 `None` 会退化成空操作；`Add` / `Multiply` / `PremultipliedAlpha` 先读目标像素，再走 `color.rs` 的纯函数 `BlendMode::blend` 落盘。管线因此与固定功能共用同一条写入路径，**565 在管线上自动可用**（`core.rs` 的 `set_pixel_unchecked` 已含 `bpp == 2` 分支）。
+
+**取整由各图元自负**：`write_fragment_color` 只收整数像素坐标。点用向零取整（`floor_to_usize`），线段用四舍五入（`floor_to_usize(v + 0.5)`），三角形在 bbox 内整数扫描——三者不可互换，故取整不能收进写入层，否则线段覆盖会被静默改变。
+
+`draw_indexed` 的第 5 参是 `Option<&mut VertexCache<'_, VS::Varying>>`。`None` = 每次重新着色；`Some(cache)` = 按顶点索引惰性复用，`cache.len()` 短于顶点数时退化为部分缓存（高索引每次重新着色），越界不 panic。缓存自身不分配：`VertexCache`（`programmable/cache.rs`）借用调用方槽位，`no_std` 下可用。`VertexShader::shade_vertex` 必须是纯函数，否则命中与未命中的结果会不一致。
+
+**索引校验先于任何绘制**：越界返回 `DrawError::IndexOutOfBounds`，且整次调用不产生任何片元——半途报错会在帧缓冲里留下「画了一半」的残留。尾部不足一个完整图元的索引（`Lines` 余 1、`Triangles` 余 1/2）静默丢弃。
+
+`draw_arrays` 与 `draw_indexed` 共用私有的 `assemble_primitives`：闭包 `resolve(slot) -> FragmentInput` 把**装配位置**映射到顶点着色结果（前者传顶点下标，后者传索引缓冲查表），装配与光栅化逻辑因此只有一份，两条 API 的像素覆盖逐位一致。**该等价性当前没有测试守护**——旧 `programmable.rs` 的测试在重写时被整体删除，待补（见「测试分布」）。
+
+**不要用「线段端点反序应当翻转渐变」验证索引是否生效**。`Interpolate::lerp(a, b, t)` 逐通道恒等于 `lerp(b, a, 1 - t)`，而端点反序后落在同一像素的步进参数恰为 `1 - t`，两者相乘抵消——**任何两顶点线段反转索引后逐像素完全相同**，这是数学恒等式而非实现缺陷，该断言恒不成立。验证索引生效要用「换顶点子集」的顶点缓冲，或用三角形换索引（三角形反转顺序同样不可观测：重心权重跟随各自顶点）。
 
 ## color.rs
 
@@ -176,11 +199,15 @@ shift 的语义是「**位**位移」：对 6 种 8 位通道格式恰好等于�
 `core.rs` 侧另有 `load_565` / `store_565` 两个 `unsafe fn`：**逐字节**读写，不假设 `u16` 对齐
 （`pitch` 允许为奇数，行首可能落在奇地址）。565 没有 SWAR 路径。
 
-`pub(crate) mod swar`（`color.rs:432`）只服务 4bpp；放在这里是因为它要复用 `PixelFormat` 的 shift 与 alpha 语义。
+`pub(crate) mod swar`（`color.rs:682`）只服务 4bpp；放在这里是因为它要复用 `PixelFormat` 的 shift 与 alpha 语义。
 
-`blend_channel`（`color.rs:207`）用 `(src*a + dst*ia + 255) >> 8` 近似 `/255`，误差 ≤ 1。SWAR 内核必须复现这个近似而非改用精确除法；565 的 `blend_565` 同样复用它。
+`blend_channel`（`color.rs:304`）用 `(src*a + dst*ia + 255) >> 8` 近似 `/255`，误差 ≤ 1。SWAR 内核必须复现这个近似而非改用精确除法；565 的 `blend_565` 同样复用它。
 
-`mod swar` 内部还有逐项优化：`mask == 255` 时直接整像素写 `u32`，跳过读-改-写（`color.rs:613`）；否则读 `u32`、混合、再把第 4 字节按 `opaque_alpha` 拼回（`color.rs:615-619`）。改动这里要保住"完全不透明时不读原像素"这个短路。
+`Color::blend` 逐通道委托 `blend_channel`，是**全库 Alpha 混合的唯一权威**——SWAR 内核、固定功能跨度填充与可编程管线都收敛到它，因此同一次混合在任意路径上逐位一致。它曾用精确 `/255`，与 `blend_channel` 在 48.67% 的 `(src, dst, alpha)` 组合上差 1；改回精确除法即会让可编程管线与字节层不再逐位一致。**该一致性当前没有测试守护**（旧 `programmable.rs` 的测试在重写时被整体删除，待补）。
+
+`Color::blend_add` / `blend_multiply` / `blend_premultiplied` 是 `pub(crate)`，只服务可编程管线的对应 `BlendMode`。三者都带 `#[cfg(feature = "programmable")]`——漏掉该 `cfg` 会让 `--no-default-features` 报 `dead_code`。
+
+`mod swar` 内部的关键优化在 `blend_lane_pairs`（`color.rs:727`）：把 `c0`/`c2` 留在原位、`c1`/`c3` 右移 8 位，使一个 32 位字同时容纳两个通道的 16 位中间值；`d*255` 展开成 `(d << 8) - d` 省掉一次乘法。掩码路径 `blend_masked_segment`（`color.rs:941`）用无分支构造的 `keep_high`（`color.rs:959`）保留原第 4 字节，`m == 0` 时结果退回原字。改动这里必须与 `blend_channel` 逐字节等价（`blend_word_matches_blend_channel_over_all_*` 两条穷举测试守护）。
 
 ## simd.rs
 
@@ -188,26 +215,34 @@ shift 的语义是「**位**位移」：对 6 种 8 位通道格式恰好等于�
 
 ## utils.rs
 
-`clip_line` 的溢出防护是硬性要求：端点来自 `usize`，经 `sat_i64` 可能取到 `i64::MAX`，与 `t`（最大 `height-1`）相乘会溢出，所以中间运算走 `i128`（`intersect_axis`，`utils.rs:103`）。改动此函数必须保留 `i128`。
+`clip_line` 的溢出防护是硬性要求：端点来自 `usize`，经 `sat_i64` 可能取到 `i64::MAX`，与 `t`（最大 `height-1`）相乘会溢出，所以中间运算走 `i128`（`intersect_axis`，`utils.rs:295`）。改动此函数必须保留 `i128`。
 
-`floor_to_usize` 用 `as usize`（向零取整），对非负值等价于 floor；`programmable.rs` 里坐标转像素索引依赖此语义。它带 `#[cfg(feature = "programmable")]`——漏掉该 `cfg` 会让 `--no-default-features` 构建报 `dead_code`。
+`floor_to_usize` 用 `as usize`（向零取整），对非负值等价于 floor；`programmable/mod.rs` 里坐标转像素索引依赖此语义。它带 `#[cfg(feature = "programmable")]`——漏掉该 `cfg` 会让 `--no-default-features` 构建报 `dead_code`。
 
 ## 测试分布
 
-单测写在文件内的 `#[cfg(test)]` 模块中，共 6 处：
+单测写在文件内的 `#[cfg(test)]` 模块中，共 124 个 `#[test]`，分布在 7 个文件：
 
-| 位置 | 覆盖对象 |
-|------|----------|
-| `core.rs:1463` | `Renderer` 全部公开方法、`*_unchecked` 等价性、图元裁剪、迭代量上界、圆半径钳制双向、精确圆盘/边界参考等价性、圆弧/扇形 |
-| `angle.rs:404` | `Angle` 定点三角（基准角精确、单位恒等式、往返）、`Wedge` 楔形判定（含大跨度与容差） |
-| `color.rs:875` | `Color` 构造/解析/混合、`PixelFormat::write_color`/`read_color` |
-| `color.rs:626` | **内嵌在 `mod swar` 内**，直接测 `blend_word` / `source_word` / `blend_span_alpha_4bpp` / `blend_masked_row_4bpp` |
-| `programmable.rs:1535` | 裁剪、插值、viewport/scissor、纹理采样、着色器 |
-| `framebuffer.rs:62` | `buffer_size` 派生与 `pitch` 下限断言 |
+| 位置 | 数量 | 覆盖对象 |
+|------|------|----------|
+| `core.rs:1637` | 72 | `Renderer` 全部公开方法、`*_unchecked` 等价性、图元裁剪、迭代量上界、圆半径钳制双向、精确圆盘/边界参考等价性、圆弧/扇形 |
+| `angle.rs:402` | 17 | `Angle` 定点三角（基准角精确、单位恒等式、往返）、`Wedge` 楔形判定（含大跨度与容差） |
+| `color.rs:1215` | 17 | `Color` 构造/解析/混合、`PixelFormat::write_color`/`read_color`、565 位域与量化往返 |
+| `color.rs:966` | 5 | **内嵌在 `mod swar` 内**，直接测 `blend_word` / `source_word` / `blend_span_alpha_4bpp` / `blend_masked_row_4bpp` |
+| `programmable/cache.rs:123` | 7 | 缓存命中/回填/清空、越界索引不 panic、短缓存降级为部分命中 |
+| `error.rs:157` | 2 | 错误展示文本稳定、`DrawError` 字段 |
+| `framebuffer.rs:61` | 2 | `buffer_size` 派生与 `pitch` 下限断言 |
+| `utils.rs:413` | 2 | `sub_view` / `sub_view_with_back_buffer` 的收缩与后台缓冲区校验 |
+
+`core.rs:121` 另有一个 `#[cfg(test)]` 的 `CircleKind`，供参考实现对照使用，不是独立测试模块。
+
+**可编程管线（`programmable/mod.rs`）当前没有单测**：旧 `programmable.rs` 的 18 个测试（图元装配、索引校验、缓存跨调用复用、纹理采样、线段/三角形裁剪、565 落盘、`BlendMode::None` 覆盖语义等）在重写时被整体删除，尚未补回。改动管线前必须手工验证这几条语义。
 
 该模块需要 `extern crate alloc;` 与 `extern crate std;`：`#![no_std]` 下两者都不在 extern prelude，即使只在 `#[cfg(test)]` 里也必须显式引入。
 
-`utils.rs` / `simd.rs` / `pixel.rs` 无单测——它们的行为通过上述集成路径间接覆盖。`simd.rs` 尤其无测试，因为验证它需要真实向量指令集，只能靠 `cargo bench` 观察。
+`simd.rs` 与 `pixel.rs` 无单测——它们的行为通过上述集成路径间接覆盖。`simd.rs` 尤其无测试，因为验证它需要真实向量指令集，只能靠 `cargo bench` 观察。
+
+`programmable/shader.rs` 没有单测；它只有一个 `Passthrough2D` 透传实现，目前也没有集成测试覆盖它。
 
 命名语义：
 
@@ -219,7 +254,7 @@ shift 的语义是「**位**位移」：对 6 种 8 位通道格式恰好等于�
 | `_rejects_*` / `_does_nothing` | 非法输入被静默拒绝 |
 | `#[should_panic(expected = "...")]` | 构造期不变量，断言 panic 文案 |
 
-穷举型单测的写法值得照抄：`color.rs:626` 的 `SAMPLES: [u8; 11]` 覆盖 0/1/2/63/64/127/128/129/192/254/255——刻意包含**每个位宽的分界点**，因为混合公式的错误几乎全出现在进位边界上。4bpp 测试还把 4 个通道填成互不相同的字节，一次调用同时校验 4 条通道并能暴露"某槽被相邻槽污染"。
+穷举型单测的写法值得照抄：`color.rs:985` 的 `SAMPLES: [u8; 11]` 覆盖 0/1/2/63/64/127/128/129/192/254/255——刻意包含**每个位宽的分界点**，因为混合公式的错误几乎全出现在进位边界上。4bpp 测试还把 4 个通道填成互不相同的字节，一次调用同时校验 4 条通道并能暴露"某槽被相邻槽污染"。
 
 新增优化路径时，前两类单测是准入条件，不是可选项。
 
@@ -227,15 +262,15 @@ shift 的语义是「**位**位移」：对 6 种 8 位通道格式恰好等于�
 
 ## unsafe 与 SAFETY 注释
 
-`unsafe` 共 86 处，分布在 5 个文件：`core.rs` 47、`simd.rs` 19、`color.rs` 18、`utils.rs` 1、`lib.rs` 1（后者是 `#![allow(unsafe_op_in_unsafe_fn)]` 属性）。
+`unsafe` 共 90 处，分布在 6 个文件：`core.rs` 47、`simd.rs` 19、`color.rs` 18、`programmable/mod.rs` 4、`utils.rs` 1、`lib.rs` 1（后者是 `#![allow(unsafe_op_in_unsafe_fn)]` 属性）。
 
 两级注释是强约定：
 
-- `unsafe fn` 上方写 `/// # Safety`，说明**前置条件**。现有 12 处：`core.rs` 9 个（6 个 `pub`——`set_pixel_unchecked`、`set_pixel_at_unchecked`、`get_pixel_unchecked`、`get_pixel_at_unchecked`、`draw_line_unchecked`，加 `pub(crate)` 的 `fill_span_alpha`、私有的 `clear_unchecked`，再加 565 的 `load_565` / `store_565`；其中 `fill_span_alpha` 并非 `unsafe fn`，但同样声明前置条件）、`color::swar` 3 个 `pub(crate)`（`blend_span_alpha_4bpp` / `blend_masked_row_4bpp` / `blend_masked_segment`）。**唯一缺失是 `simd::memcpy`（`simd.rs:145`）**。
-- 块内写 `// SAFETY: <局部推理>`，说明**此处为何安全**。现有 21 处：`core.rs` 8 处、`color.rs` 13 处，都紧邻需要论证的裸指针访问（565 新增的 5 处在 `load_565` / `store_565` / `blit_mask` / `fill_span_alpha` / `draw_line_internal`）。例：`color.rs` 的「调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，故 idx * 4 + 4 <= pixel_count * 4，且每次 u32 访问都对齐」；`core.rs` 的「调用方 fill_visible_horizontal_span 保证 x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，故 start + row_len <= buffer.len()」。
+- `unsafe fn` 上方写 `/// # Safety`，说明**前置条件**。现有 12 处：`core.rs` 9 个（5 个 `pub`——`set_pixel_unchecked`、`set_pixel_at_unchecked`、`get_pixel_unchecked`、`get_pixel_at_unchecked`、`draw_line_unchecked`，加 `pub(crate)` 的 `fill_span_alpha`、私有的 `clear_unchecked`，再加 565 的 `load_565` / `store_565`；其中 `fill_span_alpha` 并非 `unsafe fn`，但同样声明前置条件）、`color::swar` 3 个 `pub(crate)`（`blend_span_alpha_4bpp` / `blend_masked_row_4bpp` / `blend_masked_segment`）。**唯一缺失是 `simd::memcpy`（`simd.rs:145`）**。
+- 块内写 `// SAFETY: <局部推理>`，说明**此处为何安全**。现有 25 处：`core.rs` 8 处、`color.rs` 13 处、`programmable/mod.rs` 4 处（`write_fragment_color` 的 `BlendMode` 四条分支），都紧邻需要论证的裸指针访问（565 新增的 5 处在 `load_565` / `store_565` / `blit_mask` / `fill_span_alpha` / `draw_line_internal`）。例：`color.rs` 的「调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，故 idx * 4 + 4 <= pixel_count * 4，且每次 u32 访问都对齐」；`core.rs` 的「调用方 fill_visible_horizontal_span 保证 x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，故 start + row_len <= buffer.len()」。
 
 `lib.rs:82` 已开 `unsafe_op_in_unsafe_fn`，因此 `unsafe fn` 体内每处裸指针操作仍需显式 `unsafe {}` 块。新增裸指针代码时，块内 `// SAFETY:` 是硬性要求。
 
 `draw_line_unchecked`（`core.rs:948`）是**无附加前置条件**的特例：实现已收窄迭代区间并逐轴校验坐标。它的 `# Safety` 段只声明"帧缓冲切片仍有效"这一与 `draw_line` 相同的前提，不再声称需要调用方提供坐标保证。写这类"保留 `unsafe` 但实际无要求"的函数时，`# Safety` 段必须与正文描述一致，不要一边说"不需要保证"一边列一堆前置条件。
 
-**现存缺口**（`cargo clippy --all-targets` 的警告全部属于既存问题，565 改动未新增任何一条）。lib 3 条：`simd.rs:145` 缺 `# Safety` 段；`core.rs:338` 的 `as usize` 冗余转换；`programmable.rs:1124` 循环变量只用于索引。lib test 另有 3 条 `u8 as u8` 冗余转换（`core.rs:2101`/`2203`/`2722`）。examples 只有 2 个问题位置——`shared/bmp.rs:113` 无效位运算、`:157` 手写 `is_multiple_of`——但因该文件被 bin 与 4 个 example 共用，各报多次。
+**现存缺口**（`cargo clippy --all-targets` 的警告全部属于既存问题，合并未新增任何一条）。lib 3 条：`simd.rs:145` 缺 `# Safety` 段；`core.rs:338` 的 `usize as usize` 冗余转换；`programmable/shader.rs:32` 的 `(*input).into()` 是自转换（`Vertex2D<V>` 就是 `FragmentInput<V>`）。lib test 另有 3 条 `u8 as u8` 冗余转换（`core.rs:2101`/`2203`/`2722`）。examples 只有 2 个问题位置——`shared/bmp.rs:113` 无效位运算、`:157` 手写 `is_multiple_of`——但因该文件被 bin 与 4 个 example 共用，各报多次。

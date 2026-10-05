@@ -1,6 +1,8 @@
 use crate::Pixel;
 use crate::core::Renderer;
 use crate::framebuffer::FramebufferInfo;
+#[cfg(feature = "programmable")]
+use crate::programmable::{Vec2, Viewport};
 #[cfg(feature = "simd")]
 use crate::simd;
 
@@ -318,6 +320,25 @@ pub(crate) fn floor_to_usize(value: f32) -> usize {
     if value < 0.0 { 0 } else { value as usize }
 }
 
+/// 向上取整后转为 `usize`；非正值返回 `0`。
+///
+/// 不能直接用 `f32 as usize`：后者向零取整，对 `2.0` 会得到 2 而非上取整
+/// 应有的 3，对 `-1.0` 还会因负数转无符号而得到 0（依赖 Rust 的饱和转换）。
+/// 这里显式区分整数值与非整数值，用于三角形包围盒的右/下边界。
+#[cfg(feature = "programmable")]
+#[inline(always)]
+pub fn ceil_to_usize(value: f32) -> usize {
+    if value <= 0.0 {
+        return 0;
+    }
+    let truncated = value as usize;
+    if truncated as f32 == value {
+        truncated
+    } else {
+        truncated.saturating_add(1)
+    }
+}
+
 /// 用重复模式填充整个切片。
 ///
 /// 对 4bpp 等能整除 16 的格式，模式固定为 16 字节：按 16 字节块**直接重复写入**，
@@ -363,6 +384,30 @@ pub(crate) fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
         }
         filled += copy_len;
     }
+}
+
+/// 把 normalized `[0,1]²` 的 viewport 坐标变换为 viewport 内的浮点像素坐标。
+///
+/// 采用「像素中心」约定：`0.0` 映射到 viewport 左上角像素，`1.0` 映射到
+/// 右下角像素（`width - 1` / `height - 1`），与可编程管线的视口变换一致。
+/// viewport 宽或高为 0 时按 1 处理，避免除零与负跨度。
+///
+/// # 示例
+///
+/// ```
+/// # use rasteron::programmable::Viewport;
+/// # use rasteron::utils::normalized_to_screen;
+/// let viewport = Viewport::new(10, 20, 100, 50);
+/// assert_eq!(normalized_to_screen([0.0, 0.0], viewport), [10.0, 20.0]);
+/// assert_eq!(normalized_to_screen([1.0, 1.0], viewport), [109.0, 69.0]);
+/// ```
+#[cfg(feature = "programmable")]
+pub fn normalized_to_screen(position: Vec2, viewport: Viewport) -> Vec2 {
+    let vx = viewport.x as f32;
+    let vy = viewport.y as f32;
+    let vw = viewport.width.max(1) as f32;
+    let vh = viewport.height.max(1) as f32;
+    [vx + position[0] * (vw - 1.0), vy + position[1] * (vh - 1.0)]
 }
 
 #[cfg(test)]

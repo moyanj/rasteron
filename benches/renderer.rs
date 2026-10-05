@@ -5,9 +5,10 @@ use rasteron::Renderer;
 use rasteron::color::{Color, PixelFormat};
 use rasteron::framebuffer::FramebufferInfo;
 use rasteron::pixel::Pixel;
+use rasteron::programmable::shader::Passthrough2D;
 use rasteron::programmable::{
-    FragmentInput, FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState,
-    PrimitiveType, Texture2D, Vertex2D, VertexShader, Viewport,
+    FragmentInput, FragmentOutput, FragmentShader, Pipeline, PipelineState, PrimitiveType,
+    Vertex2D, Viewport,
 };
 
 const BENCH_FORMATS: [PixelFormat; 1] = [PixelFormat::Bgr24];
@@ -72,29 +73,6 @@ fn make_renderer(
     (renderer, front)
 }
 
-#[derive(Clone, Copy)]
-struct UvVertex {
-    position: [f32; 2],
-    uv: [f32; 2],
-}
-
-struct UvVs;
-
-impl VertexShader for UvVs {
-    type Input = UvVertex;
-    type Varying = [f32; 2];
-
-    fn shade_vertex(
-        &self,
-        input: &Self::Input,
-    ) -> rasteron::programmable::ProgramVertex<Self::Varying> {
-        rasteron::programmable::ProgramVertex {
-            position: input.position,
-            varying: input.uv,
-        }
-    }
-}
-
 struct SolidFs;
 
 impl FragmentShader for SolidFs {
@@ -102,18 +80,6 @@ impl FragmentShader for SolidFs {
 
     fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
         FragmentOutput::Color(input.varying)
-    }
-}
-
-struct TextureFs<'a> {
-    texture: Texture2D<'a>,
-}
-
-impl FragmentShader for TextureFs<'_> {
-    type Varying = [f32; 2];
-
-    fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
-        FragmentOutput::Color(self.texture.sample_nearest(input.varying))
     }
 }
 
@@ -598,65 +564,17 @@ fn bench_programmable_draw_indexed_triangles(c: &mut Criterion) {
 
     group.bench_function("Rgba8888/fullscreen_quad", |b| {
         b.iter(|| {
-            renderer.draw_indexed(
-                black_box(PrimitiveType::Triangles),
-                black_box(&vertices),
-                black_box(&indices),
-                black_box(&pipeline),
-            );
-        });
-    });
-
-    group.finish();
-}
-
-fn bench_programmable_textured_triangles(c: &mut Criterion) {
-    let width = 640usize;
-    let height = 360usize;
-    let mut group = c.benchmark_group("programmable_textured_triangles");
-    group.throughput(Throughput::Elements((width * height) as u64));
-
-    let (mut renderer, _front) = make_renderer(width, height, PixelFormat::Rgba8888);
-    let vertices = [
-        UvVertex {
-            position: [0.0, 0.0],
-            uv: [0.0, 0.0],
-        },
-        UvVertex {
-            position: [1.0, 0.0],
-            uv: [1.0, 0.0],
-        },
-        UvVertex {
-            position: [1.0, 1.0],
-            uv: [1.0, 1.0],
-        },
-        UvVertex {
-            position: [0.0, 1.0],
-            uv: [0.0, 1.0],
-        },
-    ];
-    let indices = [0u16, 1, 2, 0, 2, 3];
-    let texels = [
-        Color::new(255, 0, 0),
-        Color::new(0, 255, 0),
-        Color::new(0, 0, 255),
-        Color::new(255, 255, 255),
-    ];
-    let texture = Texture2D::new(2, 2, &texels);
-    let pipeline = Pipeline::new(
-        UvVs,
-        TextureFs { texture },
-        PipelineState::alpha_blend(Viewport::new(0, 0, width, height)),
-    );
-
-    group.bench_function("Rgba8888/nearest_quad", |b| {
-        b.iter(|| {
-            renderer.draw_indexed(
-                black_box(PrimitiveType::Triangles),
-                black_box(&vertices),
-                black_box(&indices),
-                black_box(&pipeline),
-            );
+            // 索引固定且合法，`Err` 只可能在缓冲区被改坏时出现；
+            // 显式 unwrap 使它不会被基准循环静默吞掉。
+            renderer
+                .draw_indexed(
+                    black_box(PrimitiveType::Triangles),
+                    black_box(&vertices),
+                    black_box(&indices),
+                    black_box(&pipeline),
+                    black_box(None),
+                )
+                .expect("索引越界");
         });
     });
 
@@ -682,7 +600,6 @@ criterion_group!(
     bench_blit,
     bench_blit_mask,
     bench_blit_mask_antialiased,
-    bench_programmable_draw_indexed_triangles,
-    bench_programmable_textured_triangles
+    bench_programmable_draw_indexed_triangles
 );
 criterion_main!(benches);

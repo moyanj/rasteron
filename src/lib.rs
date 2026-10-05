@@ -35,14 +35,16 @@
 //! |------|------|
 //! | `programmable`  | 启用完整的 2D 可编程管线。这是唯一需要 `alloc` 的特性。 |
 //! | `simd`          | 启用 SIMD 优化，提升内存操作性能。支持 AVX-512、AVX2、SSE2、NEON 和 RISC-V 向量扩展。 |
+//! | `alloc`         | 解锁自持有存储的便捷容器。默认关闭，关闭时缓存仍可由调用方借出槽位。 |
 //!
 //! # 裸机 / 内核选型
 //!
 //! * **浮点**：关闭 `programmable` 后，整个库不依赖浮点运算（几何计算全部为整数）。
 //!   启用 `programmable` 会引入 `f32`，在不支持浮点的目标上不可用；在内核态使用
 //!   还需要显式保存/恢复 FPU 状态。
-//! * **分配器**：关闭 `programmable` 后不链接全局分配器。双缓冲不需要分配——
-//!   前后台缓冲区都由调用方提供。
+//! * **分配器**：默认不启用 `alloc`，关闭 `programmable` 后不链接全局分配器。
+//!   双缓冲不需要分配——前后台缓冲区都由调用方提供。`alloc` 只解锁自持有存储的
+//!   便捷容器，不改变其余路径的分配行为。
 //! * **FPU 状态**：`simd` 会经由 `blit` / `clear` / 填充路径使用向量寄存器
 //!   （x86 的 XMM/YMM/ZMM、aarch64 的 V0-V31），内核中需配合
 //!   `kernel_fpu_begin/end`（或 `kernel_neon_begin/end`）使用。
@@ -103,10 +105,10 @@
 //!     PipelineState::alpha_blend(Viewport::new(0, 0, 128, 128)),
 //! );
 //!
-//! renderer.draw_indexed(PrimitiveType::Triangles, &vertices, &indices, &pipeline);
+//! renderer.draw_indexed(PrimitiveType::Triangles, &vertices, &indices, &pipeline, None);
 //! ```
 //!
-//! 开启 `programmable` 后，顶点着色器输出的 `ProgramVertex.position` 使用 `[0, 1]`
+//! 开启 `programmable` 后，顶点着色器输出的 `FragmentInput.position` 使用 `[0, 1]`
 //! 的 normalized viewport 坐标，而不是 OpenGL 风格的 `[-1, 1]` clip space。
 #![no_std]
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -114,6 +116,7 @@
 pub mod angle;
 pub mod color;
 pub mod core;
+pub mod error;
 pub mod framebuffer;
 pub mod pixel;
 #[cfg(feature = "programmable")]

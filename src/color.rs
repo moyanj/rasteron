@@ -1,3 +1,5 @@
+use crate::error::ColorParseError;
+
 /// 具有 8 位通道的 RGBA 颜色。
 ///
 /// 大多数绘制方法接受 `&Color`，以便在热路径中做出零成本的混合决策，
@@ -158,33 +160,93 @@ impl Color {
         Self::with_alpha(self.r, self.g, self.b, alpha)
     }
 
-    /// 将当前颜色与另一个颜色混合，透明度由 `alpha` 控制。
+    /// 将当前颜色与另一个颜色做标准 Alpha 混合，透明度由 `alpha` 控制。
     ///
-    /// 使用标准 Alpha 混合公式：
-    /// `result = src × alpha + dst × (255 - alpha)`
-    pub fn mix(&self, other: &Color, alpha: u8) -> Self {
-        let r =
-            ((self.r as u16 * alpha as u16 + other.r as u16 * (255 - alpha) as u16) / 255) as u8;
-        let g =
-            ((self.g as u16 * alpha as u16 + other.g as u16 * (255 - alpha) as u16) / 255) as u8;
-        let b =
-            ((self.b as u16 * alpha as u16 + other.b as u16 * (255 - alpha) as u16) / 255) as u8;
-        let a = 255;
-        Self { r, g, b, a }
+    /// 逐通道委托 [`PixelFormat::blend_channel`]，与固定功能路径的字节层实现
+    /// （[`PixelFormat::write_color`]）**共用同一公式**：
+    ///
+    /// ```text
+    /// (src × alpha + dst × (255 − alpha) + 255) >> 8
+    /// ```
+    ///
+    /// 这是对精确 `/255` 的近似，误差 ≤ 1。全库只此一份 Alpha 混合语义——
+    /// SWAR 内核、固定功能跨度填充与可编程管线都收敛到这里，因此同一次混合
+    /// 在任意路径上得到逐位相同的像素。
+    ///
+    /// 返回值恒为不透明（`alpha == 255`）：混合结果的 alpha 通道从不落盘，
+    /// 4bpp 格式写入的是格式自身的 opaque alpha 字节。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use rasteron::color::Color;
+    ///
+    /// let src = Color::new(255, 0, 0);
+    /// let dst = Color::new(0, 0, 255);
+    /// // alpha = 128 时结果落在两色之间。
+    /// assert_eq!(src.blend(&dst, 128), Color::new(128, 0, 127));
+    /// ```
+    #[inline(always)]
+    pub fn blend(&self, other: &Color, alpha: u8) -> Self {
+        let inv_alpha = 255 - alpha;
+        let channel = |src: u8, dst: u8| {
+            PixelFormat::blend_channel(src, dst, alpha as u16, inv_alpha as u16)
+        };
+        Color::new(
+            channel(self.r, other.r),
+            channel(self.g, other.g),
+            channel(self.b, other.b),
+        )
     }
+
+    /// 加法混合：各通道饱和相加（`min(src + dst, 255)`），常用于发光/叠加。
+    ///
+    /// 仅供可编程管线的 `BlendMode::Add` 使用，结果恒为不透明。
+    #[cfg(feature = "programmable")]
+    pub(crate) fn blend_add(self, dst: &Color) -> Color {
+        Color::new(
+            self.r.saturating_add(dst.r),
+            self.g.saturating_add(dst.g),
+            self.b.saturating_add(dst.b),
+        )
+    }
+
+    /// 乘法混合：各通道 `src × dst / 255`（`+127` 四舍五入），用于阴影/染色。
+    ///
+    /// 仅供可编程管线的 `BlendMode::Multiply` 使用，结果恒为不透明。
+    #[cfg(feature = "programmable")]
+    pub(crate) fn blend_multiply(self, dst: &Color) -> Color {
+        let channel = |src: u8, dst: u8| ((src as u16 * dst as u16 + 127) / 255) as u8;
+        Color::new(
+            channel(self.r, dst.r),
+            channel(self.g, dst.g),
+            channel(self.b, dst.b),
+        )
+    }
+
+    /// 预乘 Alpha 混合：片元颜色被视为已乘过 `src.a`，故直接加到衰减后的目标上，
+    /// 即 `src + dst × (1 - src.a)`，结果饱和到 255。
+    ///
+    /// 与 [`Color::blend`] 的区别：后者会对源色再乘一次 `alpha`，本函数不会。
+    ///
+    /// 仅供可编程管线的 `BlendMode::PremultipliedAlpha` 使用，结果恒为不透明。
+    #[cfg(feature = "programmable")]
+    pub(crate) fn blend_premultiplied(self, dst: &Color) -> Color {
+        let inv_alpha = 255 - self.a;
+        let channel = |src: u8, dst: u8| {
+            src.saturating_add(((dst as u16 * inv_alpha as u16 + 127) / 255) as u8)
+        };
+        Color::new(
+            channel(self.r, dst.r),
+            channel(self.g, dst.g),
+            channel(self.b, dst.b),
+        )
+    }
+
     /// 返回颜色的反色（按位取反 RGB 通道）。
     pub fn invert(&self) -> Color {
         Color::new(!self.r, !self.g, !self.b)
     }
-}
-
-/// 解析十六进制颜色字符串时可能发生的错误。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorParseError {
-    /// 字符串长度不是 6 或 8 个字符（不含 `#`）。
-    InvalidLength,
-    /// 包含无效的十六进制字符。
-    InvalidDigit,
 }
 
 /// 像素格式描述，定义了内存中通道的布局和字节对齐。
@@ -803,8 +865,7 @@ pub(crate) mod swar {
         } else {
             (color.b, color.g, color.r)
         };
-        let opaque_pixel =
-            (c0 as u32) | ((c1 as u32) << 8) | ((c2 as u32) << 16) | opaque_word;
+        let opaque_pixel = (c0 as u32) | ((c1 as u32) << 8) | ((c2 as u32) << 16) | opaque_word;
 
         // 进行中的混合段起点；usize::MAX 表示无待收尾的段。
         // 迭代量只取决于 pixel_count（帧缓冲派生），符合迭代量上界约束。
@@ -819,14 +880,18 @@ pub(crate) mod swar {
                 if run_start != usize::MAX {
                     // SAFETY: run_start..idx ⊆ [0, pixel_count)，前置条件由
                     // 本函数 # Safety 段保证
-                    unsafe { blend_masked_segment(row, mask, run_start, idx, src_word, opaque_word) };
+                    unsafe {
+                        blend_masked_segment(row, mask, run_start, idx, src_word, opaque_word)
+                    };
                     run_start = usize::MAX;
                 }
             } else if m4 == 0xFFFF_FFFF {
                 // 整组全不透明：直写 4 个整像素，省掉读-改-写；同样先收尾
                 if run_start != usize::MAX {
                     // SAFETY: 同上
-                    unsafe { blend_masked_segment(row, mask, run_start, idx, src_word, opaque_word) };
+                    unsafe {
+                        blend_masked_segment(row, mask, run_start, idx, src_word, opaque_word)
+                    };
                     run_start = usize::MAX;
                 }
                 // SAFETY: idx + 4 <= pixel_count 且 row 按 4 字节对齐，
@@ -892,8 +957,7 @@ pub(crate) mod swar {
                 // m == 0 时 blended == word，第 4 字节须保留原值：
                 // keep_high = m == 0 ? 0xFF00_0000 : 0（无分支构造）
                 let keep_high = 0u32.wrapping_sub((m as u32).wrapping_sub(1) >> 31) << 24;
-                let out =
-                    (blended & 0x00FF_FFFF) | (word & keep_high) | (opaque_word & !keep_high);
+                let out = (blended & 0x00FF_FFFF) | (word & keep_high) | (opaque_word & !keep_high);
                 *(dst as *mut u32) = out;
             }
         }
@@ -1151,9 +1215,10 @@ pub(crate) mod swar {
 #[cfg(test)]
 mod tests {
     use super::{
-        Color, ColorParseError, PixelFormat, blend_565, decode_565_bytes, encode_565_bytes,
-        expand_channel, pack_565, quantize_channel, unpack_565,
+        Color, PixelFormat, blend_565, decode_565_bytes, encode_565_bytes, expand_channel, pack_565,
+        quantize_channel, unpack_565,
     };
+    use crate::error::ColorParseError;
 
     #[test]
     fn from_hex_parses_rgb_and_defaults_alpha_to_opaque() {
