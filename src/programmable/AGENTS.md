@@ -1,6 +1,6 @@
 # src/programmable — 2D 可编程管线
 
-**生成时间:** 2026-10-05 · 提交 `7009f2a` · 3 文件 1178 行
+**生成时间:** 2026-10-06 · 3 文件 2866 行
 **feature 门控:** 整个目录由 `#[cfg(feature = "programmable")]` 包裹（`lib.rs:122`），默认开启
 
 这是全库**唯一**引入 `f32` 的地方。关闭该 feature 后几何计算回到全整数
@@ -10,9 +10,9 @@
 
 | 文件 | 行数 | 内容 |
 |------|------|------|
-| `mod.rs` | 892 | 类型体系、`Pipeline`、3 个 `rasterize_*` 内核、2 个公开绘制入口 |
-| `cache.rs` | 252 | `VertexCache<'a, V>`——按顶点索引复用着色结果的 post-transform cache |
-| `shader.rs` | 34 | `Passthrough2D<V>`——唯一内建顶点着色器（原样透传，`PhantomData` 绑类型） |
+| `mod.rs` | 2376 | 类型体系、`Pipeline`、3 个 `rasterize_*` 内核、2 个公开绘制入口 |
+| `cache.rs` | 386 | `VertexCache<'a, V>`——按顶点索引复用着色结果的 post-transform cache |
+| `shader.rs` | 104 | `Passthrough2D<V>`——唯一内建顶点着色器（原样透传，`PhantomData` 绑类型） |
 
 ## 数据流
 
@@ -93,23 +93,21 @@ fail-fast 上抛而非静默跳过整条图元。
 - 顶点数据变化后调用方必须 `clear()`，库不会自动失效
 - 契约依赖 `VertexShader::shade_vertex` 是纯函数
 
-## 已知不一致
+## 已解决的历史不一致
 
-- **`VecVertexCache` 不存在**。`cache.rs:20` 的文档与 `VertexCache` 的
-  结构体文档都引用了「`VecVertexCache`（`alloc` 特性）」，但全库没有这个类型，
-  且 `cache.rs:6`–`:10` 的对照表只列了 `VertexCache` 一行却写「两者都遵循
-  同一份契约」。要么实现它，要么删掉这两处引用。
-- **`alloc` feature 是死的**。`Cargo.toml` 声明了它、`lib.rs:38` 的 feature 表
-  宣传它「解锁自持有存储的便捷容器」，但 `rg 'feature = "alloc"'` 在
-  `src/`、`examples/`、`benches/` 里零命中。同表第 36 行称
-  「`programmable` 是唯一需要 `alloc` 的特性」也不成立——`programmable` 用的是
-  调用方借出的切片，同样不分配。
+原先本节列的两条均已处理：
+
+- **`VecVertexCache` 引用**：该类型从未存在，已删除 `cache.rs` 模块文档与
+  `VertexCache` 结构体文档中的两处引用，并改为说明「库内没有自持有存储的变体」。
+- **`alloc` feature 是死的**：`Cargo.toml` 已删除该 feature，`lib.rs` 的
+  特征表同步改为如实描述 `programmable` / `simd` 两个。库内零分配，槽位由
+  调用方借出，因此本就不需要它。
 
 ## 验证
 
 ```bash
 cargo check --no-default-features                          # 确认本目录被完全排除
 cargo check --no-default-features --features programmable   # 单独开启
-cargo test --lib                                            # 含 cache.rs 的 7 个测试
+cargo test --lib                                            # 本目录 61 个测试
 cargo run --example programmable                            # 最小可用示例
 ```

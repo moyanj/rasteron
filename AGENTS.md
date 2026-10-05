@@ -1,8 +1,7 @@
 # rasteron 项目知识库
 
-**生成时间:** 2026-10-05
-**提交:** 7009f2a (`docs: 完善注释`)
-**分支:** main（无远端，共 39 次提交）
+**生成时间:** 2026-10-06
+**分支:** main（无远端）
 
 ## 概述
 
@@ -48,16 +47,16 @@ rasteron/
 
 | 符号 | 类型 | 位置 | 角色 |
 |------|------|------|------|
-| `Renderer<'a>` | struct | `src/core.rs:153` | 唯一入口类型；`fmt_*` 字段缓存格式属性 |
+| `Renderer<'a>` | struct | `src/core.rs:141` | 唯一入口类型；`fmt_*` 字段缓存格式属性 |
 | `Pixel` | struct | `src/pixel.rs:5` | 二维坐标，`pixel!` 宏构造 |
 | `FramebufferInfo` | struct | `src/framebuffer.rs:14` | `width`/`height`/`pitch`/`format` |
 | `Color` | struct | `src/color.rs:16` | RGBA8；`color!` 宏构造 |
-| `PixelFormat` | enum | `src/color.rs:271` | 8bpp × 6 种 + 565 打包 × 2 种 |
-| `mod swar` | mod | `src/color.rs:682` | `pub(crate)`；4bpp Alpha 混合 SIMD 内核 |
+| `PixelFormat` | enum | `src/color.rs:270` | 8bpp × 6 种 + 565 打包 × 2 种 |
+| `mod swar` | mod | `src/color.rs:694` | `pub(crate)`；4bpp Alpha 混合 SIMD 内核 |
 | `Angle` | struct | `src/angle.rs:94` | 圈值（整圈 `2^32`），加减自动回绕 |
 | `Interpolate` | trait | `src/programmable/mod.rs:34` | varying 重心插值 |
-| `Pipeline` | struct | `src/programmable/mod.rs:416` | `VS` + `FS` + `PipelineState` |
-| `mod simd` | mod | `src/simd.rs` | AVX-512/AVX2/SSE2/NEON/RVV memcpy |
+| `Pipeline` | struct | `src/programmable/mod.rs:432` | `VS` + `FS` + `PipelineState` |
+| `mod simd` | mod | `src/simd.rs` | AVX-512/AVX2/SSE2/NEON/RVV memcpy（7 个测试） |
 
 ## 约定
 
@@ -84,14 +83,14 @@ rasteron/
 - **提交信息**：Conventional Commits + 中文描述，正文说明**为什么**。
   参考 `fix(core): 钳制圆半径与线段迭代量,消除 DoS 与越界写`。
 - **`no_std` 下的测试**：`#[cfg(test)] mod tests` 内需显式
-  `extern crate alloc;` 与 `use alloc::string::String;`（见 `src/error.rs:157`）。
+  `extern crate alloc;` 与 `use alloc::string::String;`（见 `src/error.rs:160`）。
 
 ## 禁止模式
 
 - ❌ 引入 `[dependencies]` 中除 `criterion` 外的运行时依赖（破坏 `no_std` /
   零依赖定位；确需引入须先确认）
 - ❌ 用 `as` 做 `usize → i64` 转换。必须用饱和转换，否则
-  `usize::MAX as i64 == -1`，端点会被折到画布另一侧（`src/core.rs:978` 有完整说明）
+  `usize::MAX as i64 == -1`，端点会被折到画布另一侧（`src/core.rs` 的 `draw_line_unchecked` 有完整说明）
 - ❌ 给错误类型实现 `std::error::Error`。MSRV 早于其稳定，仅实现
   `Debug` + `Display`；`Display` 文案是对外契约，有测试守护
 - ❌ 在 `angle.rs` 引入浮点三角函数，或改用「度 × 系数」表示角度
@@ -119,17 +118,19 @@ rasteron/
 cargo build
 cargo check --release
 
-# 全部 feature 组合都必须能编译（已验证 6 种全 PASS）
+# 全部 feature 组合都必须能编译（已验证 5 种全 PASS）
+# 注：原计划的 `--features alloc` 一项已作废——alloc 是死 feature，已删除。
 cargo check --no-default-features
 cargo check --no-default-features --features simd
 cargo check --no-default-features --features programmable
 cargo check --no-default-features --features programmable,simd
-cargo check --no-default-features --features alloc
 cargo check --all-features
 
 # 测试
-cargo test --lib          # 124 passed
-cargo test --doc          # 26 passed, 1 ignored
+cargo test                # 323 passed（lib 274 + 集成 22 + doctest 27）
+cargo test --lib          # 274 passed
+cargo test --lib --no-default-features   # 198 passed（验证 feature 门控）
+cargo test --doc          # 27 passed, 0 ignored
 
 # 基准
 cargo bench               # 约 16 组，warm_up 4s / measure 10s，耗时较长
@@ -143,25 +144,31 @@ cargo run --example subviewport
 
 ## 注意事项
 
-- **`cargo test` 与 `cargo build --examples` 当前失败**（HEAD 未修复）。
-  `examples/gallery/main.rs:220` 在 `unsafe {}` 块内调用 `draw_line_unchecked`，
-  但该方法在 `src/core.rs:977` 是**私有**的（同类中的
-  `set_pixel_unchecked` 才是 `pub`）。这是唯一错误，其余目标均可编译。
-  修复前不要把 `cargo test` 的失败当作新引入的回归。两种修法见
-  `examples/AGENTS.md` 的「已知破损」。
-- **MSRV 文档与配置矛盾**：`src/lib.rs:27` 与 `src/error.rs:20` 声称 MSRV 1.79
-  （理由为 `core::error::Error` 需 1.81），但 `Cargo.toml` 用
-  `edition = "2024"`，实际要求 Rust 1.85+。真实的下限由 edition 决定。
-- **`lib.rs:59` 的 API 表格宣传了 `draw_line_unchecked`**，但它并未公开——
-  文档与代码不一致，以代码为准。
-- **`alloc` feature 是死的**。`Cargo.toml` 声明它、`lib.rs:38` 的表格宣传它
-  「解锁自持有存储的便捷容器」，但 `rg 'feature = "alloc"'` 在
-  `src/`、`examples/`、`benches/` 里零命中。同表称「`programmable` 是唯一
-  需要 `alloc` 的特性」也不成立——`programmable` 的顶点缓存借用调用方切片。
-  要么实现要么从 feature 表删除。
-- **`VecVertexCache` 尚不存在**，但 `src/programmable/cache.rs:20` 的模块文档
-  与 `VertexCache` 的结构体文档都引用了它，并写「两者都遵循同一份契约」，
-  而对照表只列了一行。
+- **已知缺陷：`fill_triangle` 水平底边的绕向不对称**。`y2 == y3`（水平底边）时
+  三顶点按 Y 排序不唯一，`x2` 取决于顶点顺序，而 `x2` 是 `lower` 段的 `base_x`：
+  正序触发 `interpolate_scan_x` 的 `delta_y == 0` 短路返回 `x2`，反序走插值，
+  同一三角形两种绕向**相差 1 个像素**。已用实验确认与其它修复无关。
+  修它要改几何语义（`lower` 段在 `y2 == y3` 时应取 `x3`），风险高于收益。
+  现状由 `fill_triangle_horizontal_bottom_edge_is_winding_asymmetric` 记录——
+  **该测试断言的是 `assert_ne!`，缺陷修好的那一刻它会主动失败并提示你改写。**
+- **`sub_view` 在 `x > 0` 时恒定少一行**：这不是保守取舍，而是 `Renderer::new`
+  要求切片至少 `pitch × height` 的硬约束（窗口切片取自
+  `&mut fb[off..off + pitch × height]`，末行也必须凑满一整行）。按可见像素算本可
+  多一行，但那样切片会超出缓冲区、构造时 panic。详见 `sub_view` 文档
+  「为什么 `x > 0` 时恒定少一行」小节。
+- **`clip_line` 的左/上边界分支是死代码**：`compute_code` 里的 `LEFT`/`BOTTOM`
+  判断永不成立——`Pixel` 字段是 `usize`，负坐标无法表达。
 - `release` profile 开了 `panic = "abort"`；`bench` profile 未开（基准需要
   unwind 以捕获 panic）。
 - `no_std` 但库内不含 `unsafe` 的 `extern "C"` ABI，全部通过安全 API 暴露。
+- 测试规模与分布见 `target/TEST_PLAN.md` §6.1（该文件在 `.gitignore` 内）。
+
+## 已修复的历史缺陷（均有回归护栏）
+
+| 缺陷 | 影响 |
+|------|------|
+| `color!` 宏无法匹配字符串字面量 | 文档宣传的 `color!("#RRGGBB")` 从未能编译 |
+| `clear` 无条件 memcpy 16 字节模式 | `pitch > row_len && row_len < 16` 时污染行填充字节 |
+| `fill_visible_horizontal_span` 越界写 | **内存破坏**（release 静默写坏内存） |
+| `fill_circle`/`fill_arc` 的 `cx ± half` i64 溢出 | 大坐标 panic |
+| `ceil_to_usize(f32::NAN)` 返回 1 | 三角形 bbox 凭空多扩一像素 |

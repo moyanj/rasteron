@@ -13,13 +13,31 @@ use crate::simd;
 ///
 /// # 收缩规则
 ///
-/// 越界部分静默收缩，不 panic：
+/// 越界部分静默收缩，不 panic。收缩高度取以下三者的**最小值**：
 ///
-/// * `width`/`height` 超出可视区时，按 `info.width - x` / `info.height - y` 收缩。
-/// * 行数另受可用字节限制——窗口起点 `off` 之后必须还放得下每行 `pitch` 字节
-///   （`new` 的断言按 `pitch × height` 口径要求），故行数收缩到
-///   `(fb.len() - off) / pitch`。窗口贴住缓冲区末尾时**可能少最后一行**，
-///   这是 `pitch` 行填充被计入的必然结果，不是缺陷。
+/// 1. `height` 本身；
+/// 2. 可视区剩余高度 `info.height - y`；
+/// 3. 可用字节能容纳的完整行数 `(fb.len() - off) / pitch`。
+///
+/// # 为什么 `x > 0` 时恒定少一行
+///
+/// 第 3 条是 [`Renderer::new`] 的**硬约束**所迫，不是保守取舍。该构造按
+/// `pitch × height` 口径校验缓冲区切片长度，而窗口切片取自
+/// `&mut fb[off..off + pitch × height]`，故末行也必须凑满一整行 `pitch` 字节。
+///
+/// 当 `x > 0` 时，窗口右侧的 `x × bpp` 字节不属于窗口，却仍占用 `off` 之后的
+/// 可用字节，于是最后一行的可用字节被这些空隙吃掉一截，行数随之少一行。
+///
+/// 具体例子：父缓冲 64×64、`pitch = 256`，窗口起点 `(8, 8)`：
+/// `off = 8×256 + 8×4 = 2080`，`avail = 16384 - 2080 = 14304`，而 56 行需要
+/// `256 × 56 = 14336` 字节——差 32 字节，故最多 55 行。若改按可见像素计算
+/// （`(avail - sub_w × bpp) / pitch + 1`）本可得到 56 行，但那样切片长度会超出
+/// 缓冲区，`Renderer::new` 会在构造时 panic。
+///
+/// `x == 0` 时没有右侧空隙，行数上限与可视高度一致。
+///
+/// 要让 `x > 0` 时也拿满行数，必须放宽 [`Renderer::new`] 使其接受「末行不足
+/// `pitch`」的切片——那是构造契约的改动，不在 `sub_view` 的职责内。
 ///
 /// # 示例
 ///
@@ -76,6 +94,9 @@ pub fn sub_view<'a>(
 ///
 /// `back` 必须能容纳 `pitch × 收缩后高度` 字节（与前台切片同口径，含行填充）。
 /// 不足时返回 `None`，不 panic。
+///
+/// 收缩规则（含「`x > 0` 时恒定少一行」的原因）与 [`sub_view`] 完全一致——
+/// 两者共用 [`sub_view_geometry`]。
 ///
 /// # 示例
 ///
@@ -172,6 +193,19 @@ fn sub_view_geometry(
     let avail = fb_len.checked_sub(offset)?;
 
     // 可用完整行数：每行必须占据完整的 `pitch` 字节，含行填充。
+    //
+    // 这不是「多算一行」的问题，而是 `Renderer::new` 的**硬约束**：它按
+    // `pitch × height` 口径校验切片长度，而窗口切片是 `&mut fb[offset..offset+len]`。
+    // 末行要凑满一整行 `pitch`，就要求 `offset + pitch × sub_h <= fb_len`。
+    //
+    // 因此 `x > 0` 时窗口右侧的 `x × bpp` 空隙会「吃掉」最后一行的可用字节，
+    // 使行数恒定比可视高度少一行。例如父缓冲 64×64、pitch = 256、窗口起点
+    // (8, 8)：`offset = 2080`、`avail = 14304`，而 56 行需要 `pitch × 56 = 14336`
+    // 字节，差 32 字节，故最多 55 行。按可见像素算（`(avail - sub_w×bpp)/pitch + 1`）
+    // 本可给出 56 行，但那样切片长度会超出缓冲区，`Renderer::new` 直接 panic。
+    //
+    // 要多这一行，必须让 `Renderer::new` 接受「最后一行不足 pitch」的切片——
+    // 那是构造契约的改动，超出本函数范围。
     let rows = avail / pitch;
     let sub_h = sub_h.min(rows);
     if sub_h == 0 {
@@ -320,15 +354,26 @@ pub(crate) fn floor_to_usize(value: f32) -> usize {
     if value < 0.0 { 0 } else { value as usize }
 }
 
-/// 向上取整后转为 `usize`；非正值返回 `0`。
+/// 向上取整后转为 `usize`；非正值与 `NaN` 返回 `0`。
 ///
 /// 不能直接用 `f32 as usize`：后者向零取整，对 `2.0` 会得到 2 而非上取整
 /// 应有的 3，对 `-1.0` 还会因负数转无符号而得到 0（依赖 Rust 的饱和转换）。
 /// 这里显式区分整数值与非整数值，用于三角形包围盒的右/下边界。
+///
+/// # `NaN` 的处理
+///
+/// `NaN` 显式归零。原先的条件是 `value <= 0.0`，而 `NaN <= 0.0` 为 `false`
+/// 会绕过早退：`NaN as usize` 饱和为 0，而 `0 as f32 == NaN` 亦为 `false`，
+/// 于是落到 `truncated.saturating_add(1)` 返回 **1**。对用于 bbox 的助手而言
+/// 返回 1 会让包围盒凭空多扩一像素，且「NaN → 1」是极难排查的行为。
+///
+/// `+∞` 仍返回 `usize::MAX`（饱和转换），这是合理的：它确实大于任何有限坐标。
 #[cfg(feature = "programmable")]
 #[inline(always)]
 pub fn ceil_to_usize(value: f32) -> usize {
-    if value <= 0.0 {
+    // 用 `!(value > 0.0)` 一次性覆盖「<= 0」与「NaN」两种情形：
+    // NaN 的任何比较都为 false，故 `NaN > 0.0` 为 false，取反即为 true。
+    if !(value > 0.0) {
         return 0;
     }
     let truncated = value as usize;
@@ -517,8 +562,14 @@ mod tests {
     /// `rows = (pitch × height - y × pitch - x × bpp) / pitch` 展开：
     ///
     /// * `x == 0` 时 `rows == 64 - y`，与可视高度相同，行数上限不额外收紧；
-    /// * `x > 0` 时多出 `x × bpp / pitch` 的非整行偏移，整除后**恒定少一行**——
-    ///   这正是 `sub_view` 文档所说「窗口贴住缓冲区末尾时可能少最后一行」的成因。
+    /// * `x > 0` 时多出 `x × bpp / pitch` 的非整行偏移，整除后**恒定少一行**。
+    ///
+    /// 少这一行是 [`Renderer::new`] 的硬约束所迫，不是保守取舍：它要求切片长度
+    /// 至少 `pitch × height`，而窗口切片是 `&mut fb[off..off + pitch × height]`。
+    /// 以 `x = 8, y = 8` 为例，`off = 2080`、`avail = 14304`，而 56 行需要
+    /// `256 × 56 = 14336` 字节——差 32 字节，故最多 55 行。本测试用「按可见像素
+    /// 算出的行数所需切片长度确实超出可用字节」把这一点钉死，防止将来有人
+    /// 误以为少算了一行而去改公式（那会让 `Renderer::new` panic）。
     #[test]
     fn sub_view_shrinks_to_smaller_of_visible_area_and_available_rows() {
         let (info, mut fb) = make_parent();
@@ -539,6 +590,23 @@ mod tests {
             (56, 55),
             "x = 8 时宽度取可视区 56，高度取可用行数 55"
         );
+
+        // 少的那一行确实是「差一个完整 pitch」，不是保守浪费：
+        // 按可见像素本可算出 56 行，但它需要的切片长度超出了可用字节。
+        {
+            let (x, y, bpp) = (8usize, 8usize, info.bytes_per_pixel());
+            let off = y * info.pitch + x * bpp;
+            let avail = fb.len() - off;
+            let sub_w = info.width - x;
+            let rows_if_pixel_exact = (avail - sub_w * bpp) / info.pitch + 1;
+            assert_eq!(rows_if_pixel_exact, 56, "按可见像素可算出的行数");
+            assert!(
+                info.pitch * rows_if_pixel_exact > avail,
+                "多出的那一行需要的切片长度 {}/{} 已超出可用字节，故不可能实现",
+                info.pitch * rows_if_pixel_exact,
+                avail
+            );
+        }
 
         // 起点上移一行，可视区放宽到 60 行，可用行数同步放宽到 59 行——仍差 1。
         let panel = sub_view(&mut fb, &info, 8, 4, 1000, 1000).expect("应收缩");
@@ -1131,13 +1199,7 @@ mod tests {
         assert_eq!(floor_to_usize(f32::INFINITY), usize::MAX);
     }
 
-    /// `ceil_to_usize`：整数值不 +1，非整数值 +1，负值与 `-∞` → 0。
-    ///
-    /// **注意一个反直觉的实际行为**：`ceil_to_usize(f32::NAN)` 返回 **1**，
-    /// 不是 0。原因是 `NaN <= 0.0` 为 `false`，于是绕过早退分支，
-    /// `(NaN as usize)` 饱和为 0，而 `0 as f32 == NaN` 为 `false`，
-    /// 最终走 `truncated.saturating_add(1)` 得到 1。此处按实现断言并加注释，
-    /// 以便将来若修正该行为时能立刻看到契约变化。
+    /// `ceil_to_usize`：整数值不 +1，非整数值 +1，负值、`NaN` 与 `-∞` → 0。
     #[test]
     #[cfg(feature = "programmable")]
     fn ceil_to_usize_handles_integer_fractional_nan_and_infinity() {
@@ -1153,11 +1215,35 @@ mod tests {
         assert_eq!(ceil_to_usize(-0.5), 0);
         assert_eq!(ceil_to_usize(-0.0), 0);
         assert_eq!(ceil_to_usize(f32::NEG_INFINITY), 0);
-        // `NaN` → 1（反直觉，见文档注释）。
-        assert_eq!(ceil_to_usize(f32::NAN), 1);
+        // `NaN` → 0。曾经的实现返回 1：`NaN <= 0.0` 为 false 绕过早退，
+        // `NaN as usize` 饱和为 0，而 `0 as f32 == NaN` 也是 false，
+        // 于是走 `saturating_add(1)`。对 bbox 助手而言这会让包围盒凭空多扩
+        // 一像素，故显式归零。若此断言失败，说明 NaN 又被放行了。
+        assert_eq!(
+            ceil_to_usize(f32::NAN),
+            0,
+            "NaN 必须归零，否则三角形 bbox 会凭空多扩一像素"
+        );
         // `+∞`：`(∞ as usize)` 饱和到 usize::MAX，且 `usize::MAX as f32 == ∞`
         // 成立，故整数分支返回 usize::MAX 而不再 +1。
         assert_eq!(ceil_to_usize(f32::INFINITY), usize::MAX);
+    }
+
+    /// `floor_to_usize` 的 `NaN` 同样归零，与 `ceil_to_usize` 保持一致。
+    ///
+    /// `floor_to_usize` 的条件是 `value < 0.0`，`NaN < 0.0` 为 false，
+    /// 于是 `NaN as usize` 饱和为 0 —— 结果**恰好**正确，但走的是饱和转换
+    /// 而非显式判断。此测试固化该契约，防止将来重构时把 0 变成别的东西。
+    #[test]
+    #[cfg(feature = "programmable")]
+    fn floor_to_usize_maps_nan_to_zero() {
+        assert_eq!(floor_to_usize(f32::NAN), 0);
+        // 两个助手在 NaN 上必须一致，否则 bbox 的左右边界会来自不同语义。
+        assert_eq!(
+            floor_to_usize(f32::NAN),
+            ceil_to_usize(f32::NAN),
+            "两个取整助手对 NaN 的处理应一致"
+        );
     }
 
     /// 两个取整助手的分工契约：非负有限值上 `ceil - floor ∈ {0, 1}`。

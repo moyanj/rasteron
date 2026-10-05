@@ -1,6 +1,6 @@
 # examples — 4 个示例 + 共享 BMP 工具
 
-**生成时间:** 2026-10-05 · 提交 `7009f2a` · 5 文件 1687 行
+**生成时间:** 2026-10-06 · 5 文件
 
 这些是**独立 bin 目标**（`std` 可用，不是 `no_std`），cargo 按
 「每个子目录一个 `main.rs`」自动发现，无需在 `Cargo.toml` 注册。
@@ -58,31 +58,18 @@ HEIGHT = ROWS * (CELL_H + TITLE_H) + GAP
 按 `c` 计算原点，调 `draw_frame` 拿内容区，再画图，最后在 `main` 的网格里
 登记——`index` 决定强调色（`ACCENTS[index % ACCENTS.len()]`）。
 
-## 已知破损
+## 已修复：`gallery` 曾调用私有方法
 
-**`gallery/main.rs:220` 调用私有方法，examples 整体无法编译。**
+原先 `gallery/main.rs` 在 `unsafe {}` 块内调用 `draw_line_unchecked`，而该方法
+在 `src/core.rs` 是**私有**的（同类中的 `set_pixel_unchecked` 才是 `pub`），
+导致 `cargo build --examples` 与 `cargo test` 失败。
 
-```rust
-// SAFETY: 端点均在格内且由 `draw_line_unchecked` 自行裁剪，无需调用方保证
-unsafe {
-    r.draw_line_unchecked(...);   // ← error[E0624]: private method
-}
-```
+现按推荐的方案改成了公共 API：受安全与非安全版本对照的那两条水平线都改用
+`r.draw_line(...)`（`gallery/main.rs` 的 `cell_line`）。`draw_line` 内部已经
+通过 `clip_line` + 区间收窄完成裁剪，语义等价，**无需库侧放开 API**。
 
-`draw_line_unchecked` 在 `src/core.rs:977` 是**私有**的（同类中的
-`set_pixel_unchecked` 才是 `pub`）。这是 `cargo build --examples` 与
-`cargo test` 的**唯一**错误，其余目标（lib / bins / benches / doctest）
-全部通过。
-
-两种修法，二选一：
-
-- **改成 `r.draw_line(...)`**——公共 API 内部已在 `draw_line` 里裁剪，
-  语义等价，无需库侧改动。**推荐**。
-- 把 `draw_line_unchecked` 改成 `pub unsafe fn`——需要库侧放开 API，
-  但 `lib.rs:59` 的表格已经把它宣传成公开方法了，改动后文档反而自洽。
-  这属于扩大公开 API 面，须先确认。
-
-修复前不要把 `cargo test` 的失败当作新引入的回归。
+`lib.rs` 的固定功能图元表格里原先宣传的 `draw_line_unchecked` 一并删除——
+它始终不是公开方法，以代码为准。
 
 ## 验证
 
@@ -92,7 +79,7 @@ cargo run --example gallery      # 改动图元后的比对基准
 cargo run --example programmable
 cargo run --example subviewport
 
-cargo build --examples           # 当前 FAIL（见「已知破损」）
+cargo build --examples           # 当前 PASS
 cargo build --benches            # benches 也用 programmable，验证共享链路
 ```
 

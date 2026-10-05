@@ -1,6 +1,6 @@
 # src/ 实现层
 
-**生成时间:** 2026-10-05 · 提交 `7009f2a` · 9 个 `.rs` + 1 个子目录，约 10 100 行
+**生成时间:** 2026-10-06 · 11 个 `.rs` + 1 个子目录，约 13 300 行（含约 8 000 行测试）
 
 全部手写实现，无 `unsafe extern "C"` FFI，无代码生成（唯一例外：`angle.rs`
 的 257 项正弦波表是脚本产物后手抄入库的）。
@@ -9,19 +9,23 @@
 
 | 文件 | 行数 | 职责 | 出口 |
 |------|------|------|------|
-| `core.rs` | 3819 | `Renderer` + 全部固定功能图元 + 4 个字节序写宏 | `pub struct Renderer<'a>` |
-| `color.rs` | 1517 | `Color`、`PixelFormat`、色彩常量、**内嵌 `pub(crate) mod swar`** | `pub struct Color` / `pub enum PixelFormat` |
-| `angle.rs` | 630 | 圈值 `Angle`、`Wedge`（弧形判定）、257 项正弦波表 | `pub struct Angle` |
-| `utils.rs` | 458 | `sub_view` 子视口、`clip_line`（Cohen–Sutherland）、`pattern_fill`、f32 取整助手 | 若干 `pub fn` |
-| `error.rs` | 213 | 全库错误类型唯一定义处 + `Display` 契约测试 | `ColorParseError` / `DrawError` / `TextureError` |
+| `core.rs` | 5253 | `Renderer` + 全部固定功能图元 + 4 个字节序写宏 | `pub struct Renderer<'a>` |
+| `color.rs` | 2006 | `Color`、`PixelFormat`、色彩常量、**内嵌 `pub(crate) mod swar`** | `pub struct Color` / `pub enum PixelFormat` |
+| `angle.rs` | 908 | 圈值 `Angle`、`Wedge`（弧形判定）、257 项正弦波表 | `pub struct Angle` |
+| `utils.rs` | 1328 | `sub_view` 子视口、`clip_line`（Cohen–Sutherland）、`pattern_fill`、f32 取整助手 | 若干 `pub fn` |
+| `error.rs` | 326 | 全库错误类型唯一定义处 + `Display` 契约测试 | `ColorParseError` / `DrawError` / `TextureError` |
 | `simd.rs` | 211 | 5 条 ISA 分支的 `memcpy`（AVX-512/AVX2/SSE2/NEON/RVV） | `pub unsafe fn memcpy` |
-| `framebuffer.rs` | 80 | 布局元数据 + pitch 断言 | `pub struct FramebufferInfo` |
-| `pixel.rs` | 49 | 二维坐标 + `pixel!` 宏 | `pub struct Pixel` |
+| `framebuffer.rs` | 184 | 布局元数据 + pitch 断言 | `pub struct FramebufferInfo` |
+| `pixel.rs` | 51 | 二维坐标 + `pixel!` 宏 | `pub struct Pixel` |
 | `main.rs` | 39 | **bin 目标**：1280×720 BGR24 画一条线后落盘 | — |
-| `programmable/` | 1178 | feature 门控的 f32 可编程管线 | 见 `programmable/AGENTS.md` |
+| `programmable/` | 2866 | feature 门控的 f32 可编程管线 | 见 `programmable/AGENTS.md` |
 
-`core.rs` 的 3819 行里约 2200 行是 `#[cfg(test)]`（72 个测试），
-实际实现约 1600 行——读它时先跳过测试模块。
+`core.rs` 的 5253 行里约 3600 行是 `#[cfg(test)]`（83 个测试），
+实际实现约 1650 行——读它时先跳过测试模块。
+
+全库测试分布（`cargo test --lib` = 274 passed）：
+`core` 83、`programmable`（含 cache/shader）61、`color` 46、`angle` 40、
+`utils` 40、`framebuffer` 13、`error` 7、`simd` 7，另有 `pixel` 的 doctest。
 
 ## 内部依赖图
 
@@ -83,7 +87,9 @@ pixel ───────┘    ├─ programmable (feature)
 - **`as` 只用于 `f32 as usize` 之外的自解释窄化**；`usize → i64`、
   坐标相减一律走饱和/检查路径。
 - **`no_std` 测试**：任何用到 `String` / `Vec` / `format!` 的
-  `#[cfg(test)]` 模块都要显式 `extern crate alloc;`，范例见 `error.rs:157-164`。
+  `#[cfg(test)]` 模块都要显式 `extern crate alloc;`；用到 `vec!` 还要
+  `use alloc::vec;`，用到 `Vec` 还要 `use alloc::vec::Vec;`。范例见
+  `error.rs` 与 `color.rs` 的 `mod tests`。
   `criterion` 风格的 `black_box` 走 `core::hint`。
 - **测试风格**：几乎全部用 `should_panic` + 消息子串断言（如
   `framebuffer.rs:76`）或精确像素断言；`CircleKind` 式的自解释枚举在
@@ -93,10 +99,16 @@ pixel ───────┘    ├─ programmable (feature)
 
 ```bash
 cargo check --no-default-features      # 唯一能验证「无浮点契约」的门径
-cargo test --lib                       # 124 passed
+cargo test --lib                       # 274 passed
+cargo test --lib --no-default-features # 198 passed（验证 feature 门控）
 cargo build --bins                     # 验证 src/main.rs 这个 bin 目标
 ```
 
-改动 `core.rs` 后务必跑 `cargo test --lib`——它的 72 个测试里有大量
-像素级覆盖等价性断言（线段收窄、圆盘钳制、SWAR 对齐回退），
+改动 `core.rs` 后务必跑 `cargo test --lib`——它的 83 个测试里有大量
+像素级覆盖等价性断言（线段收窄、圆盘钳制、SWAR 对齐回退、跨度求交顺序），
 那些是防止性能优化改坏语义的护栏，不是可选的覆盖率。
+
+特别注意 `fill_visible_horizontal_span` 的**顺序契约**：必须
+「排序 → 求交 → 隐式夹取」。改成「各自 clamp」会在屏幕边缘凭空画出
+一列（完全越界的跨度被压成边缘单像素）；去掉 `swap` 排序则会丢掉
+`fill_triangle` 的反序跨度（实测多数绕向下 9/12 行是反序的）。

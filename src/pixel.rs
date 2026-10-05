@@ -47,5 +47,3 @@ macro_rules! pixel {
         $crate::pixel::Pixel::new($x as usize, $y as usize)
     };
 }
-
-// 给这玩意加注释的司马
