@@ -1,18 +1,21 @@
 # src/ 库本体
 
-`no_std` 实现，唯一有业务逻辑的目录。无子目录，全部平铺在 `src/` 下。
+`no_std` 实现，唯一有业务逻辑的目录。`programmable/` 是唯一子目录（管线阶段与顶点缓存），其余文件平铺在 `src/` 下。
 
 ## 文件职责
 
 | 文件 | 行数 | 职责 | 扩展点 |
 |------|------|------|--------|
-| `lib.rs` | 111 | `#![no_std]`、feature 门控、文档首页 | 无 |
-| `core.rs` | 2835 | `Renderer` 与固定功能图元 | 新增图元 |
-| `angle.rs` | 642 | 定点 `Angle` + 楔形 `Wedge` | 改角度精度 / 三角实现 |
-| `programmable.rs` | 2145 | 2D 可编程管线 | 实现 `VertexShader` / `FragmentShader` / `Interpolate` |
-| `color.rs` | 977 | `Color`、`PixelFormat`、混合、SWAR 内核 | 新增像素格式 |
+| `lib.rs` | 116 | `#![no_std]`、feature 门控、文档首页 | 无 |
+| `core.rs` | 2860 | `Renderer` 与固定功能图元 | 新增图元 |
+| `angle.rs` | 630 | 定点 `Angle` + 楔形 `Wedge` | 改角度精度 / 三角实现 |
+| `programmable/mod.rs` | 1271 | 图元装配与光栅化、`draw_arrays` / `draw_indexed` | 新增图元类型 |
+| `programmable/shader.rs` | 34 | 内建透传顶点着色器 `Passthrough2D` | 新增内建着色器 |
+| `programmable/cache.rs` | 252 | 顶点缓存：借用调用方槽位的 `VertexCache` | 新增缓存策略 |
+| `color.rs` | 1129 | `Color`、`PixelFormat`、混合、SWAR 内核 | 新增像素格式 |
+| `error.rs` | 210 | 全库错误类型的唯一定义处 | 新增错误类别 |
 | `simd.rs` | 211 | 分派 memcpy | 扩指令阶梯 |
-| `utils.rs` | 176 | 裁剪、饱和转换、模式填充 | 无（私有） |
+| `utils.rs` | 305 | 裁剪、饱和转换、模式填充、视口变换 | 无（多为私有） |
 | `framebuffer.rs` | 80 | 布局描述与不变量断言 | 无 |
 | `pixel.rs` | 49 | 坐标类型与宏 | 无 |
 | `main.rs` | 39 | 演示二进制，非库的一部分 | 无 |
@@ -123,7 +126,7 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 
 | 阶段 | 输入 → 输出 | 坐标空间 |
 |------|-------------|----------|
-| 顶点着色 | `VS::Input` → `ProgramVertex` | normalized `[0,1]²` |
+| 顶点着色 | `VS::Input` → `FragmentInput`（即 `Vertex2D`） | normalized `[0,1]²` |
 | 图元裁剪 | 半平面裁剪 | normalized `[0,1]²`，保证顶点全部落在内部 |
 | 视口变换 | `ndc_to_screen` | viewport 内浮点像素 |
 | 光栅化 + 片元着色 | 重心权重插值 → `shade_fragment` → `BlendMode` 写入 | 光栅化按屏幕像素定位；回传给 `shade_fragment` 的 `FragmentInput.position` 仍是 normalized `[0,1]²` |
@@ -140,7 +143,13 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 
 **取整由各图元自负**：`write_fragment_color` 只收整数像素坐标。点用向零取整（`floor_to_usize`），线段用四舍五入（`floor_to_usize(v + 0.5)`），三角形在 bbox 内整数扫描——三者不可互换，故取整不能收进写入层，否则线段覆盖会被静默改变。
 
-`draw_indexed` 尚未在新模块中实现；计划中的惰性顶点缓存由**调用方**提供（`Option<&mut [Option<...>]>`），实现内部不分配。
+`draw_indexed` 的第 5 参是 `Option<&mut VertexCache<'_, VS::Varying>>`。`None` = 每次重新着色；`Some(cache)` = 按顶点索引惰性复用，`cache.len()` 短于顶点数时退化为部分缓存（高索引每次重新着色），越界不 panic。缓存自身不分配：`VertexCache`（`programmable/cache.rs`）借用调用方槽位，`no_std` 下可用。`VertexShader::shade_vertex` 必须是纯函数，否则命中与未命中的结果会不一致。
+
+**索引校验先于任何绘制**：越界返回 `DrawError::IndexOutOfBounds`，且整次调用不产生任何片元——半途报错会在帧缓冲里留下「画了一半」的残留。尾部不足一个完整图元的索引（`Lines` 余 1、`Triangles` 余 1/2）静默丢弃。
+
+`draw_arrays` 与 `draw_indexed` 共用私有的 `assemble_primitives`：闭包 `resolve(slot) -> FragmentInput` 把**装配位置**映射到顶点着色结果（前者传顶点下标，后者传索引缓冲查表），装配与光栅化逻辑因此只有一份，两条 API 的像素覆盖逐位一致，由 `programmable::tests::indexed_matches_arrays_for_every_primitive` 守护。
+
+**不要用「线段端点反序应当翻转渐变」验证索引是否生效**。`Interpolate::lerp(a, b, t)` 逐通道恒等于 `lerp(b, a, 1 - t)`，而端点反序后落在同一像素的步进参数恰为 `1 - t`，两者相乘抵消——**任何两顶点线段反转索引后逐像素完全相同**，这是数学恒等式而非实现缺陷，该断言恒不成立。验证索引生效要用「换顶点子集」（`indexed_selects_vertices_through_the_index_buffer`），或用三角形换索引（三角形反转顺序同样不可观测：重心权重跟随各自顶点）。
 
 ## color.rs
 
@@ -177,7 +186,8 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 | `angle.rs:404` | `Angle` 定点三角（基准角精确、单位恒等式、往返）、`Wedge` 楔形判定（含大跨度与容差） |
 | `color.rs:875` | `Color` 构造/解析/混合、`PixelFormat::write_color`/`read_color` |
 | `color.rs:626` | **内嵌在 `mod swar` 内**，直接测 `blend_word` / `source_word` / `blend_span_alpha_4bpp` / `blend_masked_row_4bpp` |
-| `programmable/mod.rs` 末尾 | 点图元的 viewport 原点落位、scissor 下着色器不被调用、`BlendMode::None` 的无条件覆盖、Alpha 混合的 Color 层/字节层逐位等价 |
+| `programmable/cache.rs` | 缓存命中/回填/清空、越界索引不 panic、短缓存降级为部分命中 |
+| `programmable/mod.rs` | `draw_arrays` / `draw_indexed` 的图元装配、索引校验、缓存命中与跨调用复用、空可见区域短路 |
 | `framebuffer.rs:62` | `buffer_size` 派生与 `pitch` 下限断言 |
 
 `diff_probe`（`core.rs:2242`）默认 `#[ignore]`，它不是回归断言，而是跨实现比对工具：穷举 4 组尺寸 × 3 个圆心 × 13 个半径 × 2 种图元，把「非背景像素数 + FNV-1a 摘要」写进 `PROBE_OUT`（默认 `diff-probe.txt`）供人工 diff 两次实现的输出。触发方式：`PROBE_OUT=/tmp/a cargo test --lib diff_probe -- --ignored`。
@@ -187,6 +197,8 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 该模块需要 `extern crate alloc;` 与 `extern crate std;`：`#![no_std]` 下两者都不在 extern prelude，即使只在 `#[cfg(test)]` 里也必须显式引入。
 
 `utils.rs` / `simd.rs` / `pixel.rs` 无单测——它们的行为通过上述集成路径间接覆盖。`simd.rs` 尤其无测试，因为验证它需要真实向量指令集，只能靠 `cargo bench` 观察。
+
+`programmable/shader.rs` 目前没有单测；它只有一个 `Passthrough2D` 透传实现，其行为已由 `programmable/mod.rs` 的多条 `draw_*` 测试间接覆盖。
 
 命名语义：
 

@@ -13,6 +13,7 @@ default = ["programmable", "simd"]
 double_buffer = []
 programmable = []
 simd = []
+alloc = []
 
 [profile.release]
 opt-level = 3

@@ -27,7 +27,7 @@ where
     type Input = Vertex2D<V>;
     type Varying = V;
 
-    /// 把 [`Vertex2D`] 原样转换为 [`ProgramVertex`]。
+    /// 把 [`Vertex2D`] 原样转换为 [`FragmentInput`]。
     fn shade_vertex(&self, input: &Self::Input) -> FragmentInput<Self::Varying> {
         (*input).into()
     }

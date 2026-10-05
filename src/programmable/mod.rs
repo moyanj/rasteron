@@ -1,6 +1,9 @@
 use crate::utils::{ceil_to_usize, floor_to_usize, normalized_to_screen};
 use crate::{Renderer, color::Color, error::DrawError};
+pub mod cache;
 pub mod shader;
+
+use crate::programmable::cache::VertexCache;
 
 pub type Vec2 = [f32; 2];
 pub type Vec3 = [f32; 3];
@@ -528,6 +531,12 @@ impl<'a> Renderer<'a> {
 
     /// 光栅化线图元。
     ///
+    /// **端点顺序对输出不可观测（这是数学恒等式，不是实现缺陷）**：
+    /// `Interpolate::lerp(a, b, t)` 逐通道等于 `lerp(b, a, 1 - t)`，而反序端点后
+    /// 落在同一像素 x 的步进参数恰为 `1 - t`。两者相乘抵消，**任何两顶点线段在
+    /// 反转索引后逐像素相同**（含取整）。因此不要试图用「线段端点反序应当翻转渐变」
+    /// 来验证索引是否生效——该断言恒不成立。索引生效的正确验证方式见
+    /// `tests::indexed_selects_vertices_through_the_index_buffer`。
     fn rasterize_line<FS: FragmentShader>(
         &mut self,
         input: [FragmentInput<FS::Varying>; 2],
@@ -537,6 +546,11 @@ impl<'a> Renderer<'a> {
     ) {
         let p0 = normalized_to_screen(input[0].position, state.viewport);
         let p1 = normalized_to_screen(input[1].position, state.viewport);
+
+        // 不拦住就会把不可见的图元判成可见（同 `contains_normalized` 的处理）。
+        if !(p0[0].is_finite() && p0[1].is_finite() && p1[0].is_finite() && p1[1].is_finite()) {
+            return;
+        }
 
         let delta = [p1[0] - p0[0], p1[1] - p0[1]];
         if delta[0] == 0.0 && delta[1] == 0.0 {
@@ -580,6 +594,92 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// 光栅化三角形图元。
+    ///
+    /// # 算法
+    ///
+    /// 遍历 `bbox ∩ bound` 内的整数像素，用边函数判定覆盖并直接得到重心权重。
+    /// 边函数是线性函数，其归一化值恰为重心坐标，因此覆盖判定与 varying 插值
+    /// 共用同一组权重，无需另算。
+    fn rasterize_triangle<FS: FragmentShader>(
+        &mut self,
+        input: [FragmentInput<FS::Varying>; 3],
+        bound: &Bounds,
+        fragment_shader: &FS,
+        state: &PipelineState,
+    ) {
+        #[inline]
+        fn edge(a: Vec2, b: Vec2, p: Vec2) -> f32 {
+            (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+        }
+        let v = [
+            normalized_to_screen(input[0].position, state.viewport),
+            normalized_to_screen(input[1].position, state.viewport),
+            normalized_to_screen(input[2].position, state.viewport),
+        ];
+        if v.iter().any(|p| !(p[0].is_finite() && p[1].is_finite())) {
+            return;
+        }
+
+        // 面积为零 = 三点共线，无内部像素。顺带避免权重除零。
+        let area = edge(v[1], v[2], v[0]) + edge(v[2], v[0], v[1]) + edge(v[0], v[1], v[2]);
+        if area == 0.0 {
+            return;
+        }
+
+        // bbox 必须先与 bound 求交，迭代量才与顶点坐标解耦
+        let min_x = v[0][0].min(v[1][0]).min(v[2][0]);
+        let max_x = v[0][0].max(v[1][0]).max(v[2][0]);
+        let min_y = v[0][1].min(v[1][1]).min(v[2][1]);
+        let max_y = v[0][1].max(v[1][1]).max(v[2][1]);
+
+        let x0 = floor_to_usize(min_x).max(bound.min_x);
+        let y0 = floor_to_usize(min_y).max(bound.min_y);
+        let x1 = ceil_to_usize(max_x).min(bound.max_x);
+        let y1 = ceil_to_usize(max_y).min(bound.max_y);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        for y in y0..y1 {
+            for x in x0..x1 {
+                // 采样点取像素中心，否则覆盖判定会整体偏移半像素
+                let p = [x as f32 + 0.5, y as f32 + 0.5];
+
+                let w0 = edge(v[1], v[2], p);
+                let w1 = edge(v[2], v[0], p);
+                let w2 = edge(v[0], v[1], p);
+                // 三条边全同号即在内部。用 area 的符号统一两方向，
+                // 顺时针的三角形不会只填出半个。
+                if (w0 * area < 0.0) || (w1 * area < 0.0) || (w2 * area < 0.0) {
+                    continue;
+                }
+
+                let fragment = FragmentInput {
+                    position: Interpolate::interpolate(
+                        input[0].position,
+                        input[1].position,
+                        input[2].position,
+                        w0 / area,
+                        w1 / area,
+                        w2 / area,
+                    ),
+                    varying: Interpolate::interpolate(
+                        input[0].varying,
+                        input[1].varying,
+                        input[2].varying,
+                        w0 / area,
+                        w1 / area,
+                        w2 / area,
+                    ),
+                };
+                if let FragmentOutput::Color(color) = fragment_shader.shade_fragment(fragment) {
+                    self.write_fragment_color(x, y, &color, state.blend);
+                }
+            }
+        }
+    }
+
     pub fn draw_arrays<VS, FS>(
         &mut self,
         primitive: PrimitiveType,
@@ -597,44 +697,191 @@ impl<'a> Renderer<'a> {
             None => return Ok(()),
         };
 
+        // 无缓存：每个顶点都重新着色一次，装配位置即顶点下标。
+        self.assemble_primitives(
+            primitive,
+            vertices.len(),
+            |index| pipeline.vertex_shader.shade_vertex(&vertices[index]),
+            pipeline,
+            &bound,
+        );
+        Ok(())
+    }
+
+    /// 索引绘制。缓存由调用方提供：
+    ///
+    /// * `cache` 为 `None` → 每次使用都重新着色（无缓存、零分配的基线语义）；
+    /// * `cache` 为 `Some(cache)` → 按顶点索引惰性着色并复用；`cache.len()`
+    ///   短于顶点数时退化为部分缓存（低索引命中、高索引每次都重新着色），
+    ///   越界不 panic。
+    ///
+    /// 顶点数据在两次调用间变化时，调用方负责清空槽位（[`VertexCache::clear`]）
+    /// 或不传 `cache`。
+    ///
+    /// # 索引校验
+    ///
+    /// 索引越界返回 [`DrawError::IndexOutOfBounds`] 而不是 panic 或静默跳图元：
+    /// 索引缓冲写错属于调用方的程序错误，fail-fast 更容易定位。
+    ///
+    /// **校验先于任何绘制**：只要有一个索引越界，整次调用不产生任何片元——
+    /// 部分写入后再报错会让调用方难以确定帧缓冲里残留了什么。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use rasteron::color::Color;
+    /// # use rasteron::framebuffer::{FramebufferInfo, PixelFormat};
+    /// use rasteron::programmable::cache::VertexCache;
+    /// use rasteron::programmable::shader::Passthrough2D;
+    /// use rasteron::programmable::{
+    ///     FragmentInput, FragmentOutput, FragmentShader, Pipeline, PipelineState,
+    ///     PrimitiveType, Vertex2D, Viewport,
+    /// };
+    /// # use rasteron::Renderer;
+    ///
+    /// struct SolidFs;
+    /// impl FragmentShader for SolidFs {
+    ///     type Varying = Color;
+    ///     fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+    ///         FragmentOutput::Color(input.varying)
+    ///     }
+    /// }
+    ///
+    /// # let info = FramebufferInfo::new(16, 16, 16 * 4, PixelFormat::Rgba8888);
+    /// # let mut fb = vec![0u8; info.buffer_size()];
+    /// # let mut renderer = Renderer::new(info, &mut fb);
+    /// let vertices = [
+    ///     Vertex2D { position: [0.0, 0.0], varying: Color::new(255, 0, 0) },
+    ///     Vertex2D { position: [1.0, 0.0], varying: Color::new(0, 255, 0) },
+    ///     Vertex2D { position: [1.0, 1.0], varying: Color::new(0, 0, 255) },
+    ///     Vertex2D { position: [0.0, 1.0], varying: Color::new(255, 255, 0) },
+    /// ];
+    /// // 索引 3 被引用两次，缓存只着色一次。
+    /// let indices = [0u16, 1, 2, 0, 2, 3];
+    /// let pipeline = Pipeline::new(
+    ///     Passthrough2D::new(),
+    ///     SolidFs,
+    ///     PipelineState::alpha_blend(Viewport::new(0, 0, 16, 16)),
+    /// );
+    ///
+    /// let mut slots: [Option<FragmentInput<Color>>; 4] = [None; 4];
+    /// let mut cache = VertexCache::new(&mut slots);
+    /// renderer
+    ///     .draw_indexed(PrimitiveType::Triangles, &vertices, &indices, &pipeline, Some(&mut cache))
+    ///     .unwrap();
+    /// ```
+    pub fn draw_indexed<VS, FS>(
+        &mut self,
+        primitive: PrimitiveType,
+        vertices: &[VS::Input],
+        indices: &[u16],
+        pipeline: &Pipeline<VS, FS>,
+        cache: Option<&mut VertexCache<'_, VS::Varying>>,
+    ) -> Result<(), DrawError>
+    where
+        VS: VertexShader,
+        FS: FragmentShader<Varying = VS::Varying>,
+    {
+        // 先整体校验索引，再进入图元装配：半途报错会留下「已画一半」的帧缓冲。
+        let vertex_count = vertices.len();
+        if let Some(position) = indices
+            .iter()
+            .position(|index| (*index as usize) >= vertex_count)
+        {
+            return Err(DrawError::IndexOutOfBounds {
+                index: indices[position] as usize,
+                vertex_count,
+            });
+        }
+
+        // 图元装配前先做视口校验：可见矩形为空说明整批图元都落在屏幕外，
+        // 直接成功返回，连顶点着色都不执行。
+        let bound = match self.visible_bounds(&pipeline.state) {
+            Some(bound) => bound,
+            None => return Ok(()),
+        };
+
+        // 闭包只借用 `cache`（`&mut`），装配时按索引惰性着色：
+        // 命中复用槽位，未命中执行顶点着色器并回填；越界索引由 `resolve` 静默降级。
+        let mut cache = cache;
+        self.assemble_primitives(
+            primitive,
+            indices.len(),
+            |slot| {
+                let vertex_index = indices[slot] as usize;
+                match cache.as_deref_mut() {
+                    Some(cache) => cache.resolve(
+                        &pipeline.vertex_shader,
+                        vertex_index,
+                        &vertices[vertex_index],
+                    ),
+                    None => pipeline.vertex_shader.shade_vertex(&vertices[vertex_index]),
+                }
+            },
+            pipeline,
+            &bound,
+        );
+        Ok(())
+    }
+
+    /// 图元装配：按 `primitive` 把前 `count` 个「已着色顶点」组装成图元并光栅化。
+    ///
+    /// `resolve` 负责把**装配位置**（`0..count`）映射到实际的顶点着色结果：
+    /// [`Self::draw_arrays`] 传顶点下标，[`Self::draw_indexed`] 传索引缓冲查表，
+    /// 因此两条公开 API 共用同一份装配与光栅化逻辑，像素覆盖逐位一致。
+    ///
+    /// `resolve` 返回 `FragmentInput`（`Copy`），故按值传出不会引入生命周期约束；
+    /// 缓存的 `&mut` 借用只存在于闭包内部，不会与 `self` 的借用冲突。
+    ///
+    /// 尾部不足一个完整图元的索引（`Lines` 余 1 个、`Triangles` 余 1 或 2 个）被
+    /// 静默丢弃，与 [`Self::draw_arrays`] 对顶点缓冲的处理一致。
+    fn assemble_primitives<VS, FS, R>(
+        &mut self,
+        primitive: PrimitiveType,
+        count: usize,
+        mut resolve: R,
+        pipeline: &Pipeline<VS, FS>,
+        bound: &Bounds,
+    ) where
+        VS: VertexShader,
+        FS: FragmentShader<Varying = VS::Varying>,
+        R: FnMut(usize) -> FragmentInput<VS::Varying>,
+    {
         match primitive {
             PrimitiveType::Points => {
-                for vertex in vertices {
-                    let input = pipeline.vertex_shader.shade_vertex(vertex);
-                    self.rasterize_point(input, &bound, &pipeline.fragment_shader, &pipeline.state);
-                }
-            }
-            PrimitiveType::Lines => {
-                let mut index = 0usize;
-                while index + 1 < vertices.len() {
-                    self.rasterize_line(
-                        [
-                            pipeline.vertex_shader.shade_vertex(&vertices[index]),
-                            pipeline.vertex_shader.shade_vertex(&vertices[index + 1]),
-                        ],
-                        &bound,
+                for slot in 0..count {
+                    self.rasterize_point(
+                        resolve(slot),
+                        bound,
                         &pipeline.fragment_shader,
                         &pipeline.state,
                     );
-                    index += 2;
+                }
+            }
+            PrimitiveType::Lines => {
+                let mut slot = 0usize;
+                while slot + 1 < count {
+                    self.rasterize_line(
+                        [resolve(slot), resolve(slot + 1)],
+                        bound,
+                        &pipeline.fragment_shader,
+                        &pipeline.state,
+                    );
+                    slot += 2;
                 }
             }
             PrimitiveType::Triangles => {
-
-                //let mut index = 0usize;
-                //while index + 2 < vertices.len() {
-                //    self.rasterize_triangle(
-                //        [
-                //            pipeline.vertex_shader.shade_vertex(&vertices[index]),
-                //            pipeline.vertex_shader.shade_vertex(&vertices[index + 1]),
-                //            pipeline.vertex_shader.shade_vertex(&vertices[index + 2]),
-                //        ],
-                //        pipeline,
-                //    );
-                //    index += 3;
-                //}
+                let mut slot = 0usize;
+                while slot + 2 < count {
+                    self.rasterize_triangle(
+                        [resolve(slot), resolve(slot + 1), resolve(slot + 2)],
+                        bound,
+                        &pipeline.fragment_shader,
+                        &pipeline.state,
+                    );
+                    slot += 3;
+                }
             }
         }
-        Ok(())
     }
 }
