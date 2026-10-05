@@ -71,12 +71,18 @@
 //!
 //! # 可编程管线示例
 //!
-//! ```ignore
+//! > 本示例需要 `programmable` feature（默认开启）。关闭该 feature 后整个
+//! > `programmable` 模块不存在，故用 `cfg_attr` 让文档测试在两种配置下都成立。
+//!
+//! ```
+//! # #[cfg(feature = "programmable")]
+//! # fn main() {
 //! use rasteron::Renderer;
 //! use rasteron::color::Color;
 //! use rasteron::framebuffer::{FramebufferInfo, PixelFormat};
+//! use rasteron::programmable::shader::Passthrough2D;
 //! use rasteron::programmable::{
-//!     FragmentInput, FragmentOutput, FragmentShader, Passthrough2D, Pipeline, PipelineState,
+//!     FragmentInput, FragmentOutput, FragmentShader, Pipeline, PipelineState,
 //!     PrimitiveType, Vertex2D, Viewport,
 //! };
 //!
@@ -91,7 +97,9 @@
 //! }
 //!
 //! let info = FramebufferInfo::new(128, 128, 128 * 4, PixelFormat::Rgba8888);
-//! let mut fb = vec![0u8; info.buffer_size()];
+//! let size = info.buffer_size();
+//! let pitch = info.pitch; // `Renderer::new` 取得 `info` 的所有权，先取出需要的字段
+//! let mut fb = vec![0u8; size];
 //! let mut renderer = Renderer::new(info, &mut fb);
 //!
 //! let vertices = [
@@ -107,7 +115,16 @@
 //!     PipelineState::alpha_blend(Viewport::new(0, 0, 128, 128)),
 //! );
 //!
-//! renderer.draw_indexed(PrimitiveType::Triangles, &vertices, &indices, &pipeline, None);
+//! renderer
+//!     .draw_indexed(PrimitiveType::Triangles, &vertices, &indices, &pipeline, None)
+//!     .unwrap();
+//!
+//! // 三角形确实落到了帧缓冲上（对角线附近的像素非零）。
+//! let off = 32 * pitch + 64 * 4;
+//! assert_ne!(fb[off + 3], 0, "三角形应覆盖该像素");
+//! # }
+//! # #[cfg(not(feature = "programmable"))]
+//! # fn main() {}
 //! ```
 //!
 //! 开启 `programmable` 后，顶点着色器输出的 `FragmentInput.position` 使用 `[0, 1]`
