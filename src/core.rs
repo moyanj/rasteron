@@ -155,9 +155,6 @@ pub struct Renderer<'a> {
     front_buffer: &'a mut [u8],
     /// 后台缓冲区。`Some` 表示启用双缓冲：所有绘制写入此切片，
     /// 由 [`Renderer::swap_buffers`] 逐行 present 到 `front_buffer`。
-    ///
-    /// 缓冲区由调用方提供，库本身不做任何分配——这正是双缓冲在 `no_std`
-    /// 无分配器环境下可用的原因。
     back_buffer: Option<&'a mut [u8]>,
 
     // --- 缓存的像素格式属性（在 new() 中初始化一次，消除热路径中的格式匹配）---
@@ -274,24 +271,19 @@ impl<'a> Renderer<'a> {
                 back.len()
             );
         }
-        let (
-            fmt_bpp,
-            fmt_rgb_order,
-            fmt_opaque_alpha,
-            fmt_stores_color_alpha,
-            fmt_bytes_swapped,
-        ) = match info.format {
-            PixelFormat::Rgb24 => (3, true, 255, false, false),
-            PixelFormat::Bgr24 => (3, false, 255, false, false),
-            PixelFormat::Xrgb8888 => (4, false, 0, false, false),
-            PixelFormat::Argb8888 => (4, false, 255, true, false),
-            PixelFormat::Rgba8888 => (4, true, 255, true, false),
-            PixelFormat::Bgra8888 => (4, false, 255, true, false),
-            // 565 没有逐字节的 RGB 顺序概念，2bpp 路径不使用 `fmt_rgb_order`，
-            // 这里填 `true` 仅为占位；通道位域由 `color::pack_565` 固定。
-            PixelFormat::Rgb565 => (2, true, 255, false, false),
-            PixelFormat::Bgr565 => (2, true, 255, false, true),
-        };
+        let (fmt_bpp, fmt_rgb_order, fmt_opaque_alpha, fmt_stores_color_alpha, fmt_bytes_swapped) =
+            match info.format {
+                PixelFormat::Rgb24 => (3, true, 255, false, false),
+                PixelFormat::Bgr24 => (3, false, 255, false, false),
+                PixelFormat::Xrgb8888 => (4, false, 0, false, false),
+                PixelFormat::Argb8888 => (4, false, 255, true, false),
+                PixelFormat::Rgba8888 => (4, true, 255, true, false),
+                PixelFormat::Bgra8888 => (4, false, 255, true, false),
+                // 565 没有逐字节的 RGB 顺序概念，2bpp 路径不使用 `fmt_rgb_order`，
+                // 这里填 `true` 仅为占位；通道位域由 `color::pack_565` 固定。
+                PixelFormat::Rgb565 => (2, true, 255, false, false),
+                PixelFormat::Bgr565 => (2, true, 255, false, true),
+            };
         Self {
             info,
             front_buffer,
@@ -423,6 +415,7 @@ impl<'a> Renderer<'a> {
         src: &[u8],
         src_pitch: usize,
     ) {
+        // 短路：格式不匹配、宽高为 0 时直接返回
         if src_format != self.info.format || width == 0 || height == 0 {
             return;
         }
@@ -431,6 +424,7 @@ impl<'a> Renderer<'a> {
         if src_pitch < width.saturating_mul(self.info.format.bytes_per_pixel()) {
             return;
         }
+        // 短路：src 长度不足
         if src.len() < src_pitch.saturating_mul(height) {
             return;
         }
@@ -438,12 +432,13 @@ impl<'a> Renderer<'a> {
         let fb_width = self.info.width;
         let dst_x = dst_top_left.x;
 
+        // 逐行处理
         for row in 0..height {
             let dy = dst_top_left.y + row;
             if dy >= self.info.height {
                 break;
             }
-            // Row-level clipping: skip if entire row is outside the framebuffer
+            // 行级别裁剪
             if dst_x >= fb_width {
                 continue;
             }
@@ -454,6 +449,7 @@ impl<'a> Renderer<'a> {
             let dst_ptr = &mut self.buffer_mut()[dst_offset..dst_offset + copy_bytes];
             let src_ptr = &src[src_start..src_start + copy_bytes];
             #[cfg(feature = "simd")]
+            // SAFETY: dst_ptr 和 src_ptr 均至少为 copy_bytes 长度
             unsafe {
                 simd::memcpy(dst_ptr.as_mut_ptr(), src_ptr.as_ptr(), copy_bytes);
             }
@@ -481,8 +477,6 @@ impl<'a> Renderer<'a> {
         if width == 0 || height == 0 {
             return;
         }
-        // 每行实际读取 width 字节的 mask，故 mask_pitch 不得小于 width，
-        // 否则 row_mask_off + col 会越过行尾（见下方 mask 索引）。
         if mask_pitch < width {
             return;
         }
@@ -502,6 +496,7 @@ impl<'a> Renderer<'a> {
         let src_g = color.g;
         let src_b = color.b;
         let src_alpha = color.a as u16;
+        // 短路：颜色完全透明
         if src_alpha == 0 {
             return;
         }
@@ -525,8 +520,7 @@ impl<'a> Renderer<'a> {
             let row_ptr = unsafe { base_ptr.add(base_off) };
 
             if bpp == 4 && row_ptr.align_offset(4) == 0 {
-                // 4bpp 且行首 4 字节对齐时走 SWAR 批量路径（实现在 color::swar）：
-                // 每个像素一次 32 位读-改-写，替代 3 次逐通道混合。
+                // 4bpp 且行首 4 字节对齐时走 SWAR 批量路径
                 //
                 // 未对齐的情况见 `fill_span_opaque` 的说明——`pitch` 允许不是
                 // 4 的倍数，此时第 2 行起会错位，交给下面的逐像素路径。
@@ -546,7 +540,7 @@ impl<'a> Renderer<'a> {
                 };
                 continue;
             }
-
+            // 逐像素路径
             for col in 0..visible_cols {
                 let m_alpha = mask[row_mask_off + col];
                 if m_alpha == 0 {
@@ -670,9 +664,6 @@ impl<'a> Renderer<'a> {
             // SWAR 内核按 u32 读写，要求行首 4 字节对齐。`pitch` 允许不是 4 的
             // 倍数（见 `fill_span_opaque` 的说明），此时第 2 行起会错位，
             // 交给下面的逐像素路径处理。
-            //
-            // 该路径独立成函数：其代码体明显大于逐像素路径，若整体内联进
-            // fill_rect，会挤占不透明路径的代码布局。
             unsafe {
                 crate::color::swar::blend_span_alpha_4bpp(
                     row,
@@ -841,26 +832,12 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        unsafe {
-            self.clear_unchecked(&color, row_len, height);
-        }
-    }
-
-    /// 用重复像素模式填充当前缓冲区的可见区域。
-    ///
-    /// 先把单个像素展开成 16 字节宽的模式描述符，再用一次定长写入铺满整个
-    /// 缓冲区，避免逐像素的枚举匹配与倍增复制的写入放大。
-    ///
-    /// # Safety
-    ///
-    /// 调用方必须保证 `row_len > 0` 且 `row_len` 是当前格式的整数倍像素宽度。
-    unsafe fn clear_unchecked(&mut self, color: &Color, row_len: usize, height: usize) {
         let pitch = self.info.pitch;
         let total_bytes = pitch * height;
 
         // 16 字节模式描述符。对 4bpp 可铺满整个缓冲，把每像素一次写入降为
         // 每 16 字节一次写入；对 3bpp 退回单像素模式。
-        let (pattern, pattern_len) = self.build_pattern(color);
+        let (pattern, pattern_len) = self.build_pattern(&color);
 
         // 缓冲区可能小于一个完整模式（例如 1×1 的 4bpp 只有 4 字节），
         // 此时只能写入实际存在的字节数，否则会越界。
@@ -869,6 +846,9 @@ impl<'a> Renderer<'a> {
         let buffer = self.buffer_mut();
         let base_ptr = buffer.as_mut_ptr();
 
+        // SAFETY: init_len <= min(pattern_len, total_bytes)，既不越过 16 字节的
+        // pattern，也不越过缓冲区（构造期保证 buffer.len() >= pitch * height）；
+        // pattern 是栈上数组，与缓冲区不重叠。
         unsafe {
             #[cfg(feature = "simd")]
             simd::memcpy(base_ptr, pattern.as_ptr(), init_len);
@@ -878,16 +858,21 @@ impl<'a> Renderer<'a> {
 
         if pitch == row_len {
             // 无行间填充：一次铺满整个 buffer
+            // SAFETY: total_bytes = pitch * height <= buffer.len()，切片不越过分配。
             let full_buf = unsafe { core::slice::from_raw_parts_mut(base_ptr, total_bytes) };
             pattern_fill(full_buf, &pattern[..init_len]);
         } else {
             // 有行间填充：先铺满第一行，再逐行复制
+            // SAFETY: pitch >= row_len（FramebufferInfo 构造期校验）且 height >= 1
+            // （守卫已排除 0），故 row_len <= total_bytes <= buffer.len()。
             let first_row = unsafe { core::slice::from_raw_parts_mut(base_ptr, row_len) };
             pattern_fill(first_row, &pattern[..init_len.min(row_len)]);
 
             for y in 1..height {
-                let row_ptr = unsafe { base_ptr.add(y * pitch) };
+                // SAFETY: y < height，故 y * pitch + row_len <= pitch * height <=
+                // buffer.len()；目标行与首行（拷贝源）不重叠。
                 unsafe {
+                    let row_ptr = base_ptr.add(y * pitch);
                     #[cfg(feature = "simd")]
                     simd::memcpy(row_ptr, base_ptr, row_len);
                     #[cfg(not(feature = "simd"))]
@@ -971,7 +956,9 @@ impl<'a> Renderer<'a> {
         if clip_line(p1, p2, self.info.width, self.info.height).is_none() {
             return;
         }
-        self.draw_line_internal(p1, p2, color);
+        unsafe {
+            self.draw_line_unchecked(p1, p2, color);
+        }
     }
 
     /// Bresenham 线段绘制（唯一实现，也是 `draw_line` 与
@@ -987,7 +974,7 @@ impl<'a> Renderer<'a> {
     /// 相位，仅跳过必然越界的迭代。该等价性由
     /// `draw_line_iteration_narrowing_preserves_coverage` 守护。
     #[inline(always)]
-    fn draw_line_internal(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
+    unsafe fn draw_line_unchecked(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
         // 用饱和转换（而非 `as i64`）把 `usize` 坐标转到 `i64`：`as` 会把
         // 大于 `i64::MAX` 的值回绕成负数（如 `usize::MAX as i64 == -1`），
         // 使端点被错误地折到画布另一侧，覆盖结果完全错误。
@@ -1096,27 +1083,6 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// Bresenham 线段算法，跳过 Cohen–Sutherland 整段拒绝。
-    ///
-    /// 与 [`Self::draw_line`] 的可见性差异仅在于：跳过 `clip_line` 的整段提前
-    /// 拒绝，也跳过 `width == 0 || height == 0` 的前置守卫。二者都是纯粹的
-    /// 快速路径——`clip_line` 的拒绝在迭代区间收窄到可见范围后本就是冗余的，
-    /// 而退化尺寸下 `x_lo > x_hi` 或 `y <= y_hi_bound` 恒为假，同样不会写入。
-    /// 因此像素覆盖与 [`Self::draw_line`] 逐像素一致，由
-    /// `draw_line_unchecked_matches_safe_path` 守护。
-    ///
-    /// 保留 `unsafe` 是为了不破坏既有 API，调用方无需提供任何坐标保证。
-    ///
-    /// # Safety
-    ///
-    /// 本函数当前无附加前置条件：`draw_line_internal` 已把迭代区间收窄到可见范围
-    /// 并逐轴校验坐标，不会越界写。调用方只需保证渲染器自身持有的帧缓冲切片
-    /// 仍然有效（即未经释放或被移出所有权），这与 [`Self::draw_line`] 相同。
-    #[inline]
-    pub unsafe fn draw_line_unchecked(&mut self, p1: Pixel, p2: Pixel, color: &Color) {
-        self.draw_line_internal(p1, p2, color);
-    }
-
     /// 绘制三角形轮廓（由三条线段组成）。
     #[inline]
     pub fn draw_triangle(&mut self, p1: Pixel, p2: Pixel, p3: Pixel, color: &Color) {
@@ -1153,6 +1119,7 @@ impl<'a> Renderer<'a> {
             Pixel::new(p2.x.min(max_x), p2.y.min(max_y)),
             Pixel::new(p3.x.min(max_x), p3.y.min(max_y)),
         ];
+        // 理论最优排序
         if pts[0].y > pts[1].y {
             pts.swap(0, 1);
         }
@@ -1163,6 +1130,7 @@ impl<'a> Renderer<'a> {
             pts.swap(0, 1);
         }
 
+        // 转换为 i64, 防止溢出
         let (x1, y1) = (sat_i64(pts[0].x), sat_i64(pts[0].y));
         let (x2, y2) = (sat_i64(pts[1].x), sat_i64(pts[1].y));
         let (x3, y3) = (sat_i64(pts[2].x), sat_i64(pts[2].y));
@@ -1172,6 +1140,7 @@ impl<'a> Renderer<'a> {
             return;
         }
 
+        // 计算delta
         let long_dx = x3 - x1;
         let long_dy = y3 - y1;
 
@@ -3840,7 +3809,11 @@ mod tests {
             renderer.blit(Pixel::new(1, 0), 3, 2, format, &src, 6);
 
             assert_eq!(&renderer.buffer()[2..8], &src[0..6], "{format:?} 第 0 行");
-            assert_eq!(&renderer.buffer()[10..16], &src[6..12], "{format:?} 第 1 行");
+            assert_eq!(
+                &renderer.buffer()[10..16],
+                &src[6..12],
+                "{format:?} 第 1 行"
+            );
         }
     }
 }
