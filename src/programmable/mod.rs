@@ -1,4 +1,4 @@
-use crate::utils::{floor_to_usize, normalized_to_screen};
+use crate::utils::{ceil_to_usize, floor_to_usize, normalized_to_screen};
 use crate::{Renderer, color::Color, error::DrawError};
 pub mod shader;
 
@@ -336,6 +336,39 @@ impl Bounds {
             && y >= self.min_y as f32
             && y < self.max_y as f32
     }
+
+    #[inline]
+    pub fn clip_segment_t(self, origin: Vec2, delta: Vec2) -> Option<(f32, f32)> {
+        // 每条轴的 (起点坐标, 方向分量, 下界, 上界)
+        let axes = [
+            (origin[0], delta[0], self.min_x as f32, self.max_x as f32),
+            (origin[1], delta[1], self.min_y as f32, self.max_y as f32),
+        ];
+
+        let mut t_enter = 0.0f32;
+        let mut t_exit = 1.0f32;
+        for (start, step, lo, hi) in axes {
+            if step == 0.0 {
+                // 平行于这对边界：起点落在区间外则整段不可见
+                if start < lo || start >= hi {
+                    return None;
+                }
+                continue;
+            }
+            let (near, far) = ((lo - start) / step, (hi - start) / step);
+            let (near, far) = if near <= far {
+                (near, far)
+            } else {
+                (far, near)
+            }; // ← 负数除法
+            t_enter = t_enter.max(near);
+            t_exit = t_exit.min(far);
+            if t_enter > t_exit {
+                return None;
+            }
+        }
+        Some((t_enter, t_exit))
+    }
 }
 
 impl From<Rect> for Bounds {
@@ -493,10 +526,64 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// 光栅化线图元。
+    ///
+    fn rasterize_line<FS: FragmentShader>(
+        &mut self,
+        input: [FragmentInput<FS::Varying>; 2],
+        bound: &Bounds,
+        fragment_shader: &FS,
+        state: &PipelineState,
+    ) {
+        let p0 = normalized_to_screen(input[0].position, state.viewport);
+        let p1 = normalized_to_screen(input[1].position, state.viewport);
+
+        let delta = [p1[0] - p0[0], p1[1] - p0[1]];
+        if delta[0] == 0.0 && delta[1] == 0.0 {
+            // 退化线段：两端点映射到同一像素，语义等价于点图元
+            self.rasterize_point(input[0], bound, fragment_shader, state);
+            return;
+        }
+
+        // 线段裁剪
+        let Some((t_enter, t_exit)) = bound.clip_segment_t(p0, delta) else {
+            return;
+        };
+        let a = [p0[0] + delta[0] * t_enter, p0[1] + delta[1] * t_enter];
+        let b = [p0[0] + delta[0] * t_exit, p0[1] + delta[1] * t_exit];
+        let d = [b[0] - a[0], b[1] - a[1]];
+
+        let steps = ceil_to_usize(d[0].abs().max(d[1].abs()));
+        debug_assert!(
+            steps <= (bound.max_x - bound.min_x) + (bound.max_y - bound.min_y) + 1,
+            "可见子线段必须落在 bound 内，否则迭代量上界失效"
+        );
+        let denom = steps.max(1) as f32;
+        for i in 0..=steps {
+            let t = i as f32 / denom;
+            let (x, y) = (
+                floor_to_usize(a[0] + d[0] * t + 0.5),
+                floor_to_usize(a[1] + d[1] * t + 0.5),
+            );
+            if !bound.contains(x, y) {
+                continue;
+            }
+
+            let t_original = t_enter + (t_exit - t_enter) * t;
+            let fragment = FragmentInput {
+                position: Interpolate::lerp(input[0].position, input[1].position, t_original),
+                varying: Interpolate::lerp(input[0].varying, input[1].varying, t_original),
+            };
+            if let FragmentOutput::Color(color) = fragment_shader.shade_fragment(fragment) {
+                self.write_fragment_color(x, y, &color, state.blend);
+            }
+        }
+    }
+
     pub fn draw_arrays<VS, FS>(
         &mut self,
         primitive: PrimitiveType,
-        array: &[VS::Input],
+        vertices: &[VS::Input],
         pipeline: &Pipeline<VS, FS>,
     ) -> Result<(), DrawError>
     where
@@ -512,13 +599,41 @@ impl<'a> Renderer<'a> {
 
         match primitive {
             PrimitiveType::Points => {
-                for vertex in array {
+                for vertex in vertices {
                     let input = pipeline.vertex_shader.shade_vertex(vertex);
                     self.rasterize_point(input, &bound, &pipeline.fragment_shader, &pipeline.state);
                 }
             }
-            PrimitiveType::Lines => {}
-            PrimitiveType::Triangles => {}
+            PrimitiveType::Lines => {
+                let mut index = 0usize;
+                while index + 1 < vertices.len() {
+                    self.rasterize_line(
+                        [
+                            pipeline.vertex_shader.shade_vertex(&vertices[index]),
+                            pipeline.vertex_shader.shade_vertex(&vertices[index + 1]),
+                        ],
+                        &bound,
+                        &pipeline.fragment_shader,
+                        &pipeline.state,
+                    );
+                    index += 2;
+                }
+            }
+            PrimitiveType::Triangles => {
+
+                //let mut index = 0usize;
+                //while index + 2 < vertices.len() {
+                //    self.rasterize_triangle(
+                //        [
+                //            pipeline.vertex_shader.shade_vertex(&vertices[index]),
+                //            pipeline.vertex_shader.shade_vertex(&vertices[index + 1]),
+                //            pipeline.vertex_shader.shade_vertex(&vertices[index + 2]),
+                //        ],
+                //        pipeline,
+                //    );
+                //    index += 3;
+                //}
+            }
         }
         Ok(())
     }

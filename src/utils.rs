@@ -229,6 +229,25 @@ pub(crate) fn floor_to_usize(value: f32) -> usize {
     if value < 0.0 { 0 } else { value as usize }
 }
 
+/// 向上取整后转为 `usize`；非正值返回 `0`。
+///
+/// 不能直接用 `f32 as usize`：后者向零取整，对 `2.0` 会得到 2 而非上取整
+/// 应有的 3，对 `-1.0` 还会因负数转无符号而得到 0（依赖 Rust 的饱和转换）。
+/// 这里显式区分整数值与非整数值，用于三角形包围盒的右/下边界。
+#[cfg(feature = "programmable")]
+#[inline(always)]
+pub fn ceil_to_usize(value: f32) -> usize {
+    if value <= 0.0 {
+        return 0;
+    }
+    let truncated = value as usize;
+    if truncated as f32 == value {
+        truncated
+    } else {
+        truncated.saturating_add(1)
+    }
+}
+
 /// 用重复模式填充整个切片。
 ///
 /// 对 4bpp 等能整除 16 的格式，模式固定为 16 字节：按 16 字节块**直接重复写入**，

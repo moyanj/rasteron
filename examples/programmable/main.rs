@@ -79,6 +79,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .draw_arrays(PrimitiveType::Points, &points, &pipeline)
         .expect("顺序绘制没有索引缓冲，不可能越界");
 
+    let points = [
+        Vertex2D {
+            position: [0.0, 0.0],
+            varying: Color::new(255, 0, 0),
+        },
+        Vertex2D {
+            position: [1.0, 1.0],
+            varying: Color::new(0, 255, 0),
+        },
+    ];
+    renderer
+        .draw_arrays(PrimitiveType::Lines, &points, &pipeline)
+        .expect("顺序绘制没有索引缓冲，不可能越界");
+
     let output = "programmable-example.bmp";
     bmp::write_bmp(
         std::path::Path::new(output),
