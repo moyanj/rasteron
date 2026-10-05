@@ -209,8 +209,10 @@ impl Color {
         )
     }
 
-    /// 预乘 Alpha 混合：片元颜色被视为已乘过 `src.a`，只对目标做
-    /// `× (1 - src.a)` 衰减后叠加，结果饱和到 255。
+    /// 预乘 Alpha 混合：片元颜色被视为已乘过 `src.a`，故直接加到衰减后的目标上，
+    /// 即 `src + dst × (1 - src.a)`，结果饱和到 255。
+    ///
+    /// 与 [`Color::blend`] 的区别：后者会对源色再乘一次 `alpha`，本函数不会。
     ///
     /// 仅供可编程管线的 `BlendMode::PremultipliedAlpha` 使用，结果恒为不透明。
     #[cfg(feature = "programmable")]

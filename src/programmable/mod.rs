@@ -150,7 +150,7 @@ impl<T: Copy> Interpolate for Flat<T> {
 /// # 格式
 ///
 /// `[0, 1]` 是 normalized viewport 坐标而非 OpenGL 的 `[-1, 1]` clip space；
-/// 后者被映射到 viewport 的那一步由 `ndc_to_screen` 在此约定下完成。
+/// 后者被映射到 viewport 的那一步由 [`crate::utils::normalized_to_screen`] 在此约定下完成。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FragmentInput<Varying: Interpolate> {
     pub position: Vec2,
@@ -204,7 +204,8 @@ pub enum BlendMode {
     Add,
     /// 乘法混合：各通道相乘，用于阴影/染色。
     Multiply,
-    /// 预乘 Alpha 混合：片元颜色被视为已乘过 `src.a`，只对目标做 `× (1 - src.a)` 衰减。
+    /// 预乘 Alpha 混合：片元颜色被视为已乘过 `src.a`，故直接加到衰减后的目标上，
+    /// 即 `src + dst × (1 - src.a)`，各通道饱和到 255。
     PremultipliedAlpha,
 }
 
@@ -621,8 +622,12 @@ impl<'a> Renderer<'a> {
             return;
         }
 
+        // 有符号面积的 2 倍。`edge(v1, v2, v0)` 单项就等于它——另两项
+        // `edge(v2, v0, v1)` 与 `edge(v0, v1, v2)` 是同一量的重复计算，
+        // 累加会把面积放大到 3 倍，使 `w_i / area` 之和退化成 `1/3`，
+        // 插值出的 varying 被整体缩小（常量属性也不例外）。
         // 面积为零 = 三点共线，无内部像素。顺带避免权重除零。
-        let area = edge(v[1], v[2], v[0]) + edge(v[2], v[0], v[1]) + edge(v[0], v[1], v[2]);
+        let area = edge(v[1], v[2], v[0]);
         if area == 0.0 {
             return;
         }
