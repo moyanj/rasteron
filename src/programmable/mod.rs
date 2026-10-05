@@ -1,4 +1,4 @@
-use crate::utils::normalized_to_screen;
+use crate::utils::{floor_to_usize, normalized_to_screen};
 use crate::{Renderer, color::Color, error::DrawError};
 pub mod shader;
 
@@ -205,6 +205,42 @@ pub enum BlendMode {
     PremultipliedAlpha,
 }
 
+impl BlendMode {
+    /// 计算 `src` 与 `dst` 在本混合模式下的结果。
+    ///
+    /// 这是全库混合语义的**唯一权威实现**：纯函数、无 I/O、每个分支都有正确语义
+    /// （无 panic）。`Alpha` 一臂与热路径委托的字节层实现（`PixelFormat::blend_channel`）
+    /// 共用同一公式，因此本函数的结果与真正落盘的颜色逐位相同。
+    ///
+    /// 返回值恒为不透明（`alpha == 255`）——混合结果的 alpha 通道从不落盘，
+    /// 4bpp 格式写入的是格式自身的 opaque alpha 字节。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use rasteron::color::Color;
+    /// use rasteron::programmable::BlendMode;
+    ///
+    /// let src = Color::new(255, 0, 0);
+    /// let dst = Color::new(0, 0, 255);
+    ///
+    /// // 直接覆盖：结果就是源色。
+    /// assert_eq!(BlendMode::None.blend(src, dst), src);
+    /// // 加法混合：各通道饱和相加。
+    /// assert_eq!(BlendMode::Add.blend(src, dst), Color::new(255, 0, 255));
+    /// ```
+    #[inline(always)]
+    pub fn blend(self, src: Color, dst: Color) -> Color {
+        match self {
+            BlendMode::None => src,
+            BlendMode::Alpha => src.blend(&dst, src.a),
+            BlendMode::Add => src.blend_add(&dst),
+            BlendMode::Multiply => src.blend_multiply(&dst),
+            BlendMode::PremultipliedAlpha => src.blend_premultiplied(&dst),
+        }
+    }
+}
+
 /// 裁剪矩形。
 ///
 /// 同时用作 [`Viewport`] 与 [`ScissorRect`]，字段语义随用途而定：
@@ -243,7 +279,7 @@ pub type Viewport = Rect;
 pub type ScissorRect = Rect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Bounds {
+pub struct Bounds {
     /// 可见区域左边界（含）。
     min_x: usize,
     /// 可见区域上边界（含）。
@@ -392,6 +428,39 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// 把片元颜色按混合模式写入 `(x, y)`。
+    ///
+    /// # 调用方保证
+    ///
+    /// `(x, y)` 已通过 viewport 与 scissor 裁剪，落在帧缓冲范围内。
+    ///
+    /// 取整**不在这里做**：各图元的落位规则不同（点用向零取整，线段用四舍五入），
+    /// 由各自的光栅化函数在自己的坐标系里决定，本函数只负责按混合模式落盘。
+    #[inline(always)]
+    fn write_fragment_color(&mut self, x: usize, y: usize, src: &Color, blend: BlendMode) {
+        match blend {
+            // 纯覆盖，不读目标。`mix_alpha(255)` 绕开 `write_color_at_offset` 的
+            // `a == 0` 短路，使「None = 无条件覆盖」不被源透明度影响。
+            // SAFETY: 调用方保证 (x, y) 落在帧缓冲范围内。
+            BlendMode::None => unsafe { self.set_pixel_unchecked(x, y, &src.mix_alpha(255)) },
+
+            // Alpha 全权委托字节层权威（`write_rgb_blend!` → `PixelFormat::blend_channel`）：
+            // a==0 空操作、a==255 纯覆盖、其余混合，一条路径全覆盖，且无 Color 往返。
+            // SAFETY: 同上。
+            BlendMode::Alpha => unsafe { self.set_pixel_unchecked(x, y, src) },
+
+            // 这三种模式的 RGB 结果都依赖目标像素，必须读-改-写。
+            // `blend` 的返回值经 `Color::new` 构造，天然 a == 255，
+            // 落盘走不透明快速路径，也避开了 `a == 0` 会吞掉写入的坑。
+            BlendMode::Add | BlendMode::Multiply | BlendMode::PremultipliedAlpha => {
+                // SAFETY: 调用方保证 (x, y) 落在帧缓冲范围内，故读与写都在同一合法像素上。
+                let dst = unsafe { self.get_pixel_unchecked(x, y) };
+                // SAFETY: 同上。
+                unsafe { self.set_pixel_unchecked(x, y, &blend.blend(*src, dst)) };
+            }
+        }
+    }
+
     /// 光栅化点图元。
     ///
     /// 点没有「部分可见」的概念：要么整点绘制，要么整点丢弃。因此这里不做线段与
@@ -403,21 +472,25 @@ impl<'a> Renderer<'a> {
     ///
     /// 裁剪发生在 [`FragmentShader::shade_fragment`] **之前**：scissor 的语义是
     /// 「超出部分既不写着色器也不写帧缓冲」，故不能交由写入层兜底。
-    fn rasterize_point<FS: FragmentShader, VS: VertexShader>(
+    fn rasterize_point<FS: FragmentShader>(
         &mut self,
         input: FragmentInput<FS::Varying>,
         bound: &Bounds,
-        pipeline: &Pipeline<VS, FS>,
-    ) where
-        VS: VertexShader<Varying = FS::Varying>,
-        FS: FragmentShader,
-    {
-        let point = normalized_to_screen(input.position, pipeline.state.viewport);
+        fragment_shader: &FS,
+        state: &PipelineState,
+    ) {
+        let point = normalized_to_screen(input.position, state.viewport);
         if !bound.contains_normalized(point[0], point[1]) {
             return;
         }
 
-        if let FragmentOutput::Color(color) = pipeline.fragment_shader.shade_fragment(input) {}
+        // 点图元用向零取整，与线段/三角形路径的四舍五入不同，故取整留在本函数内。
+        // 已通过 `bound` 的坐标非负，截断即 floor，结果落在 `[min, max - 1]`。
+        let (x, y) = (floor_to_usize(point[0]), floor_to_usize(point[1]));
+
+        if let FragmentOutput::Color(color) = fragment_shader.shade_fragment(input) {
+            self.write_fragment_color(x, y, &color, state.blend);
+        }
     }
 
     pub fn draw_arrays<VS, FS>(
@@ -441,7 +514,7 @@ impl<'a> Renderer<'a> {
             PrimitiveType::Points => {
                 for vertex in array {
                     let input = pipeline.vertex_shader.shade_vertex(vertex);
-                    self.rasterize_point(input, &bound, pipeline);
+                    self.rasterize_point(input, &bound, &pipeline.fragment_shader, &pipeline.state);
                 }
             }
             PrimitiveType::Lines => {}

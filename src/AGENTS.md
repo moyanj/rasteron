@@ -126,15 +126,21 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 | 顶点着色 | `VS::Input` → `ProgramVertex` | normalized `[0,1]²` |
 | 图元裁剪 | 半平面裁剪 | normalized `[0,1]²`，保证顶点全部落在内部 |
 | 视口变换 | `ndc_to_screen` | viewport 内浮点像素 |
-| 光栅化 + 片元着色 | 重心权重插值 → `shade_fragment` → `BlendMode` 写入 | 屏幕像素 |
+| 光栅化 + 片元着色 | 重心权重插值 → `shade_fragment` → `BlendMode` 写入 | 光栅化按屏幕像素定位；回传给 `shade_fragment` 的 `FragmentInput.position` 仍是 normalized `[0,1]²` |
 
 裁剪上界：`MAX_CLIP_VERTICES = 8`（`programmable.rs:45`），四个半平面各切一刀，3 顶点凸多边形最多长到 7。改裁剪逻辑时不得让中间顶点数组溢出这个常量。
 
 插值契约（`programmable.rs:127`）：`Interpolate` 实现必须满足 `interpolate(a, a, a, ..) == a`，否则同一片元在不同顶点顺序下结果不同。`lerp` 由 `interpolate` 默认提供，自定义类型只实现一个方法即可。
 
-`FragmentInput.position` 是**相对 viewport 原点**的 `[x+0.5, y+0.5]`，viewport 不在 `(0,0)` 时它不等于帧缓冲绝对坐标。着色器里要写绝对像素必须自己加 viewport 原点。
+`FragmentInput.position` 是 **normalized `[0,1]` viewport 坐标**，与顶点着色器输出的 `position` 同处一个坐标系（`[0,0]` 为 viewport 左上角，Y 轴向下），**不是**帧缓冲绝对像素坐标。光栅化内部按屏幕像素定位，但交给 `shade_fragment` 的 `position` 仍是归一化值。着色器里要写绝对像素必须自己调 `utils::normalized_to_screen`。
 
-`draw_indexed` 用 `alloc::vec![None; n]` 做惰性着色缓存，索引越界返回 `None` 并静默跳过该图元。这是本模块链接 `alloc` 的唯一原因。
+注意归一化距离只在**正方形 viewport** 下各向同性；viewport 非正方形时 x/y 缩放比不同，着色器里做径向判定会退化成椭圆。
+
+**混合落点**：`Renderer::write_fragment_color`（`programmable/mod.rs`）是唯一的混合分派点，公式下沉在 `color.rs`。`BlendMode::Alpha` **直接委托** `Renderer::write_color_at_offset`（字节层权威）——实测比「读成 `Color` → 混合 → 写回」快 24%；`Add` / `Multiply` / `PremultipliedAlpha` 走 `color.rs` 的纯函数。`BlendMode::None` 写入前调 `mix_alpha(255)`，绕开 `write_color_at_offset` 的 `a == 0` 短路，否则 `None` 会退化成空操作、与旧行为不符。
+
+**取整由各图元自负**：`write_fragment_color` 只收整数像素坐标。点用向零取整（`floor_to_usize`），线段用四舍五入（`floor_to_usize(v + 0.5)`），三角形在 bbox 内整数扫描——三者不可互换，故取整不能收进写入层，否则线段覆盖会被静默改变。
+
+`draw_indexed` 尚未在新模块中实现；计划中的惰性顶点缓存由**调用方**提供（`Option<&mut [Option<...>]>`），实现内部不分配。
 
 ## color.rs
 
@@ -143,6 +149,10 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 `pub(crate) mod swar`（`color.rs:432`）只服务 4bpp；放在这里是因为它要复用 `PixelFormat` 的 shift 与 alpha 语义。
 
 `blend_channel`（`color.rs:207`）用 `(src*a + dst*ia + 255) >> 8` 近似 `/255`，误差 ≤ 1。SWAR 内核必须复现这个近似而非改用精确除法。
+
+`Color::blend` 逐通道委托 `blend_channel`，是**全库 Alpha 混合的唯一权威**——SWAR 内核、固定功能跨度填充与可编程管线都收敛到它，因此同一次混合在任意路径上逐位一致。它曾用精确 `/255`，与 `blend_channel` 在 48.67% 的 `(src, dst, alpha)` 组合上差 1；`programmable::tests::blend_alpha_matches_byte_layer_over_all_sample_pairs` 守护这条一致性，改回精确除法即失败。
+
+`Color::blend_add` / `blend_multiply` / `blend_premultiplied` 是 `pub(crate)`，只服务可编程管线的对应 `BlendMode`。三者都带 `#[cfg(feature = "programmable")]`——漏掉该 `cfg` 会让 `--no-default-features` 报 `dead_code`。
 
 `mod swar` 内部还有逐项优化：`mask == 255` 时直接整像素写 `u32`，跳过读-改-写（`color.rs:613`）；否则读 `u32`、混合、再把第 4 字节按 `opaque_alpha` 拼回（`color.rs:615-619`）。改动这里要保住"完全不透明时不读原像素"这个短路。
 
@@ -167,7 +177,7 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 | `angle.rs:404` | `Angle` 定点三角（基准角精确、单位恒等式、往返）、`Wedge` 楔形判定（含大跨度与容差） |
 | `color.rs:875` | `Color` 构造/解析/混合、`PixelFormat::write_color`/`read_color` |
 | `color.rs:626` | **内嵌在 `mod swar` 内**，直接测 `blend_word` / `source_word` / `blend_span_alpha_4bpp` / `blend_masked_row_4bpp` |
-| `programmable.rs:1535` | 裁剪、插值、viewport/scissor、纹理采样、着色器 |
+| `programmable/mod.rs` 末尾 | 点图元的 viewport 原点落位、scissor 下着色器不被调用、`BlendMode::None` 的无条件覆盖、Alpha 混合的 Color 层/字节层逐位等价 |
 | `framebuffer.rs:62` | `buffer_size` 派生与 `pitch` 下限断言 |
 
 `diff_probe`（`core.rs:2242`）默认 `#[ignore]`，它不是回归断言，而是跨实现比对工具：穷举 4 组尺寸 × 3 个圆心 × 13 个半径 × 2 种图元，把「非背景像素数 + FNV-1a 摘要」写进 `PROBE_OUT`（默认 `diff-probe.txt`）供人工 diff 两次实现的输出。触发方式：`PROBE_OUT=/tmp/a cargo test --lib diff_probe -- --ignored`。
@@ -201,10 +211,10 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 两级注释是强约定：
 
 - `unsafe fn` 上方写 `/// # Safety`，说明**前置条件**。现有 9 处：`core.rs` 7 个（5 个 `pub`——`set_pixel_unchecked`、`set_pixel_at_unchecked`、`get_pixel_unchecked`、`get_pixel_at_unchecked`、`draw_line_unchecked`；加 `pub(crate)` 的 `fill_span_alpha` 与私有的 `clear_unchecked`）、`color::swar` 2 个 `pub(crate)`。**唯一缺失是 `simd::memcpy`（`simd.rs:145`）**。
-- 块内写 `// SAFETY: <局部推理>`，说明**此处为何安全**。现有 11 处：`core.rs` 3 处（`251`/`426`/`472`）、`color.rs` 8 处（`534`/`557`/`602`/`608`/`743`/`763`/`804`/`832`），都紧邻需要论证的裸指针访问。例：`color.rs:534`「调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，故 idx * 4 + 4 <= pixel_count * 4，且每次 u32 访问都对齐」；`core.rs:472`「调用方 fill_visible_horizontal_span 保证 x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，故 start + row_len <= buffer.len()」。
+- 块内写 `// SAFETY: <局部推理>`，说明**此处为何安全**。现有 15 处：`core.rs` 3 处（`251`/`426`/`472`）、`color.rs` 8 处（`534`/`557`/`602`/`608`/`743`/`763`/`804`/`832`）、`programmable/mod.rs` 4 处（`write_fragment_color` 的三条混合分支），都紧邻需要论证的裸指针访问。例：`color.rs:534`「调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，故 idx * 4 + 4 <= pixel_count * 4，且每次 u32 访问都对齐」；`core.rs:472`「调用方 fill_visible_horizontal_span 保证 x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，故 start + row_len <= buffer.len()」。
 
 `lib.rs:82` 已开 `unsafe_op_in_unsafe_fn`，因此 `unsafe fn` 体内每处裸指针操作仍需显式 `unsafe {}` 块。新增裸指针代码时，块内 `// SAFETY:` 是硬性要求。
 
 `draw_line_unchecked`（`core.rs:948`）是**无附加前置条件**的特例：实现已收窄迭代区间并逐轴校验坐标。它的 `# Safety` 段只声明"帧缓冲切片仍有效"这一与 `draw_line` 相同的前提，不再声称需要调用方提供坐标保证。写这类"保留 `unsafe` 但实际无要求"的函数时，`# Safety` 段必须与正文描述一致，不要一边说"不需要保证"一边列一堆前置条件。
 
-**现存缺口**（`cargo clippy` 的警告全部属于既存问题）。lib 3 条：`simd.rs:145` 缺 `# Safety` 段；`core.rs:220` 的 `as usize` 冗余转换；`programmable.rs:1111` 循环变量只用于索引。examples 只有 2 个问题位置——`shared/bmp.rs:113` 无效位运算、`:157` 手写 `is_multiple_of`——但因 `basic` 与 `programmable` 共用该文件，各报两次。
+**现存缺口**（`cargo clippy` 的警告全部属于既存问题，与本次混合重构无关）。lib 5 条：`simd.rs:145` 缺 `# Safety` 段；`core.rs:206` / `core.rs:215` 创建了立即被解引用的引用；`core.rs:221` 的 `as usize` 冗余转换；`programmable/shader.rs:32` 的 `(*input).into()` 是自转换（`Vertex2D<V>` 就是 `FragmentInput<V>`）。examples 只有 2 个问题位置——`shared/bmp.rs:113` 无效位运算、`:157` 手写 `is_multiple_of`——但因 `basic` 与 `programmable` 共用该文件，各报两次。
