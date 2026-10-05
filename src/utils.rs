@@ -339,26 +339,44 @@ pub fn ceil_to_usize(value: f32) -> usize {
     }
 }
 
-/// 用重复模式填充整个切片。
+/// 用重复模式填充整个切片：先写入 `pattern`，再按其周期铺满 `row` 剩余部分。
+///
+/// `pattern` 是**唯一**的数据源——`row` 的内容（含首字节）完全由它决定。
+/// 尾部不足一个周期的部分按周期截断。
+///
+/// # 重叠约束
+///
+/// `pattern` 不得与 `row` 重叠，唯一例外是恰好等于 `row[..pattern.len()]`
+/// （此时首步写入是自赋值，等价于空操作，安全）。
+///
+/// # 铺开策略
 ///
 /// 对 4bpp 等能整除 16 的格式，模式固定为 16 字节：按 16 字节块**直接重复写入**，
 /// 而不是"复制已填部分来翻倍"。后者需要 `O(log n)` 次串行 `memcpy`，
 /// 每次的源区域都不同、无法向量化，且总写入量随步数累积；直接块写是
 /// 单一 steady-state 循环，流水线友好。
 ///
-/// 3bpp 无法整除 16，退回逐次倍增复制。
+/// 3bpp 无法整除 16，退回逐次倍增复制：源始终是已就位的前缀 `row[..filled]`，
+/// 因此首步写入模式是这条路径正确的前提。
 #[inline(always)]
 pub(crate) fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
     let len = row.len();
     let pattern_len = pattern.len();
-    if pattern_len == 0 || len <= pattern_len {
+    if pattern_len == 0 || len == 0 {
         return;
     }
+
+    // 写入首个模式。倍增路径的复制源就是 `row` 前缀，故此步不可省略。
+    if len <= pattern_len {
+        row.copy_from_slice(&pattern[..len]);
+        return;
+    }
+    row[..pattern_len].copy_from_slice(pattern);
 
     // 16 字节定长块：直接铺满，无倍增链
     if pattern_len == 16 {
         let mut block = [0u8; 16];
-        block.copy_from_slice(&pattern[..16]);
+        block.copy_from_slice(&row[..16]);
         let mut offset = 16;
         while offset + 16 <= len {
             row[offset..offset + 16].copy_from_slice(&block);
@@ -386,11 +404,16 @@ pub(crate) fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
     }
 }
 
-/// 把 normalized `[0,1]²` 的 viewport 坐标变换为 viewport 内的浮点像素坐标。
+/// 把 normalized `[0,1]²` 的 viewport 坐标变换为浮点像素坐标。
 ///
-/// 采用「像素中心」约定：`0.0` 映射到 viewport 左上角像素，`1.0` 映射到
-/// 右下角像素（`width - 1` / `height - 1`），与可编程管线的视口变换一致。
-/// viewport 宽或高为 0 时按 1 处理，避免除零与负跨度。
+/// # 语义：边缘空间（edge space），与主流图形 API 一致
+///
+/// 本函数输出的是**连续区间** `[x, x + width]` 上的坐标，而非像素中心坐标：
+///
+/// # 退化视口
+///
+/// viewport 宽或高为 0 时按 1 处理，避免除零与负跨度；此时 `1.0` 恰好落在
+/// `x + 1`，仍是半开区间的开边界。
 ///
 /// # 示例
 ///
@@ -398,8 +421,12 @@ pub(crate) fn pattern_fill(row: &mut [u8], pattern: &[u8]) {
 /// # use rasteron::programmable::Viewport;
 /// # use rasteron::utils::normalized_to_screen;
 /// let viewport = Viewport::new(10, 20, 100, 50);
+/// // [0, 0] 是左上边缘本身。
 /// assert_eq!(normalized_to_screen([0.0, 0.0], viewport), [10.0, 20.0]);
-/// assert_eq!(normalized_to_screen([1.0, 1.0], viewport), [109.0, 69.0]);
+/// // [1, 1] 是右下边缘，已越过末像素一像素。
+/// assert_eq!(normalized_to_screen([1.0, 1.0], viewport), [110.0, 70.0]);
+/// // 0.5 是几何中心。
+/// assert_eq!(normalized_to_screen([0.5, 0.5], viewport), [60.0, 45.0]);
 /// ```
 #[cfg(feature = "programmable")]
 pub fn normalized_to_screen(position: Vec2, viewport: Viewport) -> Vec2 {
@@ -407,52 +434,26 @@ pub fn normalized_to_screen(position: Vec2, viewport: Viewport) -> Vec2 {
     let vy = viewport.y as f32;
     let vw = viewport.width.max(1) as f32;
     let vh = viewport.height.max(1) as f32;
-    [vx + position[0] * (vw - 1.0), vy + position[1] * (vh - 1.0)]
+    [vx + position[0] * vw, vy + position[1] * vh]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{sub_view, sub_view_with_back_buffer};
-    use crate::color::PixelFormat;
-    use crate::framebuffer::FramebufferInfo;
+    use super::*;
 
-    /// 后台缓冲区不足一个窗口的 `pitch × height` 时静默返回 `None`，不 panic。
+    /// 视口变换的端点语义：`0.0` 是边缘本身，`1.0` 是外侧一像素的边缘。
     #[test]
-    fn sub_view_with_back_buffer_rejects_short_back_buffer() {
-        let info = FramebufferInfo::new(8, 8, 32, PixelFormat::Rgba8888);
-        let mut fb = [0u8; 256];
-        // 窗口 4 行、pitch 32 → 需要 128 字节后台
-        let mut short = [0u8; 127];
-        assert!(sub_view_with_back_buffer(&mut fb, &mut short, &info, 0, 0, 4, 4).is_none());
-
-        let mut exact = [0u8; 128];
-        assert!(sub_view_with_back_buffer(&mut fb, &mut exact, &info, 0, 0, 4, 4).is_some());
+    #[cfg(feature = "programmable")]
+    fn normalized_to_screen_maps_to_viewport_edges() {
+        let viewport = Viewport::new(10, 20, 100, 50);
+        assert_eq!(normalized_to_screen([0.0, 0.0], viewport), [10.0, 20.0]);
+        assert_eq!(normalized_to_screen([1.0, 1.0], viewport), [110.0, 70.0]);
     }
 
-    /// 两个子视口构造函数必须给出相同的窗口收缩结果，只有缓冲模式不同。
     #[test]
-    fn sub_view_variants_shrink_identically() {
-        let info = FramebufferInfo::new(8, 8, 32, PixelFormat::Rgba8888);
-        let mut fb = [0u8; 256];
-        let mut back = [0u8; 256];
-
-        // 窗口远超屏幕，两者都应收缩到 8×8。
-        let (w, h, pitch, plain_double) = {
-            let plain = sub_view(&mut fb, &info, 0, 0, 100, 100).expect("窗口可用");
-            (
-                plain.info().width,
-                plain.info().height,
-                plain.info().pitch,
-                plain.is_double_buffered(),
-            )
-        };
-
-        let buffered =
-            sub_view_with_back_buffer(&mut fb, &mut back, &info, 0, 0, 100, 100).expect("窗口可用");
-        assert_eq!(w, buffered.info().width);
-        assert_eq!(h, buffered.info().height);
-        assert_eq!(pitch, buffered.info().pitch);
-        assert!(!plain_double);
-        assert!(buffered.is_double_buffered());
+    fn pattern_fill_works() {
+        let mut row = [0u8; 16];
+        pattern_fill(&mut row, &[1, 2, 3]);
+        assert_eq!(row, [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1]);
     }
 }

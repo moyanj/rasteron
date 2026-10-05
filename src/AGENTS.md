@@ -70,6 +70,10 @@ pixel ───────┘    ├─ programmable (feature)
   `normalized_to_screen` 与 `color` 里的 `blend_add` / `blend_multiply` /
   `blend_premultiplied` 全部带 `#[cfg(feature = "programmable")]`。
   新增任何用浮点的东西必须同样门控，否则 `--no-default-features` 会炸。
+  **注意**：`utils.rs` 的测试模块里用到 `Viewport` / `Bounds` /
+  `normalized_to_screen` 的**测试函数本身**也要逐个加
+  `#[cfg(feature = "programmable")]`，否则
+  `cargo test --no-default-features --lib` 编译失败。
 - **feature 门控的扩展方法**：`programmable/mod.rs` 里写
   `impl<'a> Renderer<'a>` 给 `core::Renderer` 追加 `draw_arrays` /
   `draw_indexed`。同 crate 内合法，**不要**为此把 `core.rs` 引入

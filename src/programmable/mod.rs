@@ -139,10 +139,14 @@ impl<T: Copy> Interpolate for Flat<T> {
 /// `position` 使用归一化 viewport 坐标：
 ///
 /// - `x` / `y` 可见范围为 `[0.0, 1.0]`
-/// - `[0.0, 0.0]` 对应 viewport 左上角
-/// - `[1.0, 1.0]` 对应 viewport 右下角
+/// - `[0.0, 0.0]` 对应 viewport 的左上**边缘**
+/// - `[1.0, 1.0]` 对应 viewport 的右下**边缘**，即 `x + viewport.width`，
+///   位于末像素之外一像素（半开区间 `[x, x + width)` 的开边界）
 ///
 /// 超出这个范围的顶点不会被直接 clamp，而是交给图元裁剪阶段处理。
+/// 同理，位于开边界上的 `[1.0, 1.0]` 在**点图元**上会被判为不可见；
+/// 线段与三角形则由裁剪收敛，末像素仍在绘制范围内。
+/// 详见 [`crate::utils::normalized_to_screen`]。
 ///
 /// `varying` 是该顶点的插值属性，会在光栅化时按重心权重在三个顶点间插值，
 /// 因此其类型必须实现 [`Interpolate`]。
@@ -151,6 +155,8 @@ impl<T: Copy> Interpolate for Flat<T> {
 ///
 /// `[0, 1]` 是 normalized viewport 坐标而非 OpenGL 的 `[-1, 1]` clip space；
 /// 后者被映射到 viewport 的那一步由 [`crate::utils::normalized_to_screen`] 在此约定下完成。
+/// 该映射与 OpenGL `glViewport` / Vulkan `VkViewport` / D3D11 `D3D11_VIEWPORT`
+/// 同构：跨度乘**全宽**而非 `width - 1`，故 `1.0` 落在视口外边缘。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FragmentInput<Varying: Interpolate> {
     pub position: Vec2,
@@ -278,6 +284,10 @@ impl Rect {
 }
 
 /// 视口：把 `[0, 1]` 的 normalized 坐标映射到的屏幕矩形。
+///
+/// 采用**边缘空间**约定：`0.0` 映射到 `x` / `y`（左/上边缘），
+/// `1.0` 映射到 `x + width` / `y + height`（右/下边缘，已在末像素之外）。
+/// 详见 [`crate::utils::normalized_to_screen`]。
 pub type Viewport = Rect;
 /// 裁剪矩形：片元允许写入的屏幕区域，超出部分既不写着色器也不写帧缓冲。
 pub type ScissorRect = Rect;
@@ -331,6 +341,9 @@ impl Bounds {
     /// 可见——viewport 原点为 `(0, 0)` 时，归一化坐标 `-0.5` 即会命中该陷阱。
     ///
     /// 边界约定与 [`Bounds::contains`] 一致：下界含、上界不含。
+    ///
+    /// 这与边缘空间的视口变换配套：normalized `[1.0, 1.0]` 映射到
+    /// `x + viewport.width`，落在 `max_x` 上，因而被判为不可见。
     ///
     /// 非有限坐标（`NaN` / `±∞`）一律判为不可见，无需调用方预先过滤。
     #[inline]
@@ -394,6 +407,9 @@ pub struct PipelineState {
     /// 可选的裁剪矩形，`None` 表示不额外裁剪（仅受 viewport 与帧缓冲边界限制）。
     pub scissor: Option<ScissorRect>,
     /// normalized 坐标映射到的屏幕矩形。
+    ///
+    /// 采用边缘空间约定：`[1.0, 1.0]` 落在 `x + width` / `y + height`，
+    /// 即半开区间 `[x, x + width)` 的开边界，详见 [`Viewport`]。
     pub viewport: Viewport,
 }
 

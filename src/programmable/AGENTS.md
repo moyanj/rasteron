@@ -64,6 +64,15 @@ fail-fast 上抛而非静默跳过整条图元。
 
 - **坐标系不是 OpenGL**：顶点着色器输出的 `position` 是 normalized
   `[0, 1]` viewport 坐标，`[0, 0]` 为左上角，**不是** `[-1, 1]` clip space。
+- **视口变换是「边缘空间」，跨度乘全宽**：`normalized_to_screen` 算的是
+  `x + position * width`（**不是** `width - 1`），与 OpenGL `glViewport` /
+  Vulkan `VkViewport` / D3D11 `D3D11_VIEWPORT` 同构——clip space 的两端
+  对应 `left` 与 `left + width` 这条**边界线**。因此 `position == [1.0, 1.0]`
+  落在 `max_x` / `max_y` 上、位于半开区间 `[x, x + width)` **之外**：
+  点图元会被 `contains_normalized` 判为不可见，线段与三角形则由
+  `clip_segment_t` 与 bbox 收敛，末像素仍在绘制范围内。
+  「像素中心 + 半像素偏移」（`gl_FragCoord`）属于栅格化后的采样阶段，
+  不在视口变换里——别把它和 `width - 1` 口径混为一谈。
 - **点判定必须先在浮点域做**。`rasterize_point` 的注释说明了原因：
   先 `as usize` 会让负坐标饱和成 `0`，从而误通过下界检查。
 - **scissor 裁在着色器之前**。语义是「超出部分既不写着色器也不写帧缓冲」，
