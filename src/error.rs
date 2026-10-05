@@ -153,3 +153,174 @@ impl fmt::Display for TextureError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // `#![no_std]` 下 `alloc` 不在 extern prelude，即使只在 `#[cfg(test)]` 里也须显式引入。
+    extern crate alloc;
+
+    use super::{ColorParseError, DrawError, TextureError};
+    use alloc::string::String;
+    use alloc::format;
+    use core::fmt::Write;
+
+    /// `#![no_std]` 下 `ToString` 由 `alloc` 实现，测试模块需显式引入；
+    /// 用 `core::fmt::Write` 写入 `String` 以捕获展示文本。
+    fn display_of(error: impl core::fmt::Display) -> String {
+        let mut buffer = String::new();
+        write!(buffer, "{error}").expect("写入 String 不会失败");
+        buffer
+    }
+
+    /// 展示文本是对外契约的一部分：调用方可能把它写进日志，措辞不应被随意改动。
+    #[test]
+    fn display_messages_are_stable() {
+        assert_eq!(
+            display_of(ColorParseError::InvalidLength),
+            "十六进制颜色字符串长度非法（需 6 或 8 个字符，不含 `#`）"
+        );
+        assert_eq!(
+            display_of(ColorParseError::InvalidDigit),
+            "十六进制颜色字符串含非法字符"
+        );
+        assert_eq!(
+            display_of(DrawError::IndexOutOfBounds {
+                index: 7,
+                vertex_count: 4
+            }),
+            "索引 7 超出顶点缓冲范围（共 4 个顶点）"
+        );
+        assert_eq!(
+            display_of(TextureError::DimensionOverflow),
+            "width × height 溢出 usize"
+        );
+        assert_eq!(
+            display_of(TextureError::LengthMismatch),
+            "texels 长度与 width × height 不匹配"
+        );
+    }
+
+    /// `DrawError::IndexOutOfBounds` 的诊断信息必须同时含越界值与合法上界，
+    /// 否则调用方无法区分「索引错了」与「顶点传少了」。
+    #[test]
+    fn draw_error_reports_both_index_and_bound() {
+        let message = display_of(DrawError::IndexOutOfBounds {
+            index: 7,
+            vertex_count: 4,
+        });
+        assert!(message.contains('7'), "缺少越界索引：{message}");
+        assert!(message.contains('4'), "缺少顶点数量：{message}");
+    }
+
+    /// `DrawError` 是唯一的带字段变体：字段值逐一进入文案，不允许被硬编码。
+    /// 覆盖 `0` 与极大值，确认文案由字段驱动而非固定串拼接。
+    #[test]
+    fn draw_error_display_interpolates_fields() {
+        assert_eq!(
+            display_of(DrawError::IndexOutOfBounds {
+                index: 0,
+                vertex_count: 0
+            }),
+            "索引 0 超出顶点缓冲范围（共 0 个顶点）"
+        );
+        assert_eq!(
+            display_of(DrawError::IndexOutOfBounds {
+                index: usize::MAX,
+                vertex_count: usize::MAX
+            }),
+            format!("索引 {} 超出顶点缓冲范围（共 {} 个顶点）", usize::MAX, usize::MAX)
+        );
+    }
+
+    /// 两个无字段变体的 `Display` 与实例无关：多次构造结果必须完全一致。
+    #[test]
+    fn payloadless_variants_display_is_position_independent() {
+        // 单元变体可重复构造，`Display` 不应读取任何地址或内部状态。
+        for _ in 0..4 {
+            assert_eq!(
+                display_of(ColorParseError::InvalidLength),
+                display_of(ColorParseError::InvalidLength)
+            );
+            assert_eq!(
+                display_of(TextureError::DimensionOverflow),
+                display_of(TextureError::DimensionOverflow)
+            );
+        }
+    }
+
+    /// 三个枚举的 `Debug` 派生都存在且可 `format!`。`no_std` 下 `Debug` 输出
+    /// 交给 `alloc::format` 收集——这正是派生存在的意义，措辞随 derive 而定，
+    /// 故此处只断言「能渲染出含变体名的非空串」，不锁定具体格式。
+    #[test]
+    fn debug_impls_exist_for_all_variants() {
+        assert!(format!("{:?}", ColorParseError::InvalidLength).contains("InvalidLength"));
+        assert!(format!("{:?}", ColorParseError::InvalidDigit).contains("InvalidDigit"));
+        let draw = format!(
+            "{:?}",
+            DrawError::IndexOutOfBounds {
+                index: 3,
+                vertex_count: 9
+            }
+        );
+        assert!(draw.contains("IndexOutOfBounds"), "{draw}");
+        assert!(draw.contains('3'), "{draw}");
+        assert!(draw.contains('9'), "{draw}");
+        assert!(format!("{:?}", TextureError::DimensionOverflow).contains("DimensionOverflow"));
+        assert!(format!("{:?}", TextureError::LengthMismatch).contains("LengthMismatch"));
+    }
+
+    /// 派生集合：`Clone` + `Copy` + `PartialEq` + `Eq` 组合是本模块的对外类型契约，
+    /// 调用方依赖 `Copy` 做无分配传递、依赖 `Eq` 做匹配。两两相等 + 复制后独立相等。
+    #[test]
+    fn enums_derive_copy_clone_and_eq() {
+        let a = ColorParseError::InvalidLength;
+        let b = a; // 触发 Copy
+        #[allow(clippy::clone_on_copy)]
+        let c = a.clone(); // 触发 Clone
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+
+        let d = DrawError::IndexOutOfBounds {
+            index: 5,
+            vertex_count: 5,
+        };
+        #[allow(clippy::clone_on_copy)]
+        let e = d.clone();
+        assert_eq!(d, e);
+
+        let f = TextureError::LengthMismatch;
+        #[allow(clippy::clone_on_copy)]
+        let g = f.clone();
+        assert_eq!(f, g);
+
+        // 变体间不相等：`Eq` 保证可安全用于 match 去重 / HashMap 键。
+        assert_ne!(ColorParseError::InvalidLength, ColorParseError::InvalidDigit);
+        assert_ne!(TextureError::DimensionOverflow, TextureError::LengthMismatch);
+    }
+
+    /// 变体全覆盖：三个枚举的**每个**变体都必须有 `Display` 分支。
+    /// 编译器已用穷尽匹配强制这一点，此测试在实现被改动时给出可读的失败信息，
+    /// 并确保没有哪个变体意外回落到 `Debug` 式的占位文案。
+    #[test]
+    fn every_variant_has_a_distinct_display() {
+        let messages = [
+            display_of(ColorParseError::InvalidLength),
+            display_of(ColorParseError::InvalidDigit),
+            display_of(DrawError::IndexOutOfBounds {
+                index: 1,
+                vertex_count: 1,
+            }),
+            display_of(TextureError::DimensionOverflow),
+            display_of(TextureError::LengthMismatch),
+        ];
+        for (i, message) in messages.iter().enumerate() {
+            assert!(!message.is_empty(), "第 {i} 条文案为空");
+        }
+        // 任意两条不得相同：相同说明某个变体复制了别的变体的文案。
+        for i in 0..messages.len() {
+            for j in (i + 1)..messages.len() {
+                assert_ne!(messages[i], messages[j], "变体 {i} 与 {j} 文案重复");
+            }
+        }
+    }
+}
