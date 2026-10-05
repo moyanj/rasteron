@@ -115,9 +115,15 @@ fn main() {
         let panel_h = CELL_H - 12;
         // 子视口同样双缓冲：面板后台按窗口的 `pitch × 高度` 口径准备。
         let mut panel_back = vec![0u8; info.pitch * panel_h];
-        let Some(mut panel) =
-            sub_view_with_back_buffer(&mut fb, &mut panel_back, &info, panel_x, panel_y, panel_w, panel_h)
-        else {
+        let Some(mut panel) = sub_view_with_back_buffer(
+            &mut fb,
+            &mut panel_back,
+            &info,
+            panel_x,
+            panel_y,
+            panel_w,
+            panel_h,
+        ) else {
             panic!("sub_view_with_back_buffer 未能构造子渲染器");
         };
         let (pw, ph) = (panel.info().width, panel.info().height);
@@ -215,14 +221,11 @@ fn cell_line(r: &mut Renderer, c: Pixel) {
         Pixel::new(c.x + 140, c.y + 152),
         &CYAN,
     );
-    // SAFETY: 端点均在格内且由 `draw_line_unchecked` 自行裁剪，无需调用方保证
-    unsafe {
-        r.draw_line_unchecked(
-            Pixel::new(c.x + 4, c.y + 160),
-            Pixel::new(c.x + 140, c.y + 160),
-            &CYAN,
-        );
-    }
+    r.draw_line(
+        Pixel::new(c.x + 4, c.y + 160),
+        Pixel::new(c.x + 140, c.y + 160),
+        &CYAN,
+    );
 }
 
 // ── 3. draw_triangle / fill_triangle ──
