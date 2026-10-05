@@ -92,11 +92,19 @@ impl Color {
         Self::with_alpha(r, g, b, a)
     }
 
-    /// 将颜色按指定像素格式编码为字节数组（小端序）。
+    /// 将颜色按指定像素格式编码为字节数组。
     ///
-    /// 返回一个 4 字节数组；对于 3 字节格式，最后一个字节未使用。
+    /// 返回一个 4 字节数组；对于 3 字节格式，最后一个字节未使用；对于
+    /// 2 字节的 565 格式，高两字节恒为 0，有效字节按该格式的存储字节序排列
+    /// （`Rgb565` 小端、`Bgr565` 大端）。565 的通道会被量化到 5/6/5 位。
     #[inline(always)]
     pub fn to_bytes(&self, format: PixelFormat) -> [u8; 4] {
+        // 565 的通道不足 8 位，无法用「8 位通道左移 shift」的通用写法表达。
+        if format.bytes_per_pixel() == 2 {
+            let bytes = encode_565_bytes(pack_565(self), format.stores_bytes_swapped());
+            return [bytes[0], bytes[1], 0, 0];
+        }
+
         let mut value = 0u32;
         value |= (self.r as u32) << format.red_shift();
         value |= (self.g as u32) << format.green_shift();
@@ -111,6 +119,9 @@ impl Color {
 
     /// 从按指定像素格式编码的字节数组解码颜色。
     ///
+    /// 565 格式会把 5/6/5 位字段扩展回 8 位（位复制），因此解出的通道值不是
+    /// 编码前的任意 8 位值，而是「量化后再扩展」的规范值。
+    ///
     /// # 恐慌
     ///
     /// 如果 `bytes` 长度小于 `format.bytes_per_pixel()`，将会恐慌。
@@ -121,6 +132,10 @@ impl Color {
             "not enough bytes for pixel format {:?}",
             format
         );
+
+        if format.bytes_per_pixel() == 2 {
+            return unpack_565(decode_565_bytes(bytes, format.stores_bytes_swapped()));
+        }
 
         let mut value = 0u32;
         for (index, byte) in bytes.iter().take(format.bytes_per_pixel()).enumerate() {
@@ -182,6 +197,14 @@ pub enum ColorParseError {
 /// | `Argb8888` | 4 | 蓝、绿、红、Alpha |
 /// | `Rgba8888` | 4 | 红、绿、蓝、Alpha |
 /// | `Bgra8888` | 4 | 蓝、绿、红、Alpha |
+/// | `Rgb565` | 2 | 5/6/5 位打包（小端序存储），无 alpha |
+/// | `Bgr565` | 2 | 同 `Rgb565` 的位域，但两个存储字节交换 |
+///
+/// 前六种格式的通道都是 8 位且按字节对齐，通道位置由
+/// [`red_shift`](PixelFormat::red_shift) 等以**位**为单位描述（对它们而言恰好
+/// 等于字节位移 × 8）。`Rgb565` / `Bgr565` 的通道宽度分别是 5/6/5 位，故写入时
+/// 需要量化、读取时需要扩展，由 [`Color::to_bytes`] / [`Color::read_color`] 等
+/// 入口统一处理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     /// 3 字节小端序：R, G, B。
@@ -196,6 +219,18 @@ pub enum PixelFormat {
     Rgba8888,
     /// 4 字节小端序：B, G, R, A。
     Bgra8888,
+    /// 2 字节 5/6/5 打包：位域 `R = 15..11`、`G = 10..5`、`B = 4..0`，
+    /// 小端序存储（字节 0 = `G[2:0] << 5 | B`，字节 1 = `R << 3 | G[5:3]`）。
+    ///
+    /// 无 alpha 通道。写入时 8 位通道量化到 5/6/5 位，读取时位复制扩展回 8 位。
+    Rgb565,
+    /// 与 [`PixelFormat::Rgb565`] 位域完全相同的 5/6/5 打包，但两个存储字节
+    /// 顺序相反（字节 0 = `R << 3 | G[5:3]`，字节 1 = `G[2:0] << 5 | B`），
+    /// 即面板厂商常称的 **RGB565_BE**。
+    ///
+    /// **注意**：本变体只交换字节序，通道位域仍是 R 高 5 位——这与 Linux DRM 的
+    /// `DRM_FORMAT_BGR565`（把 B 放到高 5 位）**不是**同一回事。
+    Bgr565,
 }
 
 impl PixelFormat {
@@ -213,14 +248,21 @@ impl PixelFormat {
     const fn opaque_alpha_byte(self) -> u8 {
         match self {
             PixelFormat::Xrgb8888 => 0,
-            PixelFormat::Rgb24 | PixelFormat::Bgr24 => 255,
-            PixelFormat::Argb8888 | PixelFormat::Rgba8888 | PixelFormat::Bgra8888 => 255,
+            // 565 没有 alpha 字节，该值只是穷举占位（bpp != 4，永不被读取）。
+            PixelFormat::Rgb24
+            | PixelFormat::Bgr24
+            | PixelFormat::Argb8888
+            | PixelFormat::Rgba8888
+            | PixelFormat::Bgra8888
+            | PixelFormat::Rgb565
+            | PixelFormat::Bgr565 => 255,
         }
     }
 
-    /// 红色通道在 32 位小端字中的位移。
+    /// 红色通道在 32 位小端字中的位移（**以位为单位**）。
     ///
-    /// 例如 BGR 布局下 red 在高 16 位，位移为 16。
+    /// 例如 BGR 布局下 red 在高 16 位，位移为 16；`Rgb565` 的 red 在 15..11 位，
+    /// 位移为 11。对 8 位通道的格式，该值同时是字节位移 × 8。
     #[inline(always)]
     pub const fn red_shift(self) -> u8 {
         match self {
@@ -229,16 +271,25 @@ impl PixelFormat {
             | PixelFormat::Xrgb8888
             | PixelFormat::Argb8888
             | PixelFormat::Bgra8888 => 16,
+            PixelFormat::Rgb565 | PixelFormat::Bgr565 => 11,
         }
     }
 
-    /// 绿色通道的位移（所有格式均为 8）。
+    /// 绿色通道的位移（8 位格式均为 8，565 为 5）。
     #[inline(always)]
     pub const fn green_shift(self) -> u8 {
-        8
+        match self {
+            PixelFormat::Rgb565 | PixelFormat::Bgr565 => 5,
+            PixelFormat::Rgb24
+            | PixelFormat::Bgr24
+            | PixelFormat::Xrgb8888
+            | PixelFormat::Argb8888
+            | PixelFormat::Rgba8888
+            | PixelFormat::Bgra8888 => 8,
+        }
     }
 
-    /// 蓝色通道在 32 位小端字中的位移。
+    /// 蓝色通道在 32 位小端字中的位移（以位为单位）。
     #[inline(always)]
     pub const fn blue_shift(self) -> u8 {
         match self {
@@ -247,17 +298,23 @@ impl PixelFormat {
             | PixelFormat::Xrgb8888
             | PixelFormat::Argb8888
             | PixelFormat::Bgra8888 => 0,
+            PixelFormat::Rgb565 | PixelFormat::Bgr565 => 0,
         }
     }
 
     /// Alpha 通道的位移（如果格式支持）。
     ///
-    /// 对于不含 alpha 的格式（`Rgb24`、`Bgr24`、`Xrgb8888`）返回 `None`。
+    /// 对于不含 alpha 的格式（`Rgb24`、`Bgr24`、`Xrgb8888`、`Rgb565`、`Bgr565`）
+    /// 返回 `None`。
     #[inline(always)]
     pub const fn alpha_shift(self) -> Option<u8> {
         match self {
             PixelFormat::Argb8888 | PixelFormat::Rgba8888 | PixelFormat::Bgra8888 => Some(24),
-            PixelFormat::Rgb24 | PixelFormat::Bgr24 | PixelFormat::Xrgb8888 => None,
+            PixelFormat::Rgb24
+            | PixelFormat::Bgr24
+            | PixelFormat::Xrgb8888
+            | PixelFormat::Rgb565
+            | PixelFormat::Bgr565 => None,
         }
     }
 
@@ -269,7 +326,17 @@ impl PixelFormat {
             | PixelFormat::Argb8888
             | PixelFormat::Rgba8888
             | PixelFormat::Bgra8888 => 4,
+            PixelFormat::Rgb565 | PixelFormat::Bgr565 => 2,
         }
+    }
+
+    /// 16 位打包格式是否按「高字节在前」存储（即 `Rgb565` 的字节交换版本）。
+    ///
+    /// 只对 [`bytes_per_pixel`](PixelFormat::bytes_per_pixel) 为 2 的格式有意义：
+    /// 8 位通道格式的字节顺序已由各自的 shift 完整表达，故恒为 `false`。
+    #[inline(always)]
+    pub(crate) const fn stores_bytes_swapped(self) -> bool {
+        matches!(self, PixelFormat::Bgr565)
     }
 
     /// 每个像素占用的位数。
@@ -280,6 +347,10 @@ impl PixelFormat {
     /// 将颜色写入目标缓冲区（支持 Alpha 混合）。
     ///
     /// 当 `color.a == 255` 时直接覆盖；否则使用 Alpha 混合。
+    ///
+    /// 对 565 格式，混合语义是「把目标解码到 8 位 → 用
+    /// [`blend_channel`](PixelFormat::blend_channel) 混合 → 量化回 565」，
+    /// 与其余格式共用同一套参考公式，误差只来自量化。
     ///
     /// # 调用方保证
     ///
@@ -309,6 +380,12 @@ impl PixelFormat {
                         dst[3] = self.opaque_alpha_byte();
                     }
                 }
+                // 565 无 alpha 通道，不透明写入即「量化打包」，无需读取目标像素。
+                PixelFormat::Rgb565 | PixelFormat::Bgr565 => {
+                    let bytes = encode_565_bytes(pack_565(color), self.stores_bytes_swapped());
+                    dst[0] = bytes[0];
+                    dst[1] = bytes[1];
+                }
             }
             return;
         }
@@ -334,6 +411,14 @@ impl PixelFormat {
                     dst[3] = self.opaque_alpha_byte();
                 }
             }
+            // 565 就地混合：解码 → blend_channel → 量化回写。
+            PixelFormat::Rgb565 | PixelFormat::Bgr565 => {
+                let swapped = self.stores_bytes_swapped();
+                let word = decode_565_bytes(dst, swapped);
+                let bytes = encode_565_bytes(blend_565(word, color), swapped);
+                dst[0] = bytes[0];
+                dst[1] = bytes[1];
+            }
         }
     }
 
@@ -353,6 +438,10 @@ impl PixelFormat {
             PixelFormat::Argb8888 => Color::with_alpha(src[2], src[1], src[0], src[3]),
             PixelFormat::Rgba8888 => Color::with_alpha(src[0], src[1], src[2], src[3]),
             PixelFormat::Bgra8888 => Color::with_alpha(src[2], src[1], src[0], src[3]),
+            // 565：按存储字节序取字，再把 5/6/5 字段位复制扩展回 8 位。
+            PixelFormat::Rgb565 | PixelFormat::Bgr565 => {
+                unpack_565(decode_565_bytes(src, self.stores_bytes_swapped()))
+            }
         }
     }
 }
@@ -418,6 +507,105 @@ pub const MAGENTA: Color = color!(255, 0, 255);
 
 /// 灰色 `(128, 128, 128)`。
 pub const GRAY: Color = color!(128, 128, 128);
+
+// ———————————————————————————————— 5/6/5 打包格式 ————————————————————————————————
+
+/// 把 8 位通道量化到 `bits` 位，四舍五入（`(v × max + 127) / 255`）。
+///
+/// `bits ∈ {5, 6, 8}`；`bits == 8` 时结果恒等于输入。取值上界：
+/// `(255 × 63 + 127) / 255 = 63`，不会溢出 `u16`。
+///
+/// 与 [`expand_channel`] 互逆：对任意 `v < 2^bits` 有
+/// `quantize_channel(expand_channel(v, bits), bits) == v`。
+#[inline(always)]
+pub(crate) const fn quantize_channel(value: u8, bits: u8) -> u16 {
+    let max = (1u32 << bits) - 1;
+    ((value as u32 * max + 127) / 255) as u16
+}
+
+/// 把 `bits` 位的字段扩展回 8 位（位复制填充低位）。
+///
+/// 例：5 位 `v` → `(v << 3) | (v >> 2)`；6 位 `v` → `(v << 2) | (v >> 4)`。
+#[inline(always)]
+pub(crate) const fn expand_channel(value: u16, bits: u8) -> u8 {
+    let shift = 8 - bits;
+    ((value << shift) | (value >> (bits - shift))) as u8
+}
+
+/// 把颜色量化打包成 565 字（位域 `R = 15..11`、`G = 10..5`、`B = 4..0`）。
+///
+/// 不涉及字节序——字节序由 [`encode_565_bytes`] 负责。
+#[inline(always)]
+pub(crate) const fn pack_565(color: &Color) -> u16 {
+    (quantize_channel(color.r, 5) << 11)
+        | (quantize_channel(color.g, 6) << 5)
+        | quantize_channel(color.b, 5)
+}
+
+/// 把 565 字展开成 8 位通道颜色（alpha 恒为 `255`）。
+#[inline(always)]
+pub(crate) const fn unpack_565(word: u16) -> Color {
+    Color::with_alpha(
+        expand_channel((word >> 11) & 0x1F, 5),
+        expand_channel((word >> 5) & 0x3F, 6),
+        expand_channel(word & 0x1F, 5),
+        255,
+    )
+}
+
+/// 565 就地混合：把目标字解码到 8 位，用 [`PixelFormat::blend_channel`] 混合，
+/// 再量化回 565。
+///
+/// 这是 565 唯一的混合语义，与其余格式共用同一套参考公式，误差只来自量化。
+/// 两个短路：`color.a == 255` 直接返回 [`pack_565`]（不读目标像素）；
+/// `color.a == 0` 原样返回 `word`（与 8 位路径 `blend_channel` 的不动点一致）。
+#[inline(always)]
+pub(crate) fn blend_565(word: u16, color: &Color) -> u16 {
+    let alpha = color.a;
+    if alpha == 255 {
+        return pack_565(color);
+    }
+    if alpha == 0 {
+        return word;
+    }
+
+    let dst = unpack_565(word);
+    let alpha = alpha as u16;
+    let inv_alpha = 255 - alpha;
+    // 先算出量化后的 5/6/5 字段，再拼字：与 `pack_565` 的布局保持一致。
+    let r = quantize_channel(PixelFormat::blend_channel(color.r, dst.r, alpha, inv_alpha), 5);
+    let g = quantize_channel(PixelFormat::blend_channel(color.g, dst.g, alpha, inv_alpha), 6);
+    let b = quantize_channel(PixelFormat::blend_channel(color.b, dst.b, alpha, inv_alpha), 5);
+    (r << 11) | (g << 5) | b
+}
+
+/// 按存储字节序把两个字节解码成 565 字。
+///
+/// `swapped` 为 `false` 时按小端序（`Rgb565`），为 `true` 时按大端序（`Bgr565`）。
+///
+/// # 调用方保证
+///
+/// `src` 长度至少为 2。
+#[inline(always)]
+pub(crate) fn decode_565_bytes(src: &[u8], swapped: bool) -> u16 {
+    debug_assert!(src.len() >= 2, "565 像素需要 2 字节");
+    let pair = [src[0], src[1]];
+    if swapped {
+        u16::from_be_bytes(pair)
+    } else {
+        u16::from_le_bytes(pair)
+    }
+}
+
+/// 按存储字节序把 565 字编码成两个字节（[`decode_565_bytes`] 的逆操作）。
+#[inline(always)]
+pub(crate) fn encode_565_bytes(word: u16, swapped: bool) -> [u8; 2] {
+    if swapped {
+        word.to_be_bytes()
+    } else {
+        word.to_le_bytes()
+    }
+}
 
 // ———————————————————————————————— SWAR Alpha 混合 ————————————————————————————————
 
@@ -962,7 +1150,10 @@ pub(crate) mod swar {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, ColorParseError, PixelFormat};
+    use super::{
+        Color, ColorParseError, PixelFormat, blend_565, decode_565_bytes, encode_565_bytes,
+        expand_channel, pack_565, quantize_channel, unpack_565,
+    };
 
     #[test]
     fn from_hex_parses_rgb_and_defaults_alpha_to_opaque() {
@@ -1061,6 +1252,201 @@ mod tests {
         assert_eq!(
             Color::from_bytes(PixelFormat::Xrgb8888, &bytes),
             Color::new(0x12, 0x34, 0x56)
+        );
+    }
+
+    // ── Rgb565 / Bgr565 ──
+
+    /// 565 的格式元数据：16 位、无 alpha 通道，通道位移为 11/5/0 位。
+    #[test]
+    fn rgb565_format_metadata_is_16bpp_without_alpha() {
+        for format in [PixelFormat::Rgb565, PixelFormat::Bgr565] {
+            assert_eq!(format.bytes_per_pixel(), 2, "{format:?}");
+            assert_eq!(format.bits_per_pixel(), 16, "{format:?}");
+            assert_eq!(format.alpha_shift(), None, "{format:?}");
+            assert_eq!(format.red_shift(), 11, "{format:?}");
+            assert_eq!(format.green_shift(), 5, "{format:?}");
+            assert_eq!(format.blue_shift(), 0, "{format:?}");
+        }
+        assert!(!PixelFormat::Rgb565.stores_bytes_swapped());
+        assert!(PixelFormat::Bgr565.stores_bytes_swapped());
+    }
+
+    /// 位域与两字节布局必须与规范一致：R 15..11 / G 10..5 / B 4..0；
+    /// `Rgb565` 小端存储，`Bgr565` 大端存储。
+    #[test]
+    fn rgb565_pack_layout_matches_spec() {
+        let red = Color::new(255, 0, 0);
+        let green = Color::new(0, 255, 0);
+        let blue = Color::new(0, 0, 255);
+
+        assert_eq!(pack_565(&red), 0xF800);
+        assert_eq!(pack_565(&green), 0x07E0);
+        assert_eq!(pack_565(&blue), 0x001F);
+        assert_eq!(pack_565(&Color::new(255, 255, 255)), 0xFFFF);
+        assert_eq!(pack_565(&Color::new(0, 0, 0)), 0x0000);
+
+        assert_eq!(red.to_bytes(PixelFormat::Rgb565), [0x00, 0xF8, 0, 0]);
+        assert_eq!(green.to_bytes(PixelFormat::Rgb565), [0xE0, 0x07, 0, 0]);
+        assert_eq!(blue.to_bytes(PixelFormat::Rgb565), [0x1F, 0x00, 0, 0]);
+
+        assert_eq!(red.to_bytes(PixelFormat::Bgr565), [0xF8, 0x00, 0, 0]);
+        assert_eq!(green.to_bytes(PixelFormat::Bgr565), [0x07, 0xE0, 0, 0]);
+        assert_eq!(blue.to_bytes(PixelFormat::Bgr565), [0x00, 0x1F, 0, 0]);
+
+        assert_eq!(Color::from_bytes(PixelFormat::Rgb565, &[0x00, 0xF8]), red);
+        assert_eq!(Color::from_bytes(PixelFormat::Bgr565, &[0xF8, 0x00]), red);
+        assert_eq!(unpack_565(0x07E0), green);
+    }
+
+    /// 量化与扩展必须互逆：`quantize_channel(expand_channel(v, bits), bits) == v`。
+    ///
+    /// 这是「同一个 565 像素反复读写不会漂移」的前提，也保证
+    /// `from_bytes(to_bytes(..))` 返回的是稳定的规范值。
+    #[test]
+    fn rgb565_channel_quantization_is_roundtrip_stable() {
+        for v in 0..32u16 {
+            assert_eq!(quantize_channel(expand_channel(v, 5), 5), v, "5 位字段 {v}");
+        }
+        for v in 0..64u16 {
+            assert_eq!(quantize_channel(expand_channel(v, 6), 6), v, "6 位字段 {v}");
+        }
+        // 饱和边界：8 位满值必须落到字段满值，且不溢出
+        assert_eq!(quantize_channel(255, 5), 31);
+        assert_eq!(quantize_channel(255, 6), 63);
+        assert_eq!(quantize_channel(0, 5), 0);
+        assert_eq!(quantize_channel(0, 6), 0);
+
+        // 解码值必须是「量化后再扩展」的规范值，而不是原 8 位值
+        for value in 0u8..=255 {
+            let color = Color::new(value, value, value);
+            for format in [PixelFormat::Rgb565, PixelFormat::Bgr565] {
+                let bytes = color.to_bytes(format);
+                let back = Color::from_bytes(format, &bytes[..2]);
+                assert_eq!(
+                    back.r,
+                    expand_channel(quantize_channel(value, 5), 5),
+                    "{format:?} R 通道 value={value}"
+                );
+                assert_eq!(
+                    back.g,
+                    expand_channel(quantize_channel(value, 6), 6),
+                    "{format:?} G 通道 value={value}"
+                );
+                assert_eq!(
+                    back.b,
+                    expand_channel(quantize_channel(value, 5), 5),
+                    "{format:?} B 通道 value={value}"
+                );
+                assert_eq!(back.a, 255, "{format:?} 565 无 alpha，解码恒为 255");
+            }
+        }
+    }
+
+    /// 565 混合必须等于「解码 → `blend_channel` → 量化」的逐通道参考。
+    ///
+    /// 参考式在通道层面独立重算（不经 565 字路径），能暴露位域拼接错误。
+    #[test]
+    fn rgb565_blend_matches_channel_reference() {
+        const SAMPLES: [u8; 11] = [0, 1, 2, 63, 64, 127, 128, 129, 192, 254, 255];
+        // 覆盖各位段的边界：全 0、单字段满值、跨字段混合
+        const DST_WORDS: [u16; 7] = [0x0000, 0x001F, 0x07E0, 0xF800, 0x8410, 0xFFFF, 0x3DEF];
+
+        for format in [PixelFormat::Rgb565, PixelFormat::Bgr565] {
+            let swapped = format == PixelFormat::Bgr565;
+            for &sr in &SAMPLES {
+                for &sg in &SAMPLES {
+                    for &sb in &SAMPLES {
+                        for alpha in [1u8, 2, 85, 127, 128, 170, 254] {
+                            for dst_word in DST_WORDS {
+                                let dst = unpack_565(dst_word);
+                                let a = alpha as u16;
+                                let inv = 255 - a;
+                                let want = (quantize_channel(
+                                    PixelFormat::blend_channel(sr, dst.r, a, inv),
+                                    5,
+                                ) << 11)
+                                    | (quantize_channel(
+                                        PixelFormat::blend_channel(sg, dst.g, a, inv),
+                                        6,
+                                    ) << 5)
+                                    | quantize_channel(
+                                        PixelFormat::blend_channel(sb, dst.b, a, inv),
+                                        5,
+                                    );
+
+                                let mut bytes = encode_565_bytes(dst_word, swapped);
+                                format.write_color(
+                                    &mut bytes,
+                                    &Color::with_alpha(sr, sg, sb, alpha),
+                                );
+                                assert_eq!(
+                                    decode_565_bytes(&bytes, swapped),
+                                    want,
+                                    "{format:?} src=({sr},{sg},{sb}) a={alpha} dst={dst_word:#06X}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 565 混合的两个短路：`a == 255` 只量化源色（不读目标），
+    /// `a == 0` 完全不改动目标字节。
+    #[test]
+    fn rgb565_blend_short_circuits_on_extreme_alpha() {
+        let src = Color::new(0x12, 0x34, 0x56);
+
+        let mut bytes = [0xFF, 0xFF];
+        PixelFormat::Rgb565.write_color(&mut bytes, &src);
+        assert_eq!(bytes, encode_565_bytes(pack_565(&src), false));
+
+        let mut bytes = [0xFF, 0xFF];
+        PixelFormat::Bgr565.write_color(&mut bytes, &src);
+        assert_eq!(bytes, encode_565_bytes(pack_565(&src), true));
+
+        // a == 0：原字节保持不变（与 8 位路径 blend_channel 的不动点一致）
+        let mut bytes = [0x12, 0x34];
+        PixelFormat::Rgb565.write_color(&mut bytes, &src.mix_alpha(0));
+        assert_eq!(bytes, [0x12, 0x34]);
+
+        // blend_565 的短路语义
+        assert_eq!(blend_565(0x1234, &src), pack_565(&src));
+        assert_eq!(blend_565(0x1234, &src.mix_alpha(0)), 0x1234);
+    }
+
+    /// `Bgr565` 必须与 `Rgb565` 逐位同值、仅两字节顺序相反。
+    #[test]
+    fn bgr565_is_byte_swap_of_rgb565() {
+        const SAMPLES: [u8; 6] = [0, 1, 63, 127, 128, 255];
+
+        for &r in &SAMPLES {
+            for &g in &SAMPLES {
+                for &b in &SAMPLES {
+                    let color = Color::new(r, g, b);
+                    let le = color.to_bytes(PixelFormat::Rgb565);
+                    let be = color.to_bytes(PixelFormat::Bgr565);
+
+                    assert_eq!([le[0], le[1]], [be[1], be[0]], "({r},{g},{b}) 字节未交换");
+                    assert_eq!(
+                        Color::from_bytes(PixelFormat::Bgr565, &be[..2]),
+                        Color::from_bytes(PixelFormat::Rgb565, &le[..2]),
+                        "({r},{g},{b}) 两变体解码结果不一致"
+                    );
+                }
+            }
+        }
+
+        // 同一像素的两种存储：解码必须给出同一个颜色
+        assert_eq!(
+            PixelFormat::Rgb565.read_color(&[0x00, 0xF8]),
+            PixelFormat::Bgr565.read_color(&[0xF8, 0x00])
+        );
+        assert_eq!(
+            PixelFormat::Rgb565.read_color(&[0x00, 0xF8]),
+            Color::new(255, 0, 0)
         );
     }
 }

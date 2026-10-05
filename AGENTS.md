@@ -42,7 +42,7 @@ rasteron/
 | 任务 | 位置 | 要点 |
 |------|------|------|
 | 加一个固定功能图元 | `src/core.rs` | 参照 `fill_rect`/`fill_circle` 的裁剪 + 跨度填充两段式 |
-| 加一个像素格式 | `src/color.rs` + `src/core.rs` | **两处都要改**，见下方 ANTI-PATTERNS |
+| 加一个像素格式 | `src/color.rs` + `src/core.rs` + `src/programmable.rs` | **三处都要改**：编解码与格式表、`build` 的 `fmt_*` 缓存与五处写入分支、可编程管线的读写各一处，见下方 ANTI-PATTERNS |
 | 优化写像素热路径 | `src/core.rs` 跨度函数 + `src/color.rs::swar` | 必须同步补等价性单测 |
 | 改可编程管线语义 | `src/programmable.rs` | 坐标是 normalized `[0,1]`，不是 clip space |
 | 换 SIMD 阶梯 | `src/simd.rs` | 阶梯顺序 AVX512 → AVX → SSE2 → NEON → RVV |
@@ -70,7 +70,7 @@ rasteron/
 | `Renderer::swap_buffers` | fn | `core.rs:1504` | back→front 单向拷贝（非指针交换）；单缓冲时空操作 |
 | `Angle` | struct | `angle.rs` | 定点角度，整圈 `2^32` 圈值，加减自动环绕 |
 | `Wedge` | struct | `angle.rs` | 起止角区间，构造时预算单位向量，判定只做叉积 |
-| `PixelFormat` | enum | `color.rs:186` | 6 种格式，shift/bpp 均 `const fn` |
+| `PixelFormat` | enum | `color.rs:186` | 8 种格式（6 种 8 位通道 + 16 位 5/6/5 打包的 `Rgb565`/`Bgr565`），shift/bpp 均 `const fn` |
 | `PixelFormat::write_color` | fn | `color.rs:288` | **标量参考实现**，所有优化路径的等价性基准 |
 | `color::swar` | mod | `color.rs:432` | SWAR 批量混合内核（`pub(crate)`） |
 | `FramebufferInfo` | struct | `framebuffer.rs:14` | `width/height/pitch/format`，`pitch` 可含填充 |
@@ -105,8 +105,8 @@ rasteron/
 - **`unsafe fn` 必须写 `# Safety` 段**。`lib.rs:82` 已开 `unsafe_op_in_unsafe_fn`，块内仍需显式 `unsafe {}`。
 - **`# Safety` 段不能与正文自相矛盾**。若实现已自行收窄与校验、实际无附加前置条件，就只声明与安全版相同的前提，不要一边写「不需要额外保证」一边罗列坐标要求（`draw_line_unchecked` 是范例）。
 - **边界裁剪只做一次**：在上层几何函数裁好，热路径直接裸指针写。`debug_assert!` 兜底，不做运行时检查。
-- **格式属性在构造期缓存**（`new` / `with_back_buffer` 共用的私有 `build`）：`fmt_bpp` / `fmt_rgb_order` / `fmt_opaque_alpha` / `fmt_stores_color_alpha`。热路径禁止 `match info.format`。
-- **字节序分支用宏消除**：`write_rgb!` / `write_rgb_blend!` / `write_rgb_blend_ptr!` / `write_rgb_ptr!`（`core.rs:12-85`）。
+- **格式属性在构造期缓存**（`new` / `with_back_buffer` 共用的私有 `build`）：`fmt_bpp` / `fmt_rgb_order` / `fmt_opaque_alpha` / `fmt_stores_color_alpha` / `fmt_bytes_swapped`。热路径禁止 `match info.format`。
+- **字节序分支用宏消除**：`write_rgb!` / `write_rgb_blend!` / `write_rgb_blend_ptr!` / `write_rgb_ptr!`（`core.rs:12-85`），仅服务 8 位通道格式；16 位 5/6/5 打包格式走 `color::{pack_565, blend_565, decode_565_bytes, encode_565_bytes}` + `core::{load_565, store_565}`，`bpp == 2` 分支独立于宏路径。
 - **优化路径必须与标量参考等价**，并写穷举校验单测。命名约定：`blend_word_matches_blend_channel_over_all_byte_pairs`、`blend_span_matches_write_color_reference`、`alpha_fill_matches_per_channel_reference`。
 - **`usize → i64` 一律走 `sat_i64`**（`utils.rs:307`）。乘积中间值走 `i128`。
 - **迭代量必须与调用方输入解耦**：任何 `for` / `while` 的次数只能取决于帧缓冲尺寸，不得取决于端点坐标或半径。本库曾是 DoS 温床——`draw_line_unchecked` 按线段全长步进（端点取 `usize::MAX` 时越界写，实测 SIGSEGV）、圆图元按半径迭代（半径取 `1_000_000_000` 时约 7 亿次迭代把线程钉死），二者现均改为按帧缓冲尺寸收窄（见反模式）。
@@ -116,7 +116,9 @@ rasteron/
 ## 反模式
 
 - 不要在热路径加日志、`println!`、计时或分配。
-- 不要新增 `PixelFormat` 变体却不同步 `core.rs:177-184` 的 match 与四个 `fmt_*` 字段——会静默写错字节序。
+- 不要新增 `PixelFormat` 变体却不同步三处：`color.rs` 的 shift/bpp/alpha 语义与编解码、`core.rs` `build` 的 `fmt_*` 缓存与五处写入分支（`write_color_at_offset` / `blit_mask` / `fill_span_opaque` / `fill_span_alpha` / `draw_line_internal`，另加 `build_pattern`）、`programmable.rs` 的 `write_color_raw_at_offset` / `read_color_at_offset`——会静默写错字节序或越界写。
+- **不要把 565 当 8 位通道格式写**：2bpp 像素只有 2 字节，`write_rgb!` 系列宏会写第 3 个字节污染相邻像素；565 必须走 `color::{pack_565, blend_565}` + `core::{load_565, store_565}`，且逐字节读写（`pitch` 允许为奇数，行首不保证 `u16` 对齐）。`rgb565_draw_line_writes_only_expected_pixels` 用「被改写像素集合必须与 Bgr24 相同」守护这一点。
+- 不要给 565 强加 SWAR：一个 `u32` 装 2 个像素、G 字段跨字节，且混合语义要求先解码到 8 位；当前实现是逐像素标量，只有不透明跨度与 `clear` 走 2 字节块/16 字节模式。
 - 不要给 3bpp 强加 SWAR：跨字节不对齐，`pattern_fill` 必须退回倍增复制（`utils.rs:163`）。
 - 不要在 4bpp 行首未 4 字节对齐时走 SWAR。`pitch` 允许非 4 倍数，第 2 行起会错位（`core.rs:522`）。
 - **不要把 `clip_line` 的返回值当新端点用**。`intersect_axis` 用整数除法截断求交点，交点不在原直线上，斜率一改像素覆盖就变。`clip_line` 只能作「整段不可见」的快速拒绝，可见区间的裁剪由 `draw_line_internal` 的区间收窄完成。
@@ -135,8 +137,8 @@ rasteron/
 
 ```bash
 cargo build                          # 默认三特性全开
-cargo test --lib                     # 112 个单测（core 61 / angle 17 / programmable 16 / color 16 / framebuffer 2）
-cargo test                           # lib 112 + doctest 15（1 个 ignored）
+cargo test --lib                     # 133 个单测（core 72 / angle 17 / programmable 18 / color 22 含 swar 5 / utils 2 / framebuffer 2）
+cargo test                           # lib 133 + doctest 17（1 个 ignored）
 cargo bench                          # criterion，harness = false
 cargo run --example basic            # → basic-example.bmp
 cargo run --example programmable --features programmable   # → programmable-example.bmp
@@ -149,11 +151,11 @@ cargo build --no-default-features --features programmable
 
 ## 已知缺口
 
-`cargo test` 全绿（lib 112 + doctest 15）。唯一的 `ignored` 在 `lib.rs` 的 ` ```ignore ` 示例。
+`cargo test` 全绿（lib 133 + doctest 17）。唯一的 `ignored` 在 `lib.rs` 的 ` ```ignore ` 示例。
 以下为已知但未修的项：
 
 - `simd::memcpy`（`simd.rs:145`）是全库唯一缺 `/// # Safety` 段的 `pub unsafe fn`（`cargo clippy` 会报 `missing_safety_doc`）；`utils.rs:168` 与 `simd.rs` 内的裸指针块也没有 `// SAFETY:` 注释。
-- `cargo clippy` 另有 5 条既存警告：`core.rs:206`/`core.rs:215` 的立即解引用引用、`core.rs:221` 的 `as usize` 冗余转换、`programmable.rs:1111` 循环变量只用于索引、`examples/shared/bmp.rs:113` 无效位运算与 `:157` 手写 `is_multiple_of`。
+- `cargo clippy --all-targets` 的既存警告（与 565 改动无关，逐位置核对过）：`src/simd.rs:145` 缺 `# Safety`；`src/programmable.rs:1124` 循环变量只用于索引；`src/core.rs:338` 的 `usize as usize` 冗余转换；`src/core.rs` 测试内 3 处 `u8 as u8` 冗余转换（`:2101`/`:2203`/`:2722`）；`examples/shared/bmp.rs:113` 无效位运算与 `:157` 手写 `is_multiple_of`（因被 bin 与 4 个 example 共用而各报多次）。
 
 ## 其他易踩点
 

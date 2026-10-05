@@ -17,10 +17,12 @@ const BENCH_FORMATS: [PixelFormat; 1] = [PixelFormat::Bgr24];
 /// 4bpp 格式（`Rgba8888` / `Xrgb8888`）走 SWAR 内核，`Bgr24` 因跨字节错位
 /// 始终走逐通道回退，作为对照基线；`Xrgb8888` 与 `Rgba8888` 的
 /// `opaque_alpha` 分别是 0 与 255，可覆盖第 4 字节的两种处理。
-const ALPHA_BENCH_FORMATS: [PixelFormat; 3] = [
+/// `Rgb565` 没有 SWAR 路径（逐像素解码-混合-量化），作为 16 位打包格式的基线。
+const ALPHA_BENCH_FORMATS: [PixelFormat; 4] = [
     PixelFormat::Rgba8888,
     PixelFormat::Xrgb8888,
     PixelFormat::Bgr24,
+    PixelFormat::Rgb565,
 ];
 
 /// 构造抗锯齿风格的掩码：圆内为 255、圆外为 0，边缘一圈为中间值。

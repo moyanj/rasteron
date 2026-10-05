@@ -33,7 +33,7 @@
 //! 则作为第二层矩形裁剪叠加在其上。
 extern crate alloc;
 
-use crate::color::Color;
+use crate::color::{Color, decode_565_bytes, encode_565_bytes, pack_565, unpack_565};
 use crate::core::Renderer;
 use crate::utils::floor_to_usize;
 use core::marker::PhantomData;
@@ -825,12 +825,21 @@ impl<'a> Renderer<'a> {
     /// 直接将颜色写入缓冲区，不进行任何混合。
     ///
     /// 使用缓存格式属性代替 `color.to_bytes(format)` 的枚举匹配。
+    /// 对 565 格式，颜色先量化打包再按该格式的存储字节序落盘。
     #[inline(always)]
     fn write_color_raw_at_offset(&mut self, offset: usize, color: &Color) {
         let bpp = self.fmt_bpp;
         let is_rgb_order = self.fmt_rgb_order;
         let stores_alpha = self.fmt_stores_color_alpha;
+        // 必须在 `buffer_mut()` 之前读入局部变量，否则与缓冲区的可变借用冲突。
+        let bytes_swapped = self.fmt_bytes_swapped;
         let target = self.buffer_mut();
+        if bpp == 2 {
+            // 565 没有第 3、4 字节，必须先于下方的 dst[1]/dst[2] 写入返回。
+            let bytes = encode_565_bytes(pack_565(color), bytes_swapped);
+            target[offset..offset + 2].copy_from_slice(&bytes);
+            return;
+        }
         let dst = &mut target[offset..offset + bpp];
         if is_rgb_order {
             dst[0] = color.r;
@@ -852,6 +861,10 @@ impl<'a> Renderer<'a> {
         let is_rgb_order = self.fmt_rgb_order;
         let stores_alpha = self.fmt_stores_color_alpha;
         let src = &self.buffer()[offset..offset + bpp];
+        if bpp == 2 {
+            // 565 没有第 3、4 字节，必须先于下方的 src[3] 读取返回。
+            return unpack_565(decode_565_bytes(src, self.fmt_bytes_swapped));
+        }
         if is_rgb_order {
             Color::with_alpha(
                 src[0],
@@ -2141,5 +2154,87 @@ mod tests {
 
         assert_ne!(renderer.get_pixel(0, 0), Some(Color::new(0, 0, 0)));
         assert_ne!(renderer.get_pixel(0, 1), Some(Color::new(0, 0, 0)));
+    }
+
+    // ── Rgb565 / Bgr565 ──
+
+    /// 565 的落盘与回读必须与公开的 [`PixelFormat`] 编解码完全一致：
+    /// 量化打包后只写 2 字节，绝不触碰相邻像素。
+    #[test]
+    fn rgb565_raw_write_and_read_match_format_codec() {
+        for format in [PixelFormat::Rgb565, PixelFormat::Bgr565] {
+            let info = FramebufferInfo::new(4, 1, 8, format);
+            let mut front = [0u8; 8];
+            let mut renderer = Renderer::new(info, &mut front);
+
+            let color = Color::with_alpha(0x12, 0x34, 0x56, 0x78);
+            renderer.write_color_raw_at_offset(2, &color);
+
+            let expected = color.to_bytes(format);
+            assert_eq!(
+                &renderer.buffer()[2..4],
+                &expected[..2],
+                "{format:?} 落盘字节错误"
+            );
+            assert_eq!(
+                renderer.read_color_at_offset(2),
+                Color::from_bytes(format, &expected[..2]),
+                "{format:?} 回读颜色错误"
+            );
+            // 相邻像素必须保持原样（565 只有 2 字节，多写会污染邻居）
+            assert_eq!(renderer.buffer()[0..2], [0u8; 2], "{format:?} 左邻居被改写");
+            assert_eq!(renderer.buffer()[4..8], [0u8; 4], "{format:?} 右邻居被改写");
+        }
+    }
+
+    /// 565 帧缓冲上的可编程管线：`BlendMode::None` 的落盘必须等于参考量化打包。
+    #[test]
+    fn rgb565_pipeline_blend_none_matches_reference() {
+        for format in [PixelFormat::Rgb565, PixelFormat::Bgr565] {
+            let info = FramebufferInfo::new(4, 4, 8, format);
+            let mut front = [0u8; 32];
+            let mut renderer = Renderer::new(info, &mut front);
+
+            let color = Color::new(0x12, 0x34, 0x56);
+            let vertices = [
+                Vertex2D {
+                    position: [0.0, 0.0],
+                    varying: color,
+                },
+                Vertex2D {
+                    position: [1.0, 0.0],
+                    varying: color,
+                },
+                Vertex2D {
+                    position: [1.0, 1.0],
+                    varying: color,
+                },
+            ];
+            let pipeline = Pipeline::new(
+                Passthrough2D::new(),
+                SolidFs,
+                PipelineState {
+                    blend: BlendMode::None,
+                    scissor: None,
+                    viewport: Viewport::new(0, 0, 4, 4),
+                },
+            );
+            renderer.draw_arrays(PrimitiveType::Triangles, &vertices, &pipeline);
+
+            let mut want = [0u8; 2];
+            format.write_color(&mut want, &color);
+            let mut written = 0usize;
+            for y in 0..4 {
+                for x in 0..4 {
+                    let off = y * 8 + x * 2;
+                    let got = &renderer.buffer()[off..off + 2];
+                    if got != [0u8; 2] {
+                        assert_eq!(got, &want[..], "{format:?} ({x}, {y})");
+                        written += 1;
+                    }
+                }
+            }
+            assert!(written > 0, "{format:?} 三角形没有写入任何像素");
+        }
     }
 }

@@ -1,5 +1,5 @@
 use crate::angle::{Angle, Wedge};
-use crate::color::Color;
+use crate::color::{Color, blend_565, decode_565_bytes, encode_565_bytes, pack_565};
 use crate::framebuffer::{FramebufferInfo, PixelFormat};
 use crate::pixel::Pixel;
 #[cfg(feature = "simd")]
@@ -84,6 +84,37 @@ macro_rules! write_rgb_ptr {
     };
 }
 
+/// 从裸指针读取一个 16 位打包像素（`Rgb565` / `Bgr565`）。
+///
+/// 逐字节访问而非按 `u16` 解引用：`pitch` 允许是奇数，行首不保证 2 字节对齐。
+///
+/// # Safety
+///
+/// 调用方必须保证 `dst` 起至少 2 个字节可读。
+#[inline(always)]
+unsafe fn load_565(dst: *const u8, swapped: bool) -> u16 {
+    // SAFETY: 由调用方保证 dst..dst+2 可读。
+    let bytes = unsafe { [*dst, *dst.add(1)] };
+    decode_565_bytes(&bytes, swapped)
+}
+
+/// 把一个 16 位打包像素写到裸指针（`Rgb565` / `Bgr565`）。
+///
+/// 与 [`load_565`] 对称，同样不要求 2 字节对齐。
+///
+/// # Safety
+///
+/// 调用方必须保证 `dst` 起至少 2 个字节可写。
+#[inline(always)]
+unsafe fn store_565(dst: *mut u8, word: u16, swapped: bool) {
+    let bytes = encode_565_bytes(word, swapped);
+    // SAFETY: 由调用方保证 dst..dst+2 可写。
+    unsafe {
+        *dst = bytes[0];
+        *dst.add(1) = bytes[1];
+    }
+}
+
 /// 圆图元的种类，供 `tests` 中的参考实现对照使用。
 ///
 /// 显式枚举而非 `bool` 参数，避免调用点出现无法自解释的 `true` / `false`。
@@ -134,6 +165,11 @@ pub struct Renderer<'a> {
     pub(crate) fmt_rgb_order: bool,
     pub(crate) fmt_opaque_alpha: u8,
     pub(crate) fmt_stores_color_alpha: bool,
+    /// 16 位打包格式（`Rgb565` / `Bgr565`）的存储字节序是否为「高字节在前」。
+    ///
+    /// 仅 `Bgr565` 为 `true`；8 位通道格式的字节序已由各自的 shift 表达，
+    /// 在 2bpp 路径之外不会被读取。
+    pub(crate) fmt_bytes_swapped: bool,
 }
 
 impl<'a> Renderer<'a> {
@@ -238,13 +274,23 @@ impl<'a> Renderer<'a> {
                 back.len()
             );
         }
-        let (fmt_bpp, fmt_rgb_order, fmt_opaque_alpha, fmt_stores_color_alpha) = match info.format {
-            PixelFormat::Rgb24 => (3, true, 255, false),
-            PixelFormat::Bgr24 => (3, false, 255, false),
-            PixelFormat::Xrgb8888 => (4, false, 0, false),
-            PixelFormat::Argb8888 => (4, false, 255, true),
-            PixelFormat::Rgba8888 => (4, true, 255, true),
-            PixelFormat::Bgra8888 => (4, false, 255, true),
+        let (
+            fmt_bpp,
+            fmt_rgb_order,
+            fmt_opaque_alpha,
+            fmt_stores_color_alpha,
+            fmt_bytes_swapped,
+        ) = match info.format {
+            PixelFormat::Rgb24 => (3, true, 255, false, false),
+            PixelFormat::Bgr24 => (3, false, 255, false, false),
+            PixelFormat::Xrgb8888 => (4, false, 0, false, false),
+            PixelFormat::Argb8888 => (4, false, 255, true, false),
+            PixelFormat::Rgba8888 => (4, true, 255, true, false),
+            PixelFormat::Bgra8888 => (4, false, 255, true, false),
+            // 565 没有逐字节的 RGB 顺序概念，2bpp 路径不使用 `fmt_rgb_order`，
+            // 这里填 `true` 仅为占位；通道位域由 `color::pack_565` 固定。
+            PixelFormat::Rgb565 => (2, true, 255, false, false),
+            PixelFormat::Bgr565 => (2, true, 255, false, true),
         };
         Self {
             info,
@@ -254,6 +300,7 @@ impl<'a> Renderer<'a> {
             fmt_rgb_order,
             fmt_opaque_alpha,
             fmt_stores_color_alpha,
+            fmt_bytes_swapped,
         }
     }
 
@@ -301,8 +348,9 @@ impl<'a> Renderer<'a> {
     ///
     /// 如果 `color.a == 0`，直接返回，不执行任何写入。
     ///
-    /// 使用缓存格式属性（`fmt_bpp` / `fmt_rgb_order` / `fmt_opaque_alpha`）代替
-    /// `PixelFormat::write_color` 的运行时枚举匹配，消除热路径中的分支开销。
+    /// 使用缓存格式属性（`fmt_bpp` / `fmt_rgb_order` / `fmt_opaque_alpha` /
+    /// `fmt_bytes_swapped`）代替 `PixelFormat::write_color` 的运行时枚举匹配，
+    /// 消除热路径中的分支开销。
     #[inline(always)]
     pub(crate) fn write_color_at_offset(&mut self, offset: usize, color: &Color) {
         if color.a == 0 {
@@ -313,6 +361,8 @@ impl<'a> Renderer<'a> {
         let bpp = self.fmt_bpp;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
+        // 必须在 `buffer_mut()` 之前读入局部变量，否则与缓冲区的可变借用冲突。
+        let bytes_swapped = self.fmt_bytes_swapped;
         let target = self.buffer_mut();
         debug_assert!(
             offset + bpp <= target.len(),
@@ -321,6 +371,15 @@ impl<'a> Renderer<'a> {
         );
         // SAFETY: 调用方保证 offset + bpp <= buffer.len()
         let dst = unsafe { target.get_unchecked_mut(offset..offset + bpp) };
+
+        if bpp == 2 {
+            // 565：解码 → 混合（`blend_565` 内含 a == 255 的短路）→ 量化回写。
+            let word = decode_565_bytes(dst, bytes_swapped);
+            let bytes = encode_565_bytes(blend_565(word, color), bytes_swapped);
+            dst[0] = bytes[0];
+            dst[1] = bytes[1];
+            return;
+        }
 
         if alpha == 255 {
             // 不透明快速路径：直接写入，无混合
@@ -436,6 +495,7 @@ impl<'a> Renderer<'a> {
         let bpp = self.fmt_bpp;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
+        let bytes_swapped = self.fmt_bytes_swapped;
         let pitch = self.info.pitch;
 
         let src_r = color.r;
@@ -496,7 +556,13 @@ impl<'a> Renderer<'a> {
                 debug_assert!(offset + bpp <= buf_len, "blit_mask: offset overflow");
                 // SAFETY: offset + bpp <= buf_len 由裁剪保证
                 let dst = unsafe { base_ptr.add(offset) };
-                if m_alpha == 255 {
+                if bpp == 2 {
+                    // 565：掩码字节直接作为该像素的绘制 alpha（无 SWAR 批量路径）。
+                    // SAFETY: offset + 2 <= buf_len 由上面的 debug_assert 保证。
+                    let word = unsafe { load_565(dst, bytes_swapped) };
+                    let blended = blend_565(word, &color.mix_alpha(m_alpha));
+                    unsafe { store_565(dst, blended, bytes_swapped) };
+                } else if m_alpha == 255 {
                     write_rgb_ptr!(dst, src_r, src_g, src_b, is_rgb_order);
                     if bpp == 4 {
                         unsafe { *dst.add(3) = opaque_alpha };
@@ -524,7 +590,8 @@ impl<'a> Renderer<'a> {
 
     /// 用不透明颜色快速填充一行中的水平跨度。
     ///
-    /// 对 4bpp 格式，把像素写成 `[u8; 4]` 后按 4 字节块批量填充，
+    /// 对 4bpp 格式，把像素写成 `[u8; 4]` 后按 4 字节块批量填充；
+    /// 对 2bpp 的 565 格式按 2 字节块填充；
     /// 避免倍增复制的逐字节依赖链。对 3bpp 格式回退到倍增复制策略。
     #[inline(always)]
     pub(crate) fn fill_span_opaque(
@@ -539,6 +606,7 @@ impl<'a> Renderer<'a> {
         let row_len = (x_end - x_start + 1) * pixel_size;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
+        let bytes_swapped = self.fmt_bytes_swapped;
         let target = self.buffer_mut();
         // SAFETY: 调用方 fill_visible_horizontal_span 保证
         // x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，
@@ -553,6 +621,12 @@ impl<'a> Renderer<'a> {
             row.chunks_exact_mut(4).for_each(|pixel| {
                 pixel.copy_from_slice(&pattern);
             });
+        } else if pixel_size == 2 {
+            // 565：先量化打包成 2 字节 pattern，再按 2 字节块批量填充。
+            let pattern = encode_565_bytes(pack_565(color), bytes_swapped);
+            row.chunks_exact_mut(2).for_each(|pixel| {
+                pixel.copy_from_slice(&pattern);
+            });
         } else {
             // 3bpp: 单像素模式 + 倍增复制
             write_rgb!(row, color.r, color.g, color.b, is_rgb_order);
@@ -564,7 +638,8 @@ impl<'a> Renderer<'a> {
     ///
     /// 4bpp 格式优先走 SWAR 批量路径（实现在 [`crate::color::swar`]，因为它与
     /// 像素格式强相关且与逐通道混合共用同一套语义）；3bpp 格式因跨字节不对齐，
-    /// 以及 4bpp 下行首未按 4 字节对齐时，保留逐通道路径。
+    /// 2bpp 的 565 格式因通道不足 8 位，以及 4bpp 下行首未按 4 字节对齐时，
+    /// 保留逐像素路径。
     ///
     /// # Safety
     ///
@@ -584,6 +659,7 @@ impl<'a> Renderer<'a> {
         let start = y * self.info.pitch + x_start * bpp;
         let pixel_count = x_end - x_start + 1;
         let span_len = pixel_count * bpp;
+        let bytes_swapped = self.fmt_bytes_swapped;
 
         let buffer = self.buffer_mut();
         debug_assert!(start + span_len <= buffer.len());
@@ -617,6 +693,14 @@ impl<'a> Renderer<'a> {
 
         for pixel_idx in 0..pixel_count {
             let dst = unsafe { row.add(pixel_idx * bpp) };
+            if bpp == 2 {
+                // 565：解码 → blend_channel → 量化（无 SWAR 批量路径）。
+                // SAFETY: pixel_idx < pixel_count，故 dst..dst+2 在跨度内。
+                let word = unsafe { load_565(dst, bytes_swapped) };
+                let blended = blend_565(word, color);
+                unsafe { store_565(dst, blended, bytes_swapped) };
+                continue;
+            }
             write_rgb_blend_ptr!(dst, src_r, src_g, src_b, alpha, inv_alpha, is_rgb_order);
             if bpp == 4 {
                 // 4bpp 的第 4 字节恒为该格式的 opaque_alpha，不参与混合
@@ -829,15 +913,19 @@ impl<'a> Renderer<'a> {
             return (pattern, bpp);
         }
 
-        // 单像素的规范字节布局（含 alpha 处理），通过 write_rgb! 统一字节序。
+        // 单像素的规范字节布局：565 走量化打包，其余格式通过 write_rgb! 统一字节序。
         let mut pixel = [0u8; 4];
-        write_rgb!(pixel, color.r, color.g, color.b, is_rgb_order);
-        if bpp == 4 {
-            pixel[3] = if stores_alpha {
-                color_alpha
-            } else {
-                opaque_alpha
-            };
+        if bpp == 2 {
+            pixel[..2].copy_from_slice(&encode_565_bytes(pack_565(color), self.fmt_bytes_swapped));
+        } else {
+            write_rgb!(pixel, color.r, color.g, color.b, is_rgb_order);
+            if bpp == 4 {
+                pixel[3] = if stores_alpha {
+                    color_alpha
+                } else {
+                    opaque_alpha
+                };
+            }
         }
 
         // 4bpp：像素 4 字节，恰好铺满 16 字节。
@@ -957,6 +1045,7 @@ impl<'a> Renderer<'a> {
         let pitch = self.info.pitch;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
+        let bytes_swapped = self.fmt_bytes_swapped;
         let alpha = color.a as u16;
         let inv_alpha = 255 - alpha;
         let buffer = self.buffer_mut();
@@ -971,6 +1060,14 @@ impl<'a> Renderer<'a> {
                 let dst = unsafe { base_ptr.add(offset) };
                 if alpha == 0 {
                     // 完全透明：跳过写入
+                } else if bpp == 2 {
+                    // 565：解码 → blend_channel → 量化（`blend_565` 内含
+                    // a == 255 的短路，故这里不必再分支）。
+                    // SAFETY: 主轴已收窄到可见范围、次轴已校验上界，
+                    // 故 offset..offset+2 落在缓冲区可写区域内。
+                    let word = unsafe { load_565(dst, bytes_swapped) };
+                    let blended = blend_565(word, color);
+                    unsafe { store_565(dst, blended, bytes_swapped) };
                 } else if alpha == 255 {
                     write_rgb_ptr!(dst, color.r, color.g, color.b, is_rgb_order);
                     if bpp == 4 {
@@ -2951,6 +3048,9 @@ mod tests {
             (PixelFormat::Xrgb8888, 4, 4, 1, 1),
             (PixelFormat::Rgb24, 3, 3, 1, 1),
             (PixelFormat::Bgr24, 3, 3, 1, 1),
+            // 565 的填充模式同样是 16 字节，而 1×1 只有 2 字节可用
+            (PixelFormat::Rgb565, 2, 2, 1, 1),
+            (PixelFormat::Bgr565, 2, 2, 1, 1),
         ] {
             let _ = bpp;
             let mut g = Guarded {
@@ -3447,5 +3547,300 @@ mod tests {
         }
 
         assert_eq!(single, front);
+    }
+
+    // ── Rgb565 / Bgr565 ──
+
+    /// 565 的两个变体（小端存储 / 字节交换存储），用于参数化测试。
+    const FORMATS_565: [PixelFormat; 2] = [PixelFormat::Rgb565, PixelFormat::Bgr565];
+
+    /// 565 的不透明跨度（2 字节块填充）与半透明跨度（逐像素解码-混合-量化）
+    /// 必须与逐像素参考 [`PixelFormat::write_color`] 逐字节一致，行填充不受影响。
+    ///
+    /// `pitch` 取 `width × 2` 与 `width × 2 + 1` 两种，后者使第 2 行起行首不再是
+    /// 2 字节对齐，用于确认 565 路径不假设 `u16` 对齐。
+    fn check_rgb565_fill_rect(format: PixelFormat, pitch: usize) {
+        const W: usize = 9;
+        const H: usize = 3;
+        let info = FramebufferInfo::new(W, H, pitch, format);
+        let mut front = vec![0xA5u8; info.buffer_size()];
+        let mut renderer = Renderer::new(info, &mut front);
+
+        // 种入非平凡背景，避免「零缓冲恰好正确」
+        for y in 0..H {
+            for x in 0..W {
+                renderer.set_pixel(x, y, &Color::new(200, 100, 50));
+            }
+        }
+        let original = renderer.buffer().to_vec();
+
+        let opaque = Color::new(0x12, 0x34, 0x56);
+        let semi = Color::with_alpha(200, 30, 90, 77);
+        renderer.fill_rect(Pixel::new(1, 0), 4, 2, opaque);
+        renderer.fill_rect(Pixel::new(0, 1), W, 2, semi);
+
+        for y in 0..H {
+            for x in 0..W {
+                let off = y * pitch + x * 2;
+                let mut want = [0u8; 2];
+                want.copy_from_slice(&original[off..off + 2]);
+                // 参考按实际绘制顺序叠加：先不透明矩形，后半透明矩形
+                if (1..5).contains(&x) && y < 2 {
+                    format.write_color(&mut want, &opaque);
+                }
+                if y >= 1 {
+                    format.write_color(&mut want, &semi);
+                }
+                assert_eq!(
+                    &renderer.buffer()[off..off + 2],
+                    &want[..],
+                    "pitch={pitch} {format:?} ({x}, {y})"
+                );
+            }
+        }
+
+        // 行填充字节必须原样保留
+        for y in 0..H {
+            for byte in W * 2..pitch {
+                assert_eq!(
+                    renderer.buffer()[y * pitch + byte],
+                    0xA5,
+                    "pitch={pitch} {format:?} 第 {y} 行填充被改写"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rgb565_fill_rect_matches_per_pixel_reference() {
+        for format in FORMATS_565 {
+            check_rgb565_fill_rect(format, 9 * 2);
+            check_rgb565_fill_rect(format, 9 * 2 + 1);
+        }
+    }
+
+    /// `clear` 在 565 上走 16 字节模式路径：每个可见像素必须等于参考落盘结果，
+    /// 行填充不受影响，且 1×1 的 2 字节缓冲区不得越界。
+    fn check_rgb565_clear(format: PixelFormat, pitch: usize, w: usize, h: usize) {
+        let info = FramebufferInfo::new(w, h, pitch, format);
+        let mut front = vec![0x5Au8; info.buffer_size()];
+        let mut renderer = Renderer::new(info, &mut front);
+
+        let color = Color::new(0x12, 0x34, 0x56);
+        renderer.clear(color);
+
+        let mut want = [0u8; 2];
+        format.write_color(&mut want, &color);
+        for y in 0..h {
+            for x in 0..w {
+                let off = y * pitch + x * 2;
+                assert_eq!(
+                    &renderer.buffer()[off..off + 2],
+                    &want[..],
+                    "pitch={pitch} {format:?} ({x}, {y})"
+                );
+            }
+            for byte in w * 2..pitch {
+                assert_eq!(
+                    renderer.buffer()[y * pitch + byte],
+                    0x5A,
+                    "pitch={pitch} {format:?} 第 {y} 行填充被改写"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rgb565_clear_matches_reference() {
+        for format in FORMATS_565 {
+            check_rgb565_clear(format, 9 * 2, 9, 3);
+            check_rgb565_clear(format, 9 * 2 + 1, 9, 3);
+            // 1×1：缓冲区只有 2 字节，模式写入长度必须收敛到实际容量
+            check_rgb565_clear(format, 2, 1, 1);
+        }
+    }
+
+    /// 565 的掩码 blit 必须与 [`PixelFormat::write_color`] 参考逐字节一致。
+    ///
+    /// 掩码交替取 0 / 255 / 中间值，覆盖跳过、不透明与混合三条分支；
+    /// 565 没有 SWAR 批量路径，全部走逐像素解码-混合-量化。
+    fn check_rgb565_blit_mask(format: PixelFormat, pitch: usize, height: usize) {
+        const W: usize = 9;
+        let color = Color::new(0x12, 0x34, 0x56);
+        let mask_row: [u8; W] = [0, 255, 1, 128, 254, 0, 255, 77, 200];
+        let mask: Vec<u8> = mask_row.iter().copied().cycle().take(W * height).collect();
+
+        let info = FramebufferInfo::new(W, height, pitch, format);
+        let mut front = vec![0u8; info.buffer_size()];
+        let mut renderer = Renderer::new(info, &mut front);
+        for y in 0..height {
+            for x in 0..W {
+                renderer.set_pixel(x, y, &Color::new(200, 100, 50));
+            }
+        }
+        let original = renderer.buffer().to_vec();
+
+        renderer.blit_mask(Pixel::new(0, 0), W, height, &mask, W, color);
+
+        for y in 0..height {
+            for x in 0..W {
+                let off = y * pitch + x * 2;
+                let mut want = [0u8; 2];
+                want.copy_from_slice(&original[off..off + 2]);
+                // mask == 0 时整像素保持不变
+                if mask[y * W + x] != 0 {
+                    format.write_color(&mut want, &color.mix_alpha(mask[y * W + x]));
+                }
+                assert_eq!(
+                    &renderer.buffer()[off..off + 2],
+                    &want[..],
+                    "pitch={pitch} {format:?} ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rgb565_blit_mask_matches_reference() {
+        for format in FORMATS_565 {
+            check_rgb565_blit_mask(format, 9 * 2, 3);
+            check_rgb565_blit_mask(format, 9 * 2 + 1, 3);
+        }
+    }
+
+    /// 565 的 `set_pixel`：不透明写入等于量化打包，半透明写入等于逐像素参考
+    /// 混合，`a == 0` 不触碰任何字节，`get_pixel` 解出规范量化色。
+    #[test]
+    fn rgb565_set_and_get_pixel_roundtrip() {
+        for format in FORMATS_565 {
+            let info = FramebufferInfo::new(3, 1, 6, format);
+            let mut front = [0u8; 6];
+            let mut renderer = Renderer::new(info, &mut front);
+
+            let background = Color::new(200, 100, 50);
+            let semi = Color::with_alpha(10, 20, 30, 128);
+
+            // 像素 0：不透明写入 → 与参考落盘字节一致
+            renderer.set_pixel(0, 0, &background);
+            let mut want_opaque = [0u8; 2];
+            format.write_color(&mut want_opaque, &background);
+            assert_eq!(&renderer.buffer()[0..2], &want_opaque[..], "{format:?}");
+
+            // 像素 1：先铺背景再叠加半透明 → 与参考混合一致
+            renderer.set_pixel(1, 0, &background);
+            let mut want_blend = [0u8; 2];
+            want_blend.copy_from_slice(&renderer.buffer()[2..4]);
+            format.write_color(&mut want_blend, &semi);
+            renderer.set_pixel(1, 0, &semi);
+            assert_eq!(&renderer.buffer()[2..4], &want_blend[..], "{format:?}");
+
+            // get_pixel 必须解出规范量化色
+            assert_eq!(
+                renderer.get_pixel(0, 0),
+                Some(Color::from_bytes(format, &renderer.buffer()[0..2]))
+            );
+
+            // 完全透明：一个字节都不动
+            let before = renderer.buffer().to_vec();
+            renderer.set_pixel(2, 0, &semi.mix_alpha(0));
+            assert_eq!(renderer.buffer(), &before[..], "{format:?} a=0 改动了字节");
+        }
+    }
+
+    /// 同一线段在 565 与 Bgr24 上的「被改写像素集合」必须完全相同（几何与格式
+    /// 无关），且每个被改写像素等于 565 参考混合值。
+    ///
+    /// 该断言还能抓住「bpp == 2 却写了 3 个字节」这类污染相邻像素的错误——
+    /// 多写的字节会额外改变相邻像素，使集合不再相等。
+    #[test]
+    fn rgb565_draw_line_writes_only_expected_pixels() {
+        const W: usize = 8;
+        const H: usize = 6;
+        let background = Color::new(0x40, 0x80, 0xC0);
+        let line_color = Color::with_alpha(0xE0, 0x10, 0x70, 77);
+
+        /// 用同一批命令跑一遍，返回被改写像素的坐标（行优先）。
+        fn changed_pixels(
+            format: PixelFormat,
+            width: usize,
+            height: usize,
+            background: Color,
+            line_color: Color,
+        ) -> Vec<(usize, usize)> {
+            let pitch = width * format.bytes_per_pixel();
+            let info = FramebufferInfo::new(width, height, pitch, format);
+            let mut front = vec![0u8; info.buffer_size()];
+            let mut renderer = Renderer::new(info, &mut front);
+            renderer.clear(background);
+            let before = renderer.buffer().to_vec();
+            renderer.draw_line(
+                Pixel::new(0, 0),
+                Pixel::new(width - 1, height - 1),
+                &line_color,
+            );
+            let after = renderer.buffer().to_vec();
+
+            let bpp = format.bytes_per_pixel();
+            let mut changed = Vec::new();
+            for y in 0..height {
+                for x in 0..width {
+                    let off = y * pitch + x * bpp;
+                    if before[off..off + bpp] != after[off..off + bpp] {
+                        changed.push((x, y));
+                    }
+                }
+            }
+            changed
+        }
+
+        let expected = changed_pixels(PixelFormat::Bgr24, W, H, background, line_color);
+        assert!(!expected.is_empty(), "测试线段应当覆盖若干像素");
+
+        for format in FORMATS_565 {
+            assert_eq!(
+                changed_pixels(format, W, H, background, line_color),
+                expected,
+                "{format:?} 的像素覆盖与 Bgr24 不一致"
+            );
+        }
+
+        // 背景是纯色，故所有被改写像素的期望值相同
+        for format in FORMATS_565 {
+            let pitch = W * 2;
+            let info = FramebufferInfo::new(W, H, pitch, format);
+            let mut front = vec![0u8; info.buffer_size()];
+            let mut renderer = Renderer::new(info, &mut front);
+            renderer.clear(background);
+
+            let mut want = [0u8; 2];
+            format.write_color(&mut want, &background);
+            format.write_color(&mut want, &line_color);
+
+            renderer.draw_line(Pixel::new(0, 0), Pixel::new(W - 1, H - 1), &line_color);
+            for &(x, y) in &expected {
+                let off = y * pitch + x * 2;
+                assert_eq!(
+                    &renderer.buffer()[off..off + 2],
+                    &want[..],
+                    "{format:?} ({x}, {y}) 的混合值错误"
+                );
+            }
+        }
+    }
+
+    /// 565 的 `blit` 是同格式原始拷贝：逐字节相等。
+    #[test]
+    fn rgb565_blit_same_format_copies_bytes() {
+        for format in FORMATS_565 {
+            let info = FramebufferInfo::new(4, 2, 8, format);
+            let mut front = [0u8; 16];
+            let mut renderer = Renderer::new(info, &mut front);
+
+            let src: Vec<u8> = (0..12u8).collect();
+            renderer.blit(Pixel::new(1, 0), 3, 2, format, &src, 6);
+
+            assert_eq!(&renderer.buffer()[2..8], &src[0..6], "{format:?} 第 0 行");
+            assert_eq!(&renderer.buffer()[10..16], &src[6..12], "{format:?} 第 1 行");
+        }
     }
 }

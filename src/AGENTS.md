@@ -25,7 +25,7 @@
 宏层      write_rgb{,_blend,_blend_ptr,_ptr}!        core.rs:15-88
    ↓ 消除 RGB/BGR 字节序分支
 门面      struct Renderer + new/buffer/info          core.rs:125-285
-   ↓ 缓存 fmt_* 四个格式属性
+   ↓ 缓存 fmt_* 五个格式属性
 跨度层    fill_span_opaque / fill_span_alpha         core.rs:459-600
    ↓ 不透明 → 4 字节块直写 / pattern_fill；半透明 → swar 或逐像素
 图元层    clear/line/triangle/rect/circle/arc/blit  core.rs:679-1320
@@ -42,7 +42,7 @@
 | `disk_half_at` | `core.rs:1113` | 精确圆盘第 `k` 行的半宽 `floor(sqrt(r² − k²))`，增量收缩求取，无浮点 |
 | `walk_disk_rows` | `core.rs:1132` | 逐行回调 `(cx, cy, k, half)`，**每行恰好一次**。`fill_circle`/`fill_arc` 的共享入口 |
 | `walk_disk_boundary` | `core.rs:1161` | 精确圆盘边界逐像素回调 `(px, py, dx, dy)`，**每像素恰好一次**。`draw_circle`/`draw_arc` 的共享入口 |
-| `fill_span_opaque` | `core.rs:459` | 不透明跨度。用 `get_unchecked_mut` 取整行切片后按 4 字节块写，安全性完全依赖调用方已裁剪 |
+| `fill_span_opaque` | `core.rs:459` | 不透明跨度。用 `get_unchecked_mut` 取整行切片后按 4 字节块（4bpp）或 2 字节块（565）写，安全性完全依赖调用方已裁剪 |
 | `fill_span_alpha` | `core.rs:503` | 半透明跨度。`bpp == 4 && row.align_offset(4) == 0` 才进 SWAR（判定在 `522`，调用在 `530`），否则逐像素。SWAR 路径独立成函数是为避免挤占不透明路径的代码布局 |
 | `fill_visible_horizontal_span` | `core.rs:563` | 自动裁剪到可见区域，裁剪完才下沉到 `fill_span_*` |
 | `build_pattern` | `core.rs:750` | 生成 16 字节填充模式；3bpp 无法整除 16，退回 3 字节单像素模式 |
@@ -69,21 +69,25 @@
 
 注意 4×4 屏上半径 ≥ 3 即覆盖整屏，所以"钳到 3 以上"的过度收紧在该场景下不可观察——锚点只需覆盖半径 1 与 2。
 
-### 五条写入路径
+### 六条写入路径
 
-写像素有五条并存的路径，各有适用前提。**选错会静默写错字节或错位**：
+写像素有六条并存的路径，各有适用前提。**选错会静默写错字节或错位**：
 
 | 策略 | 用在哪 | 前提 |
 |------|--------|------|
 | `chunks_exact_mut(4)` / `pattern_fill` | `fill_span_opaque`（定义 `core.rs:459`）、`clear_unchecked`（定义 `core.rs:702`） | 不透明整段覆盖。4bpp 按 4 字节块写；3bpp 退回倍增复制 |
+| `chunks_exact_mut(2)` | `fill_span_opaque` 的 2bpp 分支；`clear_unchecked` 经 `build_pattern` 的 16 字节模式 | 565 不透明整段覆盖（量化打包后 2 字节 pattern） |
 | `color::swar::blend_span_alpha_4bpp` | `fill_span_alpha`（定义 `core.rs:503`，SWAR 调用 `530`） | **仅 4bpp 且行首 4 字节对齐** |
 | `color::swar::blend_masked_row_4bpp` | `blit_mask`（定义 `core.rs:342`，SWAR 调用 `407`） | 同上，掩码 alpha 逐字节驱动 |
 | 逐像素 `write_rgb_blend_ptr!` | 上述两条的回退分支 | 3bpp 或未对齐 |
+| 逐像素 `color::blend_565` + `core::{load_565, store_565}` | `write_color_at_offset` / `blit_mask` / `fill_span_alpha` / `draw_line_internal` 的 `bpp == 2` 分支 | **仅 565**：逐字节读写，不假设 `u16` 对齐；565 不走 SWAR |
 | `PixelFormat::write_color` | 不作为热路径 | 标量参考实现，等价性基准 |
 
 注意不透明填充**不走** SWAR——`fill_span_opaque` 只用 `chunks_exact_mut`，SWAR 只服务于半透明与掩码。
 
-任何优化档的改动都必须跑 `color.rs` 里的穷举单测（`blend_*_matches_*_reference` 系列）。
+任何优化档的改动都必须跑 `color.rs` 里的穷举单测（`blend_*_matches_*_reference` 系列）；
+565 另有一组（`rgb565_*`）：位域布局、量化往返、逐通道混合参考、字节交换，
+以及 `core.rs` 的 `rgb565_*` 图元等价性测试（含奇数 `pitch`）。
 
 ## angle.rs 定点角度
 
@@ -141,11 +145,40 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 
 ## color.rs
 
-`PixelFormat` 六变体，每个都要同时维护三处语义：`red/green/blue/alpha_shift`（`const fn`）、`bytes_per_pixel`、以及 `core.rs:177-184` 的 `fmt_*` 缓存值。`write_color` / `read_color` 是字节序的唯一权威实现，任何"更快"的写入都要与它们对齐。
+`PixelFormat` 八变体，每个都要同时维护三处语义：`red/green/blue/alpha_shift`（`const fn`）、
+`bytes_per_pixel`、以及 `core.rs` `build` 里的 `fmt_*` 缓存值（含 `fmt_bytes_swapped`）。
+`write_color` / `read_color` 是字节序的唯一权威实现，任何"更快"的写入都要与它们对齐。
+
+shift 的语义是「**位**位移」：对 6 种 8 位通道格式恰好等于字节位移 × 8（数值与旧版一致），
+对 565 则是 11/5/0。因此 `to_bytes` / `from_bytes` / `write_color` / `read_color` 都用
+`bytes_per_pixel() == 2` 早返回进入 565 分支，8 位路径一字未动。
+
+### 16 位打包格式（`Rgb565` / `Bgr565`）
+
+位域固定为 `R = 15..11`、`G = 10..5`、`B = 4..0`；两变体位域相同，仅存储字节序不同
+（`Rgb565` 小端，`Bgr565` 大端，即面板厂商常称的 RGB565_BE——**与 DRM 的
+`DRM_FORMAT_BGR565`（B 在高位）不是一回事**，rustdoc 已显式标注）。
+
+五个 `pub(crate)` 原语是全部 565 逻辑的单一来源：
+
+| 原语 | 作用 |
+|------|------|
+| `quantize_channel(v, bits)` | 8 位 → 5/6 位，四舍五入 `(v × max + 127) / 255`；`bits == 8` 时恒等 |
+| `expand_channel(v, bits)` | 位复制扩展回 8 位：`(v << k) \| (v >> (bits − k))`，`k = 8 − bits` |
+| `pack_565` / `unpack_565` | 颜色 ↔ 565 字（不含字节序） |
+| `blend_565(word, color)` | 唯一的 565 混合语义：解码 → `blend_channel` → 量化；`a == 255` 直接 `pack_565`（不读目标），`a == 0` 原样返回 |
+| `decode_565_bytes` / `encode_565_bytes` | 字节序的唯一权威（`from_le_bytes` / `from_be_bytes` 分支） |
+
+量化与扩展互逆：`quantize_channel(expand_channel(v, bits), bits) == v` 对全部 5/6 位取值成立
+（`rgb565_channel_quantization_is_roundtrip_stable` 守护），因此反复读写同一像素不会漂移。
+量化是四舍五入而非截断，`quantize5(255) = 31`、`quantize6(255) = 63` 无溢出。
+
+`core.rs` 侧另有 `load_565` / `store_565` 两个 `unsafe fn`：**逐字节**读写，不假设 `u16` 对齐
+（`pitch` 允许为奇数，行首可能落在奇地址）。565 没有 SWAR 路径。
 
 `pub(crate) mod swar`（`color.rs:432`）只服务 4bpp；放在这里是因为它要复用 `PixelFormat` 的 shift 与 alpha 语义。
 
-`blend_channel`（`color.rs:207`）用 `(src*a + dst*ia + 255) >> 8` 近似 `/255`，误差 ≤ 1。SWAR 内核必须复现这个近似而非改用精确除法。
+`blend_channel`（`color.rs:207`）用 `(src*a + dst*ia + 255) >> 8` 近似 `/255`，误差 ≤ 1。SWAR 内核必须复现这个近似而非改用精确除法；565 的 `blend_565` 同样复用它。
 
 `mod swar` 内部还有逐项优化：`mask == 255` 时直接整像素写 `u32`，跳过读-改-写（`color.rs:613`）；否则读 `u32`、混合、再把第 4 字节按 `opaque_alpha` 拼回（`color.rs:615-619`）。改动这里要保住"完全不透明时不读原像素"这个短路。
 
@@ -194,15 +227,15 @@ MSRV 1.79 的 const-eval 不支持浮点。改精度前先确认表仍由脚本�
 
 ## unsafe 与 SAFETY 注释
 
-`unsafe` 共 72 处，分布在 5 个文件：`core.rs` 37、`simd.rs` 19、`color.rs` 14、`utils.rs` 1、`lib.rs` 1（后者是 `#![allow(unsafe_op_in_unsafe_fn)]` 属性）。
+`unsafe` 共 86 处，分布在 5 个文件：`core.rs` 47、`simd.rs` 19、`color.rs` 18、`utils.rs` 1、`lib.rs` 1（后者是 `#![allow(unsafe_op_in_unsafe_fn)]` 属性）。
 
 两级注释是强约定：
 
-- `unsafe fn` 上方写 `/// # Safety`，说明**前置条件**。现有 9 处：`core.rs` 7 个（5 个 `pub`——`set_pixel_unchecked`、`set_pixel_at_unchecked`、`get_pixel_unchecked`、`get_pixel_at_unchecked`、`draw_line_unchecked`；加 `pub(crate)` 的 `fill_span_alpha` 与私有的 `clear_unchecked`）、`color::swar` 2 个 `pub(crate)`。**唯一缺失是 `simd::memcpy`（`simd.rs:145`）**。
-- 块内写 `// SAFETY: <局部推理>`，说明**此处为何安全**。现有 11 处：`core.rs` 3 处（`251`/`426`/`472`）、`color.rs` 8 处（`534`/`557`/`602`/`608`/`743`/`763`/`804`/`832`），都紧邻需要论证的裸指针访问。例：`color.rs:534`「调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，故 idx * 4 + 4 <= pixel_count * 4，且每次 u32 访问都对齐」；`core.rs:472`「调用方 fill_visible_horizontal_span 保证 x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，故 start + row_len <= buffer.len()」。
+- `unsafe fn` 上方写 `/// # Safety`，说明**前置条件**。现有 12 处：`core.rs` 9 个（6 个 `pub`——`set_pixel_unchecked`、`set_pixel_at_unchecked`、`get_pixel_unchecked`、`get_pixel_at_unchecked`、`draw_line_unchecked`，加 `pub(crate)` 的 `fill_span_alpha`、私有的 `clear_unchecked`，再加 565 的 `load_565` / `store_565`；其中 `fill_span_alpha` 并非 `unsafe fn`，但同样声明前置条件）、`color::swar` 3 个 `pub(crate)`（`blend_span_alpha_4bpp` / `blend_masked_row_4bpp` / `blend_masked_segment`）。**唯一缺失是 `simd::memcpy`（`simd.rs:145`）**。
+- 块内写 `// SAFETY: <局部推理>`，说明**此处为何安全**。现有 21 处：`core.rs` 8 处、`color.rs` 13 处，都紧邻需要论证的裸指针访问（565 新增的 5 处在 `load_565` / `store_565` / `blit_mask` / `fill_span_alpha` / `draw_line_internal`）。例：`color.rs` 的「调用方保证 row 指向 pixel_count * 4 字节且 4 字节对齐，故 idx * 4 + 4 <= pixel_count * 4，且每次 u32 访问都对齐」；`core.rs` 的「调用方 fill_visible_horizontal_span 保证 x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，故 start + row_len <= buffer.len()」。
 
 `lib.rs:82` 已开 `unsafe_op_in_unsafe_fn`，因此 `unsafe fn` 体内每处裸指针操作仍需显式 `unsafe {}` 块。新增裸指针代码时，块内 `// SAFETY:` 是硬性要求。
 
 `draw_line_unchecked`（`core.rs:948`）是**无附加前置条件**的特例：实现已收窄迭代区间并逐轴校验坐标。它的 `# Safety` 段只声明"帧缓冲切片仍有效"这一与 `draw_line` 相同的前提，不再声称需要调用方提供坐标保证。写这类"保留 `unsafe` 但实际无要求"的函数时，`# Safety` 段必须与正文描述一致，不要一边说"不需要保证"一边列一堆前置条件。
 
-**现存缺口**（`cargo clippy` 的警告全部属于既存问题）。lib 3 条：`simd.rs:145` 缺 `# Safety` 段；`core.rs:220` 的 `as usize` 冗余转换；`programmable.rs:1111` 循环变量只用于索引。examples 只有 2 个问题位置——`shared/bmp.rs:113` 无效位运算、`:157` 手写 `is_multiple_of`——但因 `basic` 与 `programmable` 共用该文件，各报两次。
+**现存缺口**（`cargo clippy --all-targets` 的警告全部属于既存问题，565 改动未新增任何一条）。lib 3 条：`simd.rs:145` 缺 `# Safety` 段；`core.rs:338` 的 `as usize` 冗余转换；`programmable.rs:1124` 循环变量只用于索引。lib test 另有 3 条 `u8 as u8` 冗余转换（`core.rs:2101`/`2203`/`2722`）。examples 只有 2 个问题位置——`shared/bmp.rs:113` 无效位运算、`:157` 手写 `is_multiple_of`——但因该文件被 bin 与 4 个 example 共用，各报多次。
