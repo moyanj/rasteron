@@ -9,9 +9,11 @@ edition = "2024"
 criterion = { version = "0.7", default-features = false }
 
 [features]
-default = ["programmable", "simd"]
+default = ["programmable", "simd", "font_bitmap"]
 programmable = []
 simd = []
+font_bitmap = []
+font_truetype = []
 
 [profile.release]
 opt-level = 3
