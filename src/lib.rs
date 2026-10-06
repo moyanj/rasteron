@@ -10,8 +10,9 @@
 //! [`color::PixelFormat::Bgr24`] / [`color::PixelFormat::Xrgb8888`] /
 //! [`color::PixelFormat::Argb8888`] / [`color::PixelFormat::Rgba8888`] /
 //! [`color::PixelFormat::Bgra8888`]）与 16 位 5/6/5 打包布局
-//! （[`color::PixelFormat::Rgb565`]，以及字节交换存储的
-//! [`color::PixelFormat::Bgr565`]）。565 写入时把 8 位通道量化到 5/6/5 位，
+//! （[`color::PixelFormat::Rgb565`]，以及红蓝位段互换的
+//! [`color::PixelFormat::Bgr565`]）。两个 565 变体都是小端存储，差异只在
+//! 位域里红蓝两段的位置。565 写入时把 8 位通道量化到 5/6/5 位，
 //! 混合时解码到 8 位再用同一套 `blend_channel` 公式计算，最后量化回写。
 //!
 //! 双缓冲由调用方提供后台缓冲区（[`Renderer::with_back_buffer`]），库自身不做

@@ -126,8 +126,8 @@ mod tests {
 
     use super::*;
     use crate::color::Color;
-    use crate::programmable::shader::Passthrough2D;
     use crate::programmable::Vertex2D;
+    use crate::programmable::shader::Passthrough2D;
 
     type Shaded = FragmentInput<Color>;
 
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn empty_cache_lookups_all_miss() {
         let mut slots: [Option<Shaded>; 0] = [];
-        let mut cache = VertexCache::new(&mut slots);
+        let cache = VertexCache::new(&mut slots);
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
         // 空缓存的任意索引都未命中，且不 panic。
@@ -238,15 +238,16 @@ mod tests {
         let mut slots: [Option<Shaded>; 3] = [None; 3];
         let mut cache = VertexCache::new(&mut slots);
         for index in 0..3 {
-            cache.store(
-                index,
-                vertex(0.0, 0.0, Color::new(index as u8, 0, 0)),
-            );
+            cache.store(index, vertex(0.0, 0.0, Color::new(index as u8, 0, 0)));
         }
         assert_eq!(cache.lookup(0), Some(vertex(0.0, 0.0, Color::new(0, 0, 0))));
         cache.clear();
         for index in 0..3 {
-            assert_eq!(cache.lookup(index), None, "clear 后槽位 {index} 应回到未命中");
+            assert_eq!(
+                cache.lookup(index),
+                None,
+                "clear 后槽位 {index} 应回到未命中"
+            );
         }
         // clear 不改变槽位数量。
         assert_eq!(cache.len(), 3);

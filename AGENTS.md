@@ -71,7 +71,8 @@ rasteron/
   - **像素级越界不算错误**：几何超出屏幕由绘制 API 静默裁剪
 - **热路径零格式匹配**：`Renderer` 在构造时把格式属性缓存进 `fmt_bpp` /
   `fmt_rgb_order` / `fmt_opaque_alpha` / `fmt_stores_color_alpha` /
-  `fmt_bytes_swapped`，绘制路径禁止重新 `match` `PixelFormat`。
+  `fmt_layout_565`，绘制路径禁止重新 `match` `PixelFormat`。565 的字节序是
+  小端常量（`FMT_565_LITTLE_ENDIAN`），无需缓存——红蓝差异由 `fmt_layout_565` 表达。
 - **安全边界分层**：安全 API 用 `width`/`height` 做边界判断，底层写入用
   `get_unchecked_mut`。`Renderer::new` 断言切片 ≥ `pitch × height` 是这套
   方案不越界的前提，不可移除。

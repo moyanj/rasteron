@@ -1,5 +1,5 @@
 use crate::angle::{Angle, Wedge};
-use crate::color::{Color, blend_565, decode_565_bytes, encode_565_bytes, pack_565};
+use crate::color::{Color, Layout565, blend_565, decode_565_bytes, encode_565_bytes, pack_565};
 use crate::framebuffer::{FramebufferInfo, PixelFormat};
 use crate::pixel::Pixel;
 #[cfg(feature = "simd")]
@@ -84,18 +84,28 @@ macro_rules! write_rgb_ptr {
     };
 }
 
+/// 两个 565 变体（`Rgb565` / `Bgr565`）共用的存储字节序：小端。
+///
+/// 与 `DRM_FORMAT_RGB565` / `DRM_FORMAT_BGR565` 的定义一致——二者的差异只在
+/// 位域里的红蓝位置。渲染器因此无需缓存字节序字段，热路径上 565 的字节序是常量。
+const FMT_565_LITTLE_ENDIAN: bool = true;
+
 /// 从裸指针读取一个 16 位打包像素（`Rgb565` / `Bgr565`）。
 ///
 /// 逐字节访问而非按 `u16` 解引用：`pitch` 允许是奇数，行首不保证 2 字节对齐。
+///
+/// `little_endian` 描述**存储字节序**，与 565 的位域布局无关：两个 565 变体
+/// 都是小端，真正的红蓝差异由 `layout_565()` 给出，在 `unpack_565` /
+/// `blend_565` 中生效。此处只负责「两字节 → 一个 u16」。
 ///
 /// # Safety
 ///
 /// 调用方必须保证 `dst` 起至少 2 个字节可读。
 #[inline(always)]
-unsafe fn load_565(dst: *const u8, swapped: bool) -> u16 {
+unsafe fn load_565(dst: *const u8, little_endian: bool) -> u16 {
     // SAFETY: 由调用方保证 dst..dst+2 可读。
     let bytes = unsafe { [*dst, *dst.add(1)] };
-    decode_565_bytes(&bytes, swapped)
+    decode_565_bytes(&bytes, little_endian)
 }
 
 /// 把一个 16 位打包像素写到裸指针（`Rgb565` / `Bgr565`）。
@@ -106,8 +116,8 @@ unsafe fn load_565(dst: *const u8, swapped: bool) -> u16 {
 ///
 /// 调用方必须保证 `dst` 起至少 2 个字节可写。
 #[inline(always)]
-unsafe fn store_565(dst: *mut u8, word: u16, swapped: bool) {
-    let bytes = encode_565_bytes(word, swapped);
+unsafe fn store_565(dst: *mut u8, word: u16, little_endian: bool) {
+    let bytes = encode_565_bytes(word, little_endian);
     // SAFETY: 由调用方保证 dst..dst+2 可写。
     unsafe {
         *dst = bytes[0];
@@ -150,11 +160,11 @@ pub struct Renderer<'a> {
     pub(crate) fmt_rgb_order: bool,
     pub(crate) fmt_opaque_alpha: u8,
     pub(crate) fmt_stores_color_alpha: bool,
-    /// 16 位打包格式（`Rgb565` / `Bgr565`）的存储字节序是否为「高字节在前」。
+    /// 16 位打包格式（`Rgb565` / `Bgr565`）的 565 位域布局。
     ///
-    /// 仅 `Bgr565` 为 `true`；8 位通道格式的字节序已由各自的 shift 表达，
-    /// 在 2bpp 路径之外不会被读取。
-    pub(crate) fmt_bytes_swapped: bool,
+    /// 8 位通道格式恒为 [`Layout565::RedHigh`]：该值在 2bpp 路径之外不会被
+    /// 读取，位域差异由各自的 shift 表达。
+    pub(crate) fmt_layout_565: Layout565,
 }
 
 impl<'a> Renderer<'a> {
@@ -259,18 +269,19 @@ impl<'a> Renderer<'a> {
                 back.len()
             );
         }
-        let (fmt_bpp, fmt_rgb_order, fmt_opaque_alpha, fmt_stores_color_alpha, fmt_bytes_swapped) =
+        let (fmt_bpp, fmt_rgb_order, fmt_opaque_alpha, fmt_stores_color_alpha, fmt_layout_565) =
             match info.format {
-                PixelFormat::Rgb24 => (3, true, 255, false, false),
-                PixelFormat::Bgr24 => (3, false, 255, false, false),
-                PixelFormat::Xrgb8888 => (4, false, 0, false, false),
-                PixelFormat::Argb8888 => (4, false, 255, true, false),
-                PixelFormat::Rgba8888 => (4, true, 255, true, false),
-                PixelFormat::Bgra8888 => (4, false, 255, true, false),
+                PixelFormat::Rgb24 => (3, true, 255, false, Layout565::RedHigh),
+                PixelFormat::Bgr24 => (3, false, 255, false, Layout565::RedHigh),
+                PixelFormat::Xrgb8888 => (4, false, 0, false, Layout565::RedHigh),
+                PixelFormat::Argb8888 => (4, false, 255, true, Layout565::RedHigh),
+                PixelFormat::Rgba8888 => (4, true, 255, true, Layout565::RedHigh),
+                PixelFormat::Bgra8888 => (4, false, 255, true, Layout565::RedHigh),
                 // 565 没有逐字节的 RGB 顺序概念，2bpp 路径不使用 `fmt_rgb_order`，
-                // 这里填 `true` 仅为占位；通道位域由 `color::pack_565` 固定。
-                PixelFormat::Rgb565 => (2, true, 255, false, false),
-                PixelFormat::Bgr565 => (2, true, 255, false, true),
+                // 这里填 `true` 仅为占位；位域差异由 `fmt_layout_565` 表达。
+                // 两个 565 变体都是小端存储，故不需要字节序缓存字段。
+                PixelFormat::Rgb565 => (2, true, 255, false, Layout565::RedHigh),
+                PixelFormat::Bgr565 => (2, true, 255, false, Layout565::BlueHigh),
             };
         Self {
             info,
@@ -280,7 +291,7 @@ impl<'a> Renderer<'a> {
             fmt_rgb_order,
             fmt_opaque_alpha,
             fmt_stores_color_alpha,
-            fmt_bytes_swapped,
+            fmt_layout_565,
         }
     }
 
@@ -329,7 +340,7 @@ impl<'a> Renderer<'a> {
     /// 如果 `color.a == 0`，直接返回，不执行任何写入。
     ///
     /// 使用缓存格式属性（`fmt_bpp` / `fmt_rgb_order` / `fmt_opaque_alpha` /
-    /// `fmt_bytes_swapped`）代替 `PixelFormat::write_color` 的运行时枚举匹配，
+    /// `fmt_layout_565`）代替 `PixelFormat::write_color` 的运行时枚举匹配，
     /// 消除热路径中的分支开销。
     #[inline(always)]
     pub(crate) fn write_color_at_offset(&mut self, offset: usize, color: &Color) {
@@ -342,7 +353,7 @@ impl<'a> Renderer<'a> {
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
         // 必须在 `buffer_mut()` 之前读入局部变量，否则与缓冲区的可变借用冲突。
-        let bytes_swapped = self.fmt_bytes_swapped;
+        let layout_565 = self.fmt_layout_565;
         let target = self.buffer_mut();
         debug_assert!(
             offset + bpp <= target.len(),
@@ -354,8 +365,11 @@ impl<'a> Renderer<'a> {
 
         if bpp == 2 {
             // 565：解码 → 混合（`blend_565` 内含 a == 255 的短路）→ 量化回写。
-            let word = decode_565_bytes(dst, bytes_swapped);
-            let bytes = encode_565_bytes(blend_565(word, color), bytes_swapped);
+            let word = decode_565_bytes(dst, FMT_565_LITTLE_ENDIAN);
+            let bytes = encode_565_bytes(
+                blend_565(word, color, layout_565),
+                FMT_565_LITTLE_ENDIAN,
+            );
             dst[0] = bytes[0];
             dst[1] = bytes[1];
             return;
@@ -477,7 +491,7 @@ impl<'a> Renderer<'a> {
         let bpp = self.fmt_bpp;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
-        let bytes_swapped = self.fmt_bytes_swapped;
+        let layout_565 = self.fmt_layout_565;
         let pitch = self.info.pitch;
 
         let src_r = color.r;
@@ -541,9 +555,9 @@ impl<'a> Renderer<'a> {
                 if bpp == 2 {
                     // 565：掩码字节直接作为该像素的绘制 alpha（无 SWAR 批量路径）。
                     // SAFETY: offset + 2 <= buf_len 由上面的 debug_assert 保证。
-                    let word = unsafe { load_565(dst, bytes_swapped) };
-                    let blended = blend_565(word, &color.mix_alpha(m_alpha));
-                    unsafe { store_565(dst, blended, bytes_swapped) };
+                    let word = unsafe { load_565(dst, FMT_565_LITTLE_ENDIAN) };
+                    let blended = blend_565(word, &color.mix_alpha(m_alpha), layout_565);
+                    unsafe { store_565(dst, blended, FMT_565_LITTLE_ENDIAN) };
                 } else if m_alpha == 255 {
                     write_rgb_ptr!(dst, src_r, src_g, src_b, is_rgb_order);
                     if bpp == 4 {
@@ -588,7 +602,7 @@ impl<'a> Renderer<'a> {
         let row_len = (x_end - x_start + 1) * pixel_size;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
-        let bytes_swapped = self.fmt_bytes_swapped;
+        let layout_565 = self.fmt_layout_565;
         let target = self.buffer_mut();
         // SAFETY: 调用方 fill_visible_horizontal_span 保证
         // x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，
@@ -605,7 +619,10 @@ impl<'a> Renderer<'a> {
             });
         } else if pixel_size == 2 {
             // 565：先量化打包成 2 字节 pattern，再按 2 字节块批量填充。
-            let pattern = encode_565_bytes(pack_565(color), bytes_swapped);
+            let pattern = encode_565_bytes(
+                pack_565(color, layout_565),
+                FMT_565_LITTLE_ENDIAN,
+            );
             row.chunks_exact_mut(2).for_each(|pixel| {
                 pixel.copy_from_slice(&pattern);
             });
@@ -641,7 +658,7 @@ impl<'a> Renderer<'a> {
         let start = y * self.info.pitch + x_start * bpp;
         let pixel_count = x_end - x_start + 1;
         let span_len = pixel_count * bpp;
-        let bytes_swapped = self.fmt_bytes_swapped;
+        let layout_565 = self.fmt_layout_565;
 
         let buffer = self.buffer_mut();
         debug_assert!(start + span_len <= buffer.len());
@@ -675,9 +692,9 @@ impl<'a> Renderer<'a> {
             if bpp == 2 {
                 // 565：解码 → blend_channel → 量化（无 SWAR 批量路径）。
                 // SAFETY: pixel_idx < pixel_count，故 dst..dst+2 在跨度内。
-                let word = unsafe { load_565(dst, bytes_swapped) };
-                let blended = blend_565(word, color);
-                unsafe { store_565(dst, blended, bytes_swapped) };
+                let word = unsafe { load_565(dst, FMT_565_LITTLE_ENDIAN) };
+                let blended = blend_565(word, color, layout_565);
+                unsafe { store_565(dst, blended, FMT_565_LITTLE_ENDIAN) };
                 continue;
             }
             write_rgb_blend_ptr!(dst, src_r, src_g, src_b, alpha, inv_alpha, is_rgb_order);
@@ -928,7 +945,10 @@ impl<'a> Renderer<'a> {
         // 单像素的规范字节布局：565 走量化打包，其余格式通过 write_rgb! 统一字节序。
         let mut pixel = [0u8; 4];
         if bpp == 2 {
-            pixel[..2].copy_from_slice(&encode_565_bytes(pack_565(color), self.fmt_bytes_swapped));
+            pixel[..2].copy_from_slice(&encode_565_bytes(
+                pack_565(color, self.fmt_layout_565),
+                FMT_565_LITTLE_ENDIAN,
+            ));
         } else {
             write_rgb!(pixel, color.r, color.g, color.b, is_rgb_order);
             if bpp == 4 {
@@ -1059,7 +1079,7 @@ impl<'a> Renderer<'a> {
         let pitch = self.info.pitch;
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
-        let bytes_swapped = self.fmt_bytes_swapped;
+        let layout_565 = self.fmt_layout_565;
         let alpha = color.a as u16;
         let inv_alpha = 255 - alpha;
         let buffer = self.buffer_mut();
@@ -1079,9 +1099,9 @@ impl<'a> Renderer<'a> {
                     // a == 255 的短路，故这里不必再分支）。
                     // SAFETY: 主轴已收窄到可见范围、次轴已校验上界，
                     // 故 offset..offset+2 落在缓冲区可写区域内。
-                    let word = unsafe { load_565(dst, bytes_swapped) };
-                    let blended = blend_565(word, color);
-                    unsafe { store_565(dst, blended, bytes_swapped) };
+                    let word = unsafe { load_565(dst, FMT_565_LITTLE_ENDIAN) };
+                    let blended = blend_565(word, color, layout_565);
+                    unsafe { store_565(dst, blended, FMT_565_LITTLE_ENDIAN) };
                 } else if alpha == 255 {
                     write_rgb_ptr!(dst, color.r, color.g, color.b, is_rgb_order);
                     if bpp == 4 {
@@ -1650,7 +1670,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{Renderer, load_565, store_565};
+    use super::{FMT_565_LITTLE_ENDIAN, Renderer, load_565, store_565};
     use crate::angle::Angle;
     use crate::color::{Color, PixelFormat};
     use crate::framebuffer::FramebufferInfo;
@@ -1697,7 +1717,7 @@ mod tests {
         PixelFormat::Bgr565,
     ];
 
-    /// 565 的两个变体：小端存储与字节交换存储。
+    /// 565 的两个变体：红在高位与蓝在高位（均为小端存储）。
     const FORMATS_565: [PixelFormat; 2] = [PixelFormat::Rgb565, PixelFormat::Bgr565];
 
 
@@ -1731,9 +1751,20 @@ mod tests {
         ((v as u32 * max + 127) / 255) as u16
     }
 
-    /// 565 打包的参考实现（位域 `R = 15..11`、`G = 10..5`、`B = 4..0`）。
-    fn pack_565_ref(c: &Color) -> u16 {
-        (quantize_ref(c.r, 5) << 11) | (quantize_ref(c.g, 6) << 5) | quantize_ref(c.b, 5)
+    /// 565 打包的参考实现：按格式的位域布局写入红蓝两段。
+    ///
+    /// 与 `color::pack_565` 独立重写：这里显式按 `PixelFormat` 分派，
+    /// 使得「位域随格式变化」这一契约在测试侧也有独立表述。
+    fn pack_565_ref(format: PixelFormat, c: &Color) -> u16 {
+        let r = quantize_ref(c.r, 5);
+        let g = quantize_ref(c.g, 6);
+        let b = quantize_ref(c.b, 5);
+        match format {
+            // Bgr565：蓝占高 5 位、红占低 5 位。
+            PixelFormat::Bgr565 => (b << 11) | (g << 5) | r,
+            // Rgb565 及其它：红占高 5 位、蓝占低 5 位。
+            _ => (r << 11) | (g << 5) | b,
+        }
     }
 
     /// 精确圆盘参考实现：逐像素判定 `dx² + dy² <= radius²`。
@@ -2150,7 +2181,7 @@ mod tests {
     ///
     /// 这是落盘语义的基准：`fmt_rgb_order` 决定前 3 字节的通道序，
     /// 第 4 字节恒为该格式的 `opaque_alpha`（`Xrgb8888` 为 0，其余 4bpp 为 255），
-    /// 565 则按各自的存储字节序量化打包。
+    /// 565 则按各自的位域布局量化打包（小端存储）。
     #[test]
     fn set_pixel_byte_layout_per_format() {
         let color = Color::with_alpha(0x12, 0x34, 0x56, 0xFF);
@@ -2163,10 +2194,11 @@ mod tests {
             (PixelFormat::Argb8888, [0x56, 0x34, 0x12, 0xFF]),
             (PixelFormat::Rgba8888, [0x12, 0x34, 0x56, 0xFF]),
             (PixelFormat::Bgra8888, [0x56, 0x34, 0x12, 0xFF]),
-            // 565：0x12/0x34/0x56 → word 0x11AA；Rgb565 小端 [0xAA,0x11]，
-            // Bgr565 恰为两字节交换 [0x11,0xAA]。
+            // 565：0x12/0x34/0x56 → Rgb565 word 0x11AA（红高位）→ 小端 [0xAA,0x11]；
+            // Bgr565 蓝占高位 → word 0x51A2 → 小端 [0xA2,0x51]。
+            // 二者都是小端；差异在位域而非字节序。
             (PixelFormat::Rgb565, [0xAA, 0x11, 0, 0]),
-            (PixelFormat::Bgr565, [0x11, 0xAA, 0, 0]),
+            (PixelFormat::Bgr565, [0xA2, 0x51, 0, 0]),
         ];
 
         for (format, expected) in cases {
@@ -2356,13 +2388,9 @@ mod tests {
 
             // 参考：解出目标色、按 blend_channel 混合、再量化打包。
             let dst = Color::new(255, 255, 255);
-            let want = pack_565_ref(&blend_ref(&src, &dst, src.a));
-            let swapped = format == PixelFormat::Bgr565;
-            let bytes = if swapped {
-                [((want >> 8) & 0xFF) as u8, (want & 0xFF) as u8]
-            } else {
-                [(want & 0xFF) as u8, ((want >> 8) & 0xFF) as u8]
-            };
+            let want = pack_565_ref(format, &blend_ref(&src, &dst, src.a));
+            // 两个 565 变体都是小端：字节 0 是位域低字节。
+            let bytes = [(want & 0xFF) as u8, ((want >> 8) & 0xFF) as u8];
             assert_eq!(renderer.buffer()[..2], bytes, "{format:?} 的 565 混合落盘错误");
         }
     }
@@ -2408,23 +2436,26 @@ mod tests {
     /// 这里专门用**奇数偏移**的裸指针确认它们不解引用未对齐的 `u16`。
     #[test]
     fn load_565_and_store_565_roundtrip_at_odd_offset() {
-        for swapped in [false, true] {
-            let word = pack_565_ref(&Color::new(0x12, 0x34, 0x56));
-            // 故意让 `src` 的起始偏移为奇数：任何 `u16` 解引用都是 UB。
-            let mut storage = [0u8; 8];
-            unsafe {
-                let p = storage.as_mut_ptr().add(1);
-                store_565(p, word, swapped);
-                assert_eq!(load_565(p, swapped), word, "swapped={swapped} 往返失败");
-            }
-            // 存储字节序与 `encode_565_bytes` 一致。
-            let expected = if swapped {
-                [(word >> 8) as u8, (word & 0xFF) as u8]
-            } else {
-                [(word & 0xFF) as u8, (word >> 8) as u8]
-            };
-            assert_eq!(storage[1..3], expected);
+        let word = pack_565_ref(PixelFormat::Rgb565, &Color::new(0x12, 0x34, 0x56));
+        // 565 恒为小端存储，故字节序参数只有一种取值。
+        assert!(
+            FMT_565_LITTLE_ENDIAN,
+            "两个 565 变体都必须是小端存储"
+        );
+        // 故意让 `src` 的起始偏移为奇数：任何 `u16` 解引用都是 UB。
+        let mut storage = [0u8; 8];
+        unsafe {
+            let p = storage.as_mut_ptr().add(1);
+            store_565(p, word, FMT_565_LITTLE_ENDIAN);
+            assert_eq!(
+                load_565(p, FMT_565_LITTLE_ENDIAN),
+                word,
+                "往返失败"
+            );
         }
+        // 存储字节序与 `encode_565_bytes` 一致（小端：字节 0 是低字节）。
+        let expected = [(word & 0xFF) as u8, (word >> 8) as u8];
+        assert_eq!(storage[1..3], expected);
     }
 
     // ——————————————————————— S11 · clear ———————————————————————
@@ -2443,12 +2474,9 @@ mod tests {
             PixelFormat::Argb8888 | PixelFormat::Bgra8888 => vec![c.b, c.g, c.r, c.a],
             PixelFormat::Rgba8888 => vec![c.r, c.g, c.b, c.a],
             PixelFormat::Rgb565 | PixelFormat::Bgr565 => {
-                let word = pack_565_ref(c);
-                if format == PixelFormat::Bgr565 {
-                    vec![(word >> 8) as u8, (word & 0xFF) as u8]
-                } else {
-                    vec![(word & 0xFF) as u8, (word >> 8) as u8]
-                }
+                // 两个变体都是小端：字节 0 是位域低字节。
+                let word = pack_565_ref(format, c);
+                vec![(word & 0xFF) as u8, (word >> 8) as u8]
             }
         }
     }

@@ -177,8 +177,8 @@ fn rendering_is_deterministic_per_format() {
 /// `Argb8888` 与 `Bgra8888` 的字节序都是 `B, G, R, A`，`alpha_shift` 同为 24，
 /// 在只写不透明颜色时无法区分——这是格式定义使然，不是 bug。
 ///
-/// 注意 `Rgb565` / `Bgr565` **不在此列**：二者位域相同但**存储字节序相反**，
-/// 同一颜色在缓冲区里的两个字节排列不同，故指纹不同（而解码回的颜色相同）。
+/// 注意 `Rgb565` / `Bgr565` **不在此列**：二者**位域不同**（`Bgr565` 的红蓝两段
+/// 互换），同一颜色落盘的字节排列不同，故指纹不同（而各自解码回的颜色相同）。
 const EQUIVALENT_FORMAT_PAIRS: [(PixelFormat, PixelFormat); 1] =
     [(PixelFormat::Argb8888, PixelFormat::Bgra8888)];
 
