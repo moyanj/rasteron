@@ -1,5 +1,5 @@
 use crate::angle::{Angle, Wedge};
-use crate::color::{Color, Layout565, blend_565, decode_565_bytes, encode_565_bytes, pack_565};
+use crate::color::{blend_565, decode_565_bytes, encode_565_bytes, pack_565, Color, Layout565};
 use crate::framebuffer::{FramebufferInfo, PixelFormat};
 use crate::pixel::Pixel;
 #[cfg(feature = "simd")]
@@ -330,9 +330,24 @@ impl<'a> Renderer<'a> {
     }
 
     /// 计算像素 `(x, y)` 在缓冲区中的字节偏移。
+    ///
+    /// # 恐慌
+    ///
+    /// 两类乘法（`y × pitch`、`x × bytes_per_pixel`）及其和溢出 `usize` 时恐慌。
+    ///
+    /// 这里用 `checked_*` 而不是裸算术，是因为 [`FramebufferInfo`] 的字段是
+    /// 公开的：`Renderer` 构造之后调用方仍可改写 `width` / `height` / `pitch`，
+    /// 构造期的长度校验对改写后的布局没有约束力。静默回绕会返回一个「看起来
+    /// 在缓冲区内」的小偏移，随后的 `get_unchecked_mut` 便写到了错误的像素上——
+    /// 那是静默的渲染错误，比 fail-fast 更难发现。
     #[inline(always)]
     pub fn pixel_offset(&self, x: usize, y: usize) -> usize {
-        y * self.info.pitch + x * self.info.bytes_per_pixel()
+        y.checked_mul(self.info.pitch)
+            .and_then(|row| {
+                x.checked_mul(self.info.bytes_per_pixel())
+                    .and_then(|col| row.checked_add(col))
+            })
+            .expect("pixel offset overflow")
     }
 
     /// 在指定字节偏移处写入颜色（支持 Alpha 混合）。
@@ -403,7 +418,8 @@ impl<'a> Renderer<'a> {
     /// 自动裁剪到帧缓冲可见区域。
     ///
     /// 当 `src_format` 与帧缓冲格式不匹配、`width`/`height` 为 0、`src_pitch` 小于
-    /// `width × bytes_per_pixel`、或 `src` 切片长度不足以容纳 `src_pitch × height`
+    /// `width × bytes_per_pixel`、`src_pitch × height` 或 `width × bytes_per_pixel`
+    /// 在 `usize` 中溢出、或 `src` 切片长度不足以容纳 `src_pitch × height`
     /// 字节时，静默返回，不写入任何像素。
     pub fn blit(
         &mut self,
@@ -420,20 +436,33 @@ impl<'a> Renderer<'a> {
         }
         // 每行实际读取 width * bpp 字节，故 src_pitch 不得小于该值，
         // 否则 src_start + copy_bytes 会越过行尾（见下方切片索引）。
-        if src_pitch < width.saturating_mul(self.info.format.bytes_per_pixel()) {
+        let bpp = self.info.format.bytes_per_pixel();
+        // `width` / `height` 是 `usize`，裸乘会回绕成小值并让下面的长度检查
+        // 误判为「容量够用」。溢出说明这个请求本身不可表示，按既有契约静默返回。
+        let Some(row_bytes) = width.checked_mul(bpp) else {
+            return;
+        };
+        if src_pitch < row_bytes {
             return;
         }
         // 短路：src 长度不足
-        if src.len() < src_pitch.saturating_mul(height) {
+        let Some(src_needed) = src_pitch.checked_mul(height) else {
+            return;
+        };
+        if src.len() < src_needed {
             return;
         }
-        let bpp = self.info.format.bytes_per_pixel();
         let fb_width = self.info.width;
         let dst_x = dst_top_left.x;
 
         // 逐行处理
         for row in 0..height {
-            let dy = dst_top_left.y + row;
+            // `dst_top_left.y + row` 与 `row * src_pitch` 同样可能溢出；
+            // 前者溢出说明行号已超出任何可表示的坐标，直接停止；
+            // 后者在循环外已由 `src_needed` 的检查覆盖，这里用 checked 表达同一前提。
+            let Some(dy) = dst_top_left.y.checked_add(row) else {
+                break;
+            };
             if dy >= self.info.height {
                 break;
             }
@@ -463,7 +492,8 @@ impl<'a> Renderer<'a> {
     /// 适用于文本渲染/精灵绘制的前置能力。
     ///
     /// 当 `width`/`height` 为 0、颜色完全透明、`mask_pitch` 小于 `width`、
-    /// 或 `mask` 切片长度不足 `mask_pitch × height` 时，静默返回。
+    /// `mask_pitch × height` 在 `usize` 中溢出、或 `mask` 切片长度不足
+    /// `mask_pitch × height` 时，静默返回。
     pub fn blit_mask(
         &mut self,
         dst_top_left: Pixel,
@@ -479,7 +509,11 @@ impl<'a> Renderer<'a> {
         if mask_pitch < width {
             return;
         }
-        if mask.len() < mask_pitch.saturating_mul(height) {
+        // 与 `blit` 同理：饱和值会让长度检查放行一个实际装不下的请求。
+        let Some(mask_needed) = mask_pitch.checked_mul(height) else {
+            return;
+        };
+        if mask.len() < mask_needed {
             return;
         }
         let fb_width = self.info.width;
@@ -506,7 +540,13 @@ impl<'a> Renderer<'a> {
         let buf_len = buffer.len();
 
         for row in 0..height {
-            let dy = dst_top_left.y + row;
+            // 行号与行起点偏移都用 checked 计算：`dst_top_left.y + row` 溢出说明
+            // 该行已落到任何可表示坐标之外；`row * mask_pitch` 由循环外的
+            // `mask_needed` 检查覆盖，但这里同样以 checked 表达，避免裸乘在
+            // 未来的改动中无声回绕。
+            let Some(dy) = dst_top_left.y.checked_add(row) else {
+                break;
+            };
             if dy >= fb_height {
                 break;
             }
@@ -514,8 +554,19 @@ impl<'a> Renderer<'a> {
                 continue;
             }
             let visible_cols = width.min(fb_width - dst_x);
-            let row_mask_off = row * mask_pitch;
-            let base_off = dy * pitch + dst_x * bpp;
+            let Some(row_mask_off) = row.checked_mul(mask_pitch) else {
+                break;
+            };
+            // `dy < fb_height`、`dst_x < fb_width`，故这是 `pixel_offset(dst_x, dy)`
+            // 的等价展开，同样的 checked 口径。
+            let Some(base_off) = dy
+                .checked_mul(pitch)
+                .and_then(|r| dst_x.checked_mul(bpp).and_then(|c| r.checked_add(c)))
+            else {
+                break;
+            };
+            // SAFETY: `dy < fb_height` 且 `dst_x < fb_width`，且构造期保证
+            // `buffer.len() >= pitch × height`，故 `base_off` 是合法的行首偏移。
             let row_ptr = unsafe { base_ptr.add(base_off) };
 
             if bpp == 4 && row_ptr.align_offset(4) == 0 {
@@ -595,16 +646,24 @@ impl<'a> Renderer<'a> {
         color: &Color,
     ) {
         let pixel_size = self.fmt_bpp;
+        // `pixel_offset` 内部已是 checked；跨度长度单独 checked，两者之和即
+        // `row` 切片的右端点，必须在进入 unsafe 之前确定它可表示。
         let start = self.pixel_offset(x_start, y);
-        let row_len = (x_end - x_start + 1) * pixel_size;
+        let span_bytes = (x_end - x_start + 1)
+            .checked_mul(pixel_size)
+            .expect("fill_span_opaque: span length overflow");
+        let end = start
+            .checked_add(span_bytes)
+            .expect("fill_span_opaque: span end overflow");
         let is_rgb_order = self.fmt_rgb_order;
         let opaque_alpha = self.fmt_opaque_alpha;
         let layout_565 = self.fmt_layout_565;
         let target = self.buffer_mut();
+        debug_assert!(end <= target.len(), "fill_span_opaque: span end 越界");
         // SAFETY: 调用方 fill_visible_horizontal_span 保证
         // x_start..=x_end 已裁剪到 [0, width)，y 已裁剪到 [0, height)，
-        // 故 start + row_len = pixel_offset(x_end, y) + pixel_size <= buffer.len()。
-        let row = unsafe { target.get_unchecked_mut(start..start + row_len) };
+        // 故 end = pixel_offset(x_end, y) + pixel_size <= buffer.len()。
+        let row = unsafe { target.get_unchecked_mut(start..end) };
 
         if pixel_size == 4 {
             // 构造 4 字节 pattern，然后按 4 字节块批量填充。
@@ -649,14 +708,27 @@ impl<'a> Renderer<'a> {
         debug_assert!(color.a > 0 && color.a < 255);
 
         let bpp = self.fmt_bpp;
-        let start = y * self.info.pitch + x_start * bpp;
+        // 行首偏移与跨度长度与 `pixel_offset` 同口径，全部 checked：`start` 是
+        // 裸指针 `add` 的偏移、`span_len` 决定写入范围，两者都必须在进入
+        // unsafe 之前确定可表示且不越界。
+        let start = y
+            .checked_mul(self.info.pitch)
+            .and_then(|r| x_start.checked_mul(bpp).and_then(|c| r.checked_add(c)))
+            .expect("fill_span_alpha: row offset overflow");
         let pixel_count = x_end - x_start + 1;
-        let span_len = pixel_count * bpp;
+        let span_len = pixel_count
+            .checked_mul(bpp)
+            .expect("fill_span_alpha: span length overflow");
+        let end = start
+            .checked_add(span_len)
+            .expect("fill_span_alpha: span end overflow");
         let layout_565 = self.fmt_layout_565;
 
         let buffer = self.buffer_mut();
-        debug_assert!(start + span_len <= buffer.len());
+        debug_assert!(end <= buffer.len(), "fill_span_alpha: span end 越界");
         let base_ptr = buffer.as_mut_ptr();
+        // SAFETY: 调用方保证 x_start..=x_end 与 y 均已裁剪到可见区，
+        // 且 end 的 checked 计算已确认偏移可表示。
         let row = unsafe { base_ptr.add(start) };
 
         if bpp == 4 && row.align_offset(4) == 0 {
@@ -849,18 +921,36 @@ impl<'a> Renderer<'a> {
     }
 
     /// 用指定颜色清空整个帧缓冲。
+    ///
+    /// # 恐慌
+    ///
+    /// `width × bytes_per_pixel`、`pitch × height` 或 `pitch × (height - 1) + row_len`
+    /// 在 `usize` 中溢出时恐慌（字段公开，构造期校验管不到构造之后的改写）。
     pub fn clear(&mut self, color: Color) {
         let pixel_size = self.info.format.bytes_per_pixel();
         let width = self.info.width;
         let height = self.info.height;
-        let row_len = width * pixel_size;
+        // 布局算术一律 checked：溢出（正常构造下不可能，改写公开字段后可能）
+        // 必须 fail-fast，否则下面的裸指针写入会以错误容量为前提。
+        let row_len = width
+            .checked_mul(pixel_size)
+            .expect("clear: width * bytes_per_pixel overflow");
 
         if row_len == 0 || height == 0 {
             return;
         }
 
         let pitch = self.info.pitch;
-        let total_bytes = pitch * height;
+        let total_bytes = pitch
+            .checked_mul(height)
+            .expect("clear: pitch * height overflow");
+        // 末行起点 + 行可见长度：逐行路径里唯一可能越出 total_bytes 的算术。
+        let last_row_end = height
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(pitch))
+            .and_then(|off| off.checked_add(row_len))
+            .expect("clear: last row end overflow");
+        debug_assert!(last_row_end <= total_bytes);
 
         // 16 字节模式描述符。对 4bpp 可铺满整个缓冲，把每像素一次写入降为
         // 每 16 字节一次写入；对 3bpp 退回单像素模式。
@@ -893,7 +983,8 @@ impl<'a> Renderer<'a> {
                 #[cfg(not(feature = "simd"))]
                 core::ptr::copy_nonoverlapping(pattern.as_ptr(), base_ptr, init_len);
             }
-            // SAFETY: total_bytes = pitch * height <= buffer.len()，切片不越过分配。
+            // SAFETY: total_bytes = pitch * height <= buffer.len()（checked 计算，
+            // 溢出已在上方 fail-fast），切片不越过分配。
             let full_buf = unsafe { core::slice::from_raw_parts_mut(base_ptr, total_bytes) };
             pattern_fill(full_buf, &pattern[..init_len]);
         } else {
@@ -907,10 +998,15 @@ impl<'a> Renderer<'a> {
             pattern_fill(first_row, &pattern[..first_row_init_len]);
 
             for y in 1..height {
-                // SAFETY: y < height，故 y * pitch + row_len <= pitch * height <=
-                // buffer.len()；目标行与首行（拷贝源）不重叠。
+                // `y < height` 时 `y × pitch` 必不超过 `last_row_end`，
+                // 而后者已在进入 unsafe 前完成 checked 计算。
+                let row_off = y
+                    .checked_mul(pitch)
+                    .expect("clear: row offset overflow (y * pitch)");
+                // SAFETY: y < height，故 row_off + row_len <= last_row_end <=
+                // total_bytes <= buffer.len()；目标行与首行（拷贝源）不重叠。
                 unsafe {
-                    let row_ptr = base_ptr.add(y * pitch);
+                    let row_ptr = base_ptr.add(row_off);
                     #[cfg(feature = "simd")]
                     simd::memcpy(row_ptr, base_ptr, row_len);
                     #[cfg(not(feature = "simd"))]
@@ -1084,7 +1180,17 @@ impl<'a> Renderer<'a> {
             // 单独检查其上界。下界恒为 0：坐标非负，且 y 从 y1 >= 0 出发，
             // 步进方向 y_step 只会让它朝 y2 所在的一侧移动，不会越过 0。
             if y <= y_hi_bound {
-                let offset = py as usize * pitch + px as usize * bpp;
+                // 主轴（py）与次轴（px）都已确认落在各自的 `*-1` 上界内，
+                // 但偏移本身仍用 checked 计算：`pitch` 与 `bpp` 来自公开字段，
+                // 回绕出的偏移会让裸指针写到错误的像素上。
+                let offset = (py as usize)
+                    .checked_mul(pitch)
+                    .and_then(|r| {
+                        (px as usize)
+                            .checked_mul(bpp)
+                            .and_then(|c| r.checked_add(c))
+                    })
+                    .expect("draw_line: pixel offset overflow");
                 let dst = unsafe { base_ptr.add(offset) };
                 if alpha == 0 {
                     // 完全透明：跳过写入
@@ -1616,6 +1722,11 @@ impl<'a> Renderer<'a> {
     /// [`Renderer::clear`]。
     ///
     /// 单缓冲模式下（未提供后台缓冲区）绘制本就落在前台，此方法为空操作。
+    ///
+    /// # 恐慌
+    ///
+    /// `width × bytes_per_pixel`、`pitch × height` 或 `pitch × (height - 1) + row_len`
+    /// 在 `usize` 中溢出时恐慌（字段公开，构造期校验管不到构造之后的改写）。
     pub fn swap_buffers(&mut self) {
         // 先取出后台切片的不可变引用：`back_buffer` 与 `front_buffer` 是不同的
         // 字段，借用检查器允许随后可变借用 `front_buffer`。
@@ -1623,7 +1734,13 @@ impl<'a> Renderer<'a> {
             return;
         };
 
-        let row_len = self.info.width * self.info.bytes_per_pixel();
+        // 与 `clear` 同口径：present 的切片索引必须先经 checked 计算，
+        // 不能让回绕值决定拷贝范围。
+        let row_len = self
+            .info
+            .width
+            .checked_mul(self.info.bytes_per_pixel())
+            .expect("swap_buffers: width * bytes_per_pixel overflow");
         let height = self.info.height;
         if row_len == 0 || height == 0 {
             return;
@@ -1633,14 +1750,28 @@ impl<'a> Renderer<'a> {
         if pitch == row_len {
             // 无行间填充：一次拷贝。切片可能比 `buffer_size()` 更长，故显式取前
             // `pitch × height` 字节，而不是整体 `copy_from_slice`（长度不等会 panic）。
-            let total = pitch * height;
+            let total = pitch
+                .checked_mul(height)
+                .expect("swap_buffers: pitch * height overflow");
             self.front_buffer[..total].copy_from_slice(&back[..total]);
             return;
         }
 
+        // 末行起点 + 可见行长度必须可表示，否则下面逐行的切片索引会以回绕值为准。
+        if height
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(pitch))
+            .and_then(|off| off.checked_add(row_len))
+            .is_none()
+        {
+            panic!("swap_buffers: last row end overflow");
+        }
+
         // 有行间填充：逐行只拷贝可见部分，填充字节与相邻区域不被触碰。
         for y in 0..height {
-            let off = y * pitch;
+            let off = y
+                .checked_mul(pitch)
+                .expect("swap_buffers: row offset overflow (y * pitch)");
             self.front_buffer[off..off + row_len].copy_from_slice(&back[off..off + row_len]);
         }
     }
@@ -1659,7 +1790,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{FMT_565_LITTLE_ENDIAN, Renderer, load_565, store_565};
+    use super::{load_565, store_565, Renderer, FMT_565_LITTLE_ENDIAN};
     use crate::angle::Angle;
     use crate::color::{Color, PixelFormat};
     use crate::framebuffer::FramebufferInfo;
@@ -2077,6 +2208,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ——————————————— 公开布局字段被改写后的 fail-fast 契约 ———————————————
+    //
+    // `FramebufferInfo` 的 `width` / `height` / `pitch` 都是 `pub`，调用方在
+    // `Renderer` 构造之后仍可直接改写它们。构造期的长度校验因此**不能**被当作
+    // 后续运算的安全前提：所有按布局做的算术都必须独立 checked、溢出即 panic。
+    //
+    // 下面几条用一个 4×4 的紧凑 Rgba8888 渲染器做底座，构造之后把字段改写成
+    // 会溢出的组合。它们不需要（也不能）真实分配那么大的内存——被验证的只是
+    // 「算术溢出被拒绝」，不是「能装下多少像素」。
+
+    /// 构造一个 4×4 Rgba8888 渲染器，缓冲恰好 `pitch × height = 64` 字节。
+    fn overflow_probe_renderer(fb: &mut [u8; 64]) -> Renderer<'_> {
+        Renderer::new(FramebufferInfo::new(4, 4, 16, PixelFormat::Rgba8888), fb)
+    }
+
+    /// `pixel_offset` 在 `pitch × y` 溢出时 fail-fast，不回绕。
+    ///
+    /// 回绕值会落在缓冲区内，让 `get_unchecked_mut` 写到**错误的像素**上——
+    /// 静默的渲染错误比 panic 难发现得多，故这里要求 panic。
+    #[test]
+    #[should_panic(expected = "pixel offset overflow")]
+    fn pixel_offset_panics_when_pitch_times_y_overflows() {
+        let mut fb = [0u8; 64];
+        let mut renderer = overflow_probe_renderer(&mut fb);
+        renderer.info.pitch = usize::MAX;
+        let _ = renderer.pixel_offset(0, 2);
+    }
+
+    /// `pixel_offset` 在 `x × bytes_per_pixel` 溢出时同样 fail-fast。
+    #[test]
+    #[should_panic(expected = "pixel offset overflow")]
+    fn pixel_offset_panics_when_x_times_bpp_overflows() {
+        let mut fb = [0u8; 64];
+        let mut renderer = overflow_probe_renderer(&mut fb);
+        // `width` 一并改写，使 x 通过 `get_pixel` 的上界检查走到偏移计算。
+        renderer.info.width = usize::MAX;
+        let _ = renderer.pixel_offset(usize::MAX, 0);
+    }
+
+    /// `pixel_offset` 在两项之和（而非任一项）溢出时 fail-fast。
+    ///
+    /// 单独 checked 两个乘积还不够：`y × pitch` 与 `x × bpp` 都可表示、
+    /// 但相加溢出时，裸加法同样会回绕。
+    #[test]
+    #[should_panic(expected = "pixel offset overflow")]
+    fn pixel_offset_panics_when_sum_overflows() {
+        let mut fb = [0u8; 64];
+        let mut renderer = overflow_probe_renderer(&mut fb);
+        renderer.info.pitch = usize::MAX / 2 + 1;
+        renderer.info.width = usize::MAX;
+        // (1 × (MAX/2 + 1)) + (MAX × 4) 之和溢出（每一项本身不溢出）。
+        let _ = renderer.pixel_offset(usize::MAX, 1);
+    }
+
+    /// `buffer_size` 在 `pitch × height` 溢出时 fail-fast。
+    #[test]
+    #[should_panic(expected = "framebuffer size overflow")]
+    fn buffer_size_panics_when_layout_fields_are_mutated_to_overflow() {
+        let mut fb = [0u8; 64];
+        let mut renderer = overflow_probe_renderer(&mut fb);
+        renderer.info.height = usize::MAX;
+        let _ = renderer.info().buffer_size();
+    }
+
+    /// `clear` 在改写后的布局溢出时 fail-fast，不进入裸指针写入路径。
+    ///
+    /// 若 `pitch × height` 回绕成小值，`from_raw_parts_mut(base_ptr, total_bytes)`
+    /// 与后续 `pattern_fill` 会以错误容量为前提，那是越界写。
+    #[test]
+    #[should_panic(expected = "clear: ")]
+    fn clear_panics_on_overflowed_layout_instead_of_wrapping() {
+        let mut fb = [0u8; 64];
+        let mut renderer = overflow_probe_renderer(&mut fb);
+        renderer.info.height = usize::MAX;
+        renderer.clear(Color::new(1, 2, 3));
+    }
+
+    /// `swap_buffers` 在改写后的布局溢出时 fail-fast。
+    ///
+    /// 这条路径同样以 `pitch × height`（或末行起点 + 行长度）做切片索引，
+    /// 回绕值会让 present 拷贝错误的字节区间。
+    #[test]
+    #[should_panic(expected = "swap_buffers: ")]
+    fn swap_buffers_panics_on_overflowed_layout_instead_of_wrapping() {
+        let info = FramebufferInfo::new(4, 4, 16, PixelFormat::Rgba8888);
+        let mut front = [0u8; 64];
+        let mut back = [0u8; 64];
+        let mut renderer = Renderer::with_back_buffer(info, &mut front, &mut back);
+        renderer.info.height = usize::MAX;
+        renderer.swap_buffers();
+    }
+
+    /// `blit` 在 `width × bpp` 或 `src_pitch × height` 溢出时静默返回。
+    ///
+    /// 与上面几条不同，`blit` 的既有契约是**静默不写**（见其文档），故这里
+    /// 断言的是「没有写入且不 panic」，而不是 panic。
+    #[test]
+    fn blit_returns_silently_when_size_products_overflow() {
+        let (info, mut fb) = scratch(4, 4, PixelFormat::Rgba8888, Layout::Tight);
+        let blank = vec![0u8; 64];
+        let mut renderer = render_on(info, &mut fb);
+
+        // `width × bpp` 溢出：src_pitch 再怎么给都不可能满足。
+        renderer.blit(
+            Pixel::new(0, 0),
+            usize::MAX,
+            1,
+            PixelFormat::Rgba8888,
+            &[0xAB; 16],
+            usize::MAX,
+        );
+        // `src_pitch × height` 溢出：长度为 16 的 src 曾被 saturating 检查放行。
+        renderer.blit(
+            Pixel::new(0, 0),
+            1,
+            2,
+            PixelFormat::Rgba8888,
+            &[0xAB; 16],
+            usize::MAX,
+        );
+
+        assert_eq!(
+            renderer.buffer(),
+            &blank[..],
+            "溢出尺寸的 blit 必须不写入任何字节"
+        );
+    }
+
+    /// `blit_mask` 在 `mask_pitch × height` 溢出时静默返回。
+    #[test]
+    fn blit_mask_returns_silently_when_mask_pitch_times_height_overflows() {
+        let (info, mut fb) = scratch(4, 4, PixelFormat::Rgba8888, Layout::Tight);
+        let blank = vec![0u8; 64];
+        let mut renderer = render_on(info, &mut fb);
+
+        // 长度为 16 的 mask 曾被 `saturating_mul` 的饱和值放行。
+        renderer.blit_mask(
+            Pixel::new(0, 0),
+            1,
+            2,
+            &[0xFF; 16],
+            usize::MAX,
+            Color::new(255, 0, 0),
+        );
+
+        assert_eq!(
+            renderer.buffer(),
+            &blank[..],
+            "溢出尺寸的 blit_mask 必须不写入任何字节"
+        );
+    }
+
+    /// `blit_mask` 的调用方若给出不溢出的正常参数，行为不变（对照组）。
+    #[test]
+    fn blit_mask_still_writes_with_normal_parameters() {
+        let (info, mut fb) = scratch(4, 4, PixelFormat::Rgba8888, Layout::Tight);
+        let mut renderer = render_on(info, &mut fb);
+        renderer.blit_mask(Pixel::new(0, 0), 2, 2, &[255; 4], 2, Color::new(255, 0, 0));
+        assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(255, 0, 0)));
+        assert_eq!(renderer.get_pixel(1, 1), Some(Color::new(255, 0, 0)));
+        // (2,2) 在 2×2 的 mask 之外，保持初始的黑色。
+        assert_eq!(
+            renderer.get_pixel(2, 2).map(|c| (c.r, c.g, c.b)),
+            Some((0, 0, 0))
+        );
     }
 
     /// 单缓冲的 `swap_buffers` 必须是空操作。
@@ -4232,7 +4530,11 @@ mod tests {
                 .copied()
                 .filter(|(_, y)| {
                     let dy = *y as i64 - center_y;
-                    if lower { dy >= 0 } else { dy <= 0 }
+                    if lower {
+                        dy >= 0
+                    } else {
+                        dy <= 0
+                    }
                 })
                 .collect();
 

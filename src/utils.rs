@@ -1,10 +1,10 @@
-use crate::Pixel;
 use crate::core::Renderer;
 use crate::framebuffer::FramebufferInfo;
 #[cfg(feature = "programmable")]
 use crate::programmable::{Vec2, Viewport};
 #[cfg(feature = "simd")]
 use crate::simd;
+use crate::Pixel;
 
 /// 按可见窗口构造单缓冲子渲染器，实现无状态裁剪。
 ///
@@ -188,7 +188,8 @@ fn sub_view_geometry(
     let sub_h = height.min(info.height - y);
 
     // 窗口左上角在缓冲区中的字节偏移。用 checked_* 而非裸算术，因为
-    // `FramebufferInfo::new` 不限制 width/height，`y * pitch` 在极端输入下会溢出。
+    // `FramebufferInfo` 的字段是公开的，`y * pitch` / `x * bpp` 在构造之后的
+    // 改写或极端输入下都会回绕——回绕值会变成一个「看起来在缓冲区内」的偏移。
     let offset = y.checked_mul(pitch)?.checked_add(x.checked_mul(bpp)?)?;
     let avail = fb_len.checked_sub(offset)?;
 
@@ -217,6 +218,23 @@ fn sub_view_geometry(
     // 属于父缓冲区下一行的字节不会被任何绘制或 present 触碰（见 `swap_buffers`）。
     let len = pitch.checked_mul(sub_h)?;
     if len > avail {
+        return None;
+    }
+
+    // 窗口切片的右端点 `offset + len` 也必须可表示：`offset + len` 溢出时
+    // `&mut fb[offset..offset + len]` 会以回绕值索引，直接把越界切片交给
+    // `Renderer`。`len <= avail = fb_len - offset` 已保证它不越过 `fb_len`，
+    // 这里补上可表示性这一前提。
+    let _ = offset.checked_add(len)?;
+
+    // 窗口内最右下可见像素的右边界：`(sub_h - 1) × pitch + sub_w × bpp`，
+    // 即所有绘制与 present 真正触碰的最大偏移。它不超过 `len` 才说明
+    // 「切片长度取整行」这一取舍不会把可见像素排除在外。
+    let visible_end = sub_h
+        .checked_sub(1)?
+        .checked_mul(pitch)?
+        .checked_add(sub_w.checked_mul(bpp)?)?;
+    if visible_end > len {
         return None;
     }
 
@@ -351,7 +369,11 @@ pub(crate) fn sat_i64(value: usize) -> i64 {
 #[cfg(feature = "programmable")]
 #[inline(always)]
 pub(crate) fn floor_to_usize(value: f32) -> usize {
-    if value < 0.0 { 0 } else { value as usize }
+    if value < 0.0 {
+        0
+    } else {
+        value as usize
+    }
 }
 
 /// 向上取整后转为 `usize`；非正值与 `NaN` 返回 `0`。
