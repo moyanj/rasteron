@@ -3,6 +3,8 @@ use crate::{Pixel, Renderer, color::Color};
 #[cfg(feature = "font_bitmap")]
 mod font_8x16;
 #[cfg(feature = "font_bitmap")]
+mod ttf;
+#[cfg(feature = "font_bitmap")]
 use font_8x16::DEFAULT_FONT;
 
 // Hand-drawn 1bpp replacement glyph: a framed X, expanded at compile time.
