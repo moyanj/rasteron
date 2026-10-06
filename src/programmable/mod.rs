@@ -1,5 +1,5 @@
 use crate::utils::{ceil_to_usize, floor_to_usize, normalized_to_screen};
-use crate::{Renderer, color::Color, error::DrawError};
+use crate::{color::Color, error::DrawError, Renderer};
 pub mod cache;
 pub mod shader;
 pub mod texture;
@@ -589,6 +589,26 @@ impl<'a> Renderer<'a> {
     /// 反转索引后逐像素相同**（含取整）。因此不要试图用「线段端点反序应当翻转渐变」
     /// 来验证索引是否生效——该断言恒不成立。索引生效的正确验证方式见
     /// `tests::indexed_selects_vertices_through_the_index_buffer`。
+    ///
+    /// # 采样语义：DDA 采样点是密集的，片元是唯一的
+    ///
+    /// 沿可见段按 `steps = ceil(max|dx|, |dy|)` 做 DDA 采样（`steps + 1` 个参数），
+    /// 再对每个采样点四舍五入取整。**采样点数量与像素数量不是一一对应**：当线段
+    /// 短于一个像素时，多个 `t` 会映射到同一个整数像素；主轴步进为 1 时也可能
+    /// 因四舍五入把相邻两个采样点压到同一像素上。
+    ///
+    /// 重复片元不是无害的：`Alpha` / `Add` / `Multiply` / `PremultipliedAlpha`
+    /// 都是读-改-写，对同一像素着色两次会得到两倍的效果——半透明短线段比同位置
+    /// 的点更亮，且亮度取决于线段方向（哪个轴承担了多余采样）。
+    ///
+    /// 因此每个像素**最多着色一次**：坐标为整数且在 `bound` 内时才与上一次输出的
+    /// 坐标比较，相同则跳过。DDA 的主采样轴单调递增，重复坐标必然连续出现，
+    /// 故只需记住一个 `previous`，不需要集合也不需要分配。
+    ///
+    /// 保留的是**第一次**映射到该像素的 `t`（端点插值方向与插入的重复点无关），
+    /// 这与「短线段只调用一次片元着色器」是同一件事的两面。
+    /// 由 `short_line_shades_each_pixel_once` 与
+    /// `short_line_alpha_matches_a_point_at_the_same_pixel` 守护。
     fn rasterize_line<FS: FragmentShader>(
         &mut self,
         input: [FragmentInput<FS::Varying>; 2],
@@ -625,6 +645,9 @@ impl<'a> Renderer<'a> {
             "可见子线段必须落在 bound 内，否则迭代量上界失效"
         );
         let denom = steps.max(1) as f32;
+        // 上一次真正写出的像素坐标。DDA 主轴单调，重复坐标只会连续出现，
+        // 故单个变量足够；只有真正写入后才更新它。
+        let mut previous: Option<(usize, usize)> = None;
         for i in 0..=steps {
             let t = i as f32 / denom;
             let (x, y) = (
@@ -634,6 +657,11 @@ impl<'a> Renderer<'a> {
             if !bound.contains(x, y) {
                 continue;
             }
+            // 同一像素的后续采样直接跳过：否则混合模式会被重复执行。
+            if previous == Some((x, y)) {
+                continue;
+            }
+            previous = Some((x, y));
 
             let t_original = t_enter + (t_exit - t_enter) * t;
             let fragment = FragmentInput {
@@ -710,10 +738,7 @@ impl<'a> Renderer<'a> {
         // 交换后 `w1` 对应的是原来的 v2。若只换 `v` 不换 `input`，varying 会
         // 插到错误的顶点上。
         let (v, input) = if area < 0.0 {
-            (
-                [v[0], v[2], v[1]],
-                [input[0], input[2], input[1]],
-            )
+            ([v[0], v[2], v[1]], [input[0], input[2], input[1]])
         } else {
             (v, input)
         };
@@ -1016,8 +1041,8 @@ mod tests {
     use super::*;
     use crate::color::{Color as C, PixelFormat as Fmt};
     use crate::framebuffer::FramebufferInfo;
-    use crate::programmable::Vertex2D;
     use crate::programmable::shader::Passthrough2D;
+    use crate::programmable::Vertex2D;
 
     /// 容差常量：光栅化用 f32 累加重心坐标，插值后允许极小的舍入偏差。
     const EPS: f32 = 1e-4;
@@ -1320,14 +1345,352 @@ mod tests {
         let same = render([[0.25, 0.25], [0.25, 0.25]]);
         assert_eq!(same, vec![(16, 16)], "坐标相同的退化线段应等价于点图元");
 
-        // 坐标不同但取整后落在同一像素 → delta 非零 → 两步采样 → 两个像素。
-        // 0.25 * 64 = 16.00，0.26 * 64 = 16.64（四舍五入得 17）。
+        // 坐标不同且取整后落在**不同**像素 → 两个采样点各写一个像素。
+        // 0.25 * 64 = 16.00 → 像素 16；0.26 * 64 = 16.64 → 四舍五入得 17。
+        // 这里没有重复，去重逻辑不应误删任何一个像素。
         let near = render([[0.25, 0.25], [0.26, 0.26]]);
         assert_eq!(
             near,
             vec![(16, 16), (17, 17)],
-            "坐标不同但取整邻近的线段走两步采样，画出两个像素"
+            "取整后落在不同像素的线段仍应画出两个像素"
         );
+    }
+
+    // ————————————— S24 补充 · 线段片元去重（短线段/重复采样） —————————————
+
+    /// 屏幕长度远小于 1 像素的线段只调用一次片元着色器。
+    ///
+    /// 去重前：`steps = ceil(0.1) = 1`，`t = 0` 与 `t = 1` 两点四舍五入后
+    /// 落在同一像素，着色器被调用两次。
+    #[test]
+    fn short_line_shades_each_pixel_once() {
+        // 屏幕长度 0.1 像素：64 × 0.0015625 ≈ 0.1。
+        let short = 0.1 / 64.0;
+        let (info, mut buffer) = make_renderer(64);
+        let pipeline = Pipeline::new(
+            Passthrough2D::<C>::new(),
+            CountingFs::new(),
+            PipelineState {
+                blend: BlendMode::None,
+                scissor: None,
+                viewport: Viewport::new(0, 0, 64, 64),
+            },
+        );
+        {
+            let mut renderer = Renderer::new(info, &mut buffer);
+            renderer
+                .draw_arrays(
+                    PrimitiveType::Lines,
+                    &[
+                        Vertex2D {
+                            position: [0.5, 0.5],
+                            varying: C::new(255, 0, 0),
+                        },
+                        Vertex2D {
+                            position: [0.5 + short, 0.5],
+                            varying: C::new(255, 0, 0),
+                        },
+                    ],
+                    &pipeline,
+                )
+                .unwrap();
+        }
+        // 计数器是辅助证据；真正的断言是下面的 framebuffer 结果。
+        assert_eq!(
+            pipeline.fragment_shader.calls.get(),
+            1,
+            "长度 0.1 像素的线段应对片元着色器只调用一次"
+        );
+        assert_eq!(
+            painted_pixels(64, &buffer),
+            vec![(32, 32)],
+            "短线段应恰好覆盖一个像素"
+        );
+    }
+
+    /// 半透明短线段与同位置的点绘制结果**逐字节相同**。
+    ///
+    /// 这是去重最有说服力的口径：点图元天然只写一次，若线段把同一像素写了两次，
+    /// `BlendMode::Alpha` 会混合两遍，结果必然比点更亮。
+    #[test]
+    fn short_line_alpha_matches_a_point_at_the_same_pixel() {
+        let color = C::with_alpha(255, 255, 255, 128);
+        // 屏幕长度 0.1 像素、水平方向（主轴 x）。
+        let short = 0.1 / 64.0;
+
+        let render_line = || -> Vec<u8> {
+            let (info, mut buffer) = make_renderer(64);
+            let pipeline = Pipeline::new(
+                Passthrough2D::<C>::new(),
+                SolidFs,
+                PipelineState::alpha_blend(Viewport::new(0, 0, 64, 64)),
+            );
+            {
+                let mut renderer = Renderer::new(info, &mut buffer);
+                // 先把整屏清成不透明的黑，混合才有可观察的底。
+                renderer
+                    .draw_arrays(
+                        PrimitiveType::Triangles,
+                        &[
+                            Vertex2D {
+                                position: [0.0, 0.0],
+                                varying: C::new(0, 0, 0),
+                            },
+                            Vertex2D {
+                                position: [1.0, 0.0],
+                                varying: C::new(0, 0, 0),
+                            },
+                            Vertex2D {
+                                position: [0.0, 1.0],
+                                varying: C::new(0, 0, 0),
+                            },
+                        ],
+                        &pipeline,
+                    )
+                    .unwrap();
+                renderer
+                    .draw_arrays(
+                        PrimitiveType::Lines,
+                        &[
+                            Vertex2D {
+                                position: [0.5, 0.5],
+                                varying: color,
+                            },
+                            Vertex2D {
+                                position: [0.5 + short, 0.5],
+                                varying: color,
+                            },
+                        ],
+                        &pipeline,
+                    )
+                    .unwrap();
+            }
+            buffer
+        };
+
+        let render_point = || -> Vec<u8> {
+            let (info, mut buffer) = make_renderer(64);
+            let pipeline = Pipeline::new(
+                Passthrough2D::<C>::new(),
+                SolidFs,
+                PipelineState::alpha_blend(Viewport::new(0, 0, 64, 64)),
+            );
+            {
+                let mut renderer = Renderer::new(info, &mut buffer);
+                renderer
+                    .draw_arrays(
+                        PrimitiveType::Triangles,
+                        &[
+                            Vertex2D {
+                                position: [0.0, 0.0],
+                                varying: C::new(0, 0, 0),
+                            },
+                            Vertex2D {
+                                position: [1.0, 0.0],
+                                varying: C::new(0, 0, 0),
+                            },
+                            Vertex2D {
+                                position: [0.0, 1.0],
+                                varying: C::new(0, 0, 0),
+                            },
+                        ],
+                        &pipeline,
+                    )
+                    .unwrap();
+                renderer
+                    .draw_arrays(
+                        PrimitiveType::Points,
+                        &[Vertex2D {
+                            position: [0.5, 0.5],
+                            varying: color,
+                        }],
+                        &pipeline,
+                    )
+                    .unwrap();
+            }
+            buffer
+        };
+
+        let line = render_line();
+        let point = render_point();
+
+        // 被画到的像素必须非空。
+        let lit: Vec<usize> = (0..64 * 64)
+            .filter(|i| line[i * 4] != 0 || line[i * 4 + 1] != 0)
+            .collect();
+        assert_eq!(lit.len(), 1, "短线段必须恰好点亮一个像素，实际 {lit:?}");
+        assert_ne!(line, point_precondition_black(64), "线段确实写入了内容");
+
+        assert_eq!(
+            line, point,
+            "半透明短线段必须与同位置的半透明点逐字节相同（重复片元会混合两遍）"
+        );
+    }
+
+    /// 全黑帧缓冲（用于给上面那条测试做非平凡性对照）。
+    fn point_precondition_black(size: usize) -> Vec<u8> {
+        vec![0u8; size * size * 4]
+    }
+
+    /// 不同方向的短线段不会因重复采样产生不同亮度。
+    ///
+    /// 去重前，多余采样落在哪个轴上取决于线段方向（主轴承担 `steps` 次迭代），
+    /// 于是水平、垂直、斜向的短线段会在同一像素写出不同的混合次数。
+    #[test]
+    fn short_lines_of_different_directions_have_equal_brightness() {
+        let color = C::with_alpha(255, 255, 255, 128);
+        let short = 0.1 / 64.0;
+
+        // 四条屏幕长度同为 0.1 像素、方向不同的短线段，全部锚在 (0.5, 0.5)。
+        let directions: [[f32; 2]; 4] =
+            [[short, 0.0], [0.0, short], [short, short], [short, -short]];
+
+        let mut samples = Vec::new();
+        for dir in directions {
+            let (info, mut buffer) = make_renderer(64);
+            let pipeline = Pipeline::new(
+                Passthrough2D::<C>::new(),
+                SolidFs,
+                PipelineState::alpha_blend(Viewport::new(0, 0, 64, 64)),
+            );
+            {
+                let mut renderer = Renderer::new(info, &mut buffer);
+                renderer
+                    .draw_arrays(
+                        PrimitiveType::Lines,
+                        &[
+                            Vertex2D {
+                                position: [0.5, 0.5],
+                                varying: color,
+                            },
+                            Vertex2D {
+                                position: [0.5 + dir[0], 0.5 + dir[1]],
+                                varying: color,
+                            },
+                        ],
+                        &pipeline,
+                    )
+                    .unwrap();
+            }
+            // 取锚点像素的颜色：所有方向都应落在 (32, 32)。
+            let off = (32 * 64 + 32) * 4;
+            samples.push((dir, [buffer[off], buffer[off + 1], buffer[off + 2]]));
+        }
+
+        let first = samples[0].1;
+        for (dir, rgb) in &samples {
+            assert_eq!(
+                *rgb, first,
+                "方向 {dir:?} 的短线段亮度与其它方向不同（重复片元？）"
+            );
+        }
+        // 非平凡性：混合必须真的发生过（不是全 0），且是「恰好一次」的精确值。
+        // `PixelFormat::blend_channel` 的契约公式是 `(src×a + dst×inv + 255) >> 8`，
+        // 在 src = 255、dst = 0、a = 128 下即 `(255×128 + 255) >> 8 = 128`。
+        // 若该像素被混合两次，结果会变成 `(255×128 + 128×127 + 255) >> 8 = 191`。
+        let single = ((255u32 * 128) + 255) >> 8;
+        assert_eq!(single, 128, "公式口径核对");
+        assert_eq!(
+            first[0] as u32, single,
+            "锚点像素应是恰好一次 alpha 混合的结果"
+        );
+    }
+
+    /// 长线段仍保持既有像素覆盖（去重不得改变正常线段的栅格化结果）。
+    #[test]
+    fn long_line_coverage_is_unchanged() {
+        let color = C::new(255, 0, 0);
+        let (info, mut buffer) = make_renderer(64);
+        let pipeline = Pipeline::new(
+            Passthrough2D::<C>::new(),
+            CountingFs::new(),
+            PipelineState {
+                blend: BlendMode::None,
+                scissor: None,
+                viewport: Viewport::new(0, 0, 64, 64),
+            },
+        );
+        {
+            let mut renderer = Renderer::new(info, &mut buffer);
+            renderer
+                .draw_arrays(
+                    PrimitiveType::Lines,
+                    &[
+                        Vertex2D {
+                            position: [0.0, 0.0],
+                            varying: color,
+                        },
+                        Vertex2D {
+                            position: [1.0, 1.0],
+                            varying: color,
+                        },
+                    ],
+                    &pipeline,
+                )
+                .unwrap();
+        }
+        let painted = painted_pixels(64, &buffer);
+        // 从 (0,0) 到 (63,63) 的对角线：每行一个像素，共 64 个。
+        assert_eq!(painted.len(), 64, "对角线应覆盖 64 个像素");
+        for (i, p) in painted.iter().enumerate() {
+            assert_eq!(*p, (i, i), "第 {i} 个像素应落在对角线上");
+        }
+        // 采样数（64 个不同像素）不变，故着色器调用次数也应保持不变。
+        assert_eq!(
+            pipeline.fragment_shader.calls.get(),
+            64,
+            "长线段的每个像素恰好着色一次"
+        );
+    }
+
+    /// 线段反向绘制仍保持覆盖与颜色插值一致。
+    ///
+    /// 去重引入了 `previous` 状态，必须确认它与端点顺序无关：反序后端点到像素的
+    /// 映射不变（只是遍历方向相反），`previous` 的比较同样对称。
+    #[test]
+    fn short_line_dedup_is_end_order_invariant() {
+        let color = C::with_alpha(255, 255, 255, 128);
+        let short = 0.1 / 64.0;
+
+        let render = |a: [f32; 2], b: [f32; 2]| -> Vec<u8> {
+            let (info, mut buffer) = make_renderer(64);
+            let pipeline = Pipeline::new(
+                Passthrough2D::<C>::new(),
+                SolidFs,
+                PipelineState::alpha_blend(Viewport::new(0, 0, 64, 64)),
+            );
+            {
+                let mut renderer = Renderer::new(info, &mut buffer);
+                renderer
+                    .draw_arrays(
+                        PrimitiveType::Lines,
+                        &[
+                            Vertex2D {
+                                position: a,
+                                varying: color,
+                            },
+                            Vertex2D {
+                                position: b,
+                                varying: color,
+                            },
+                        ],
+                        &pipeline,
+                    )
+                    .unwrap();
+            }
+            buffer
+        };
+
+        let forward = render([0.5, 0.5], [0.5 + short, 0.5]);
+        let backward = render([0.5 + short, 0.5], [0.5, 0.5]);
+        assert_eq!(
+            forward, backward,
+            "短线段反序绘制必须逐字节相同（去重状态与端点顺序无关）"
+        );
+
+        // 非平凡性：确实是「点亮的像素 + 一次混合」，不是两条路径都空。
+        let off = (32 * 64 + 32) * 4;
+        assert!(forward[off] > 0, "短线段应写入锚点像素");
     }
 
     #[test]
@@ -1802,21 +2165,48 @@ mod tests {
         // 共享边从 (0.5, 0) 出发，两个三角形在此处顺序相反。
         let second = if flip_second {
             [
-                Vertex2D { position: [0.0, half], varying: () },
-                Vertex2D { position: [half, 0.0], varying: () },
-                Vertex2D { position: [half, half], varying: () },
+                Vertex2D {
+                    position: [0.0, half],
+                    varying: (),
+                },
+                Vertex2D {
+                    position: [half, 0.0],
+                    varying: (),
+                },
+                Vertex2D {
+                    position: [half, half],
+                    varying: (),
+                },
             ]
         } else {
             [
-                Vertex2D { position: [half, 0.0], varying: () },
-                Vertex2D { position: [0.0, half], varying: () },
-                Vertex2D { position: [half, half], varying: () },
+                Vertex2D {
+                    position: [half, 0.0],
+                    varying: (),
+                },
+                Vertex2D {
+                    position: [0.0, half],
+                    varying: (),
+                },
+                Vertex2D {
+                    position: [half, half],
+                    varying: (),
+                },
             ]
         };
         let vertices = [
-            Vertex2D { position: [0.0, 0.0], varying: () },
-            Vertex2D { position: [half, 0.0], varying: () },
-            Vertex2D { position: [0.0, half], varying: () },
+            Vertex2D {
+                position: [0.0, 0.0],
+                varying: (),
+            },
+            Vertex2D {
+                position: [half, 0.0],
+                varying: (),
+            },
+            Vertex2D {
+                position: [0.0, half],
+                varying: (),
+            },
             second[0],
             second[1],
             second[2],
@@ -1880,10 +2270,7 @@ mod tests {
             painted_pixels(size, &flipped_buffer),
             "共享边上的像素归属不应随图元绕向改变"
         );
-        assert_eq!(
-            forward_calls, flipped_calls,
-            "反向绕向下片元着色次数应相同"
-        );
+        assert_eq!(forward_calls, flipped_calls, "反向绕向下片元着色次数应相同");
     }
 
     // ————————————————————————————— S26 · draw_arrays / draw_indexed —————————————————————————————
@@ -2026,11 +2413,9 @@ mod tests {
         );
         let mut renderer = Renderer::new(info, &mut buffer);
         let empty: [Vertex2D<C>; 0] = [];
-        assert!(
-            renderer
-                .draw_arrays(PrimitiveType::Triangles, &empty, &pipeline)
-                .is_ok()
-        );
+        assert!(renderer
+            .draw_arrays(PrimitiveType::Triangles, &empty, &pipeline)
+            .is_ok());
         assert_eq!(
             pipeline.vertex_shader.calls.get(),
             0,
@@ -2058,11 +2443,9 @@ mod tests {
             position: [0.0, 0.0],
             varying: C::new(255, 0, 0),
         }];
-        assert!(
-            renderer
-                .draw_arrays(PrimitiveType::Points, &vertices, &pipeline)
-                .is_ok()
-        );
+        assert!(renderer
+            .draw_arrays(PrimitiveType::Points, &vertices, &pipeline)
+            .is_ok());
         assert_eq!(
             pipeline.vertex_shader.calls.get(),
             0,
