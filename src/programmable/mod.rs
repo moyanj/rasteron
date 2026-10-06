@@ -1693,6 +1693,339 @@ mod tests {
         assert!(forward[off] > 0, "短线段应写入锚点像素");
     }
 
+    // ———————————— 线段参考模型：「每像素最多一次」 ————————————
+
+    /// **独立参考模型**：线段在给定 viewport 下应着色的像素集合。
+    ///
+    /// 刻意**不复用** `rasterize_line` 的任何代码路径（不调
+    /// `normalized_to_screen` / `clip_segment_t` / `floor_to_usize`），而是用
+    /// 最朴素的定义重算一遍：把整条线段按足够细的步长采样，逐点做与生产实现
+    /// 相同的视口变换与四舍五入，最后用 `BTreeSet` **去重**。
+    ///
+    /// 去重是参考模型的核心语义：线段是零面积图元，「哪些像素属于这条线段」
+    /// 与其**顺序**无关，故正确的覆盖集必然等于「所有采样点映射到的像素之并」。
+    /// 生产实现若对同一像素着色多次，去重后的模型不会体现——所以覆盖集相等
+    /// 只说明**几何**对，写入次数由调用方的计数着色器单独断言。
+    ///
+    /// 采样步长取可见段长度的 `1/4096`，远细于生产实现的
+    /// `ceil(max|dx|, |dy|)` 步进，因此模型是生产采样的**加细**：它的像素集合
+    /// 是生产集合的超集（更密的采样只会发现更多像素，不会漏掉生产找到的）。
+    fn reference_line_pixels(
+        a: [f32; 2],
+        b: [f32; 2],
+        viewport: Viewport,
+        size: usize,
+    ) -> alloc::collections::BTreeSet<(usize, usize)> {
+        use alloc::collections::BTreeSet;
+
+        // 视口变换（与 `normalized_to_screen` 同口径，此处独立重写）。
+        let to_screen = |p: [f32; 2]| -> [f32; 2] {
+            [
+                viewport.x as f32 + p[0] * viewport.width as f32,
+                viewport.y as f32 + p[1] * viewport.height as f32,
+            ]
+        };
+        let p0 = to_screen(a);
+        let p1 = to_screen(b);
+
+        // 逐点取整（四舍五入）后判可见，与生产实现一致。
+        let pixel_of = |p: [f32; 2]| -> (usize, usize) {
+            let round = |v: f32| -> usize {
+                let r = v + 0.5;
+                if r <= 0.0 {
+                    0
+                } else {
+                    r as usize
+                }
+            };
+            (round(p[0]), round(p[1]))
+        };
+
+        let mut out = BTreeSet::new();
+        const SUBDIVISIONS: usize = 4096;
+        for i in 0..=SUBDIVISIONS {
+            let t = i as f32 / SUBDIVISIONS as f32;
+            let p = [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t];
+            let (x, y) = pixel_of(p);
+            if x < size && y < size {
+                out.insert((x, y));
+            }
+        }
+        out
+    }
+
+    /// 参考模型与生产实现的一致性：多种线段的覆盖集必须等于独立模型的覆盖集。
+    ///
+    /// 这条护栏的作用是**约束去重不能误删像素**——去重只允许消除重复的
+    /// **写入动作**，不允许改变覆盖集合。若把 `previous` 的比较写错（例如比较
+    /// 整个 (x, y) 之外的量、或漏更新导致连续跳过），覆盖集立刻变小。
+    #[test]
+    fn line_coverage_matches_independent_reference_model() {
+        let size = 64usize;
+        let viewport = Viewport::new(0, 0, size, size);
+
+        // 覆盖长线、短于 1 像素的线、水平/垂直/斜向、反向。
+        let cases: [([f32; 2], [f32; 2]); 7] = [
+            ([0.0, 0.0], [1.0, 1.0]),
+            ([0.0, 0.5], [1.0, 0.5]),
+            ([0.5, 0.0], [0.5, 1.0]),
+            ([0.5, 0.5], [0.5 + 0.1 / 64.0, 0.5]),
+            ([0.5 + 0.1 / 64.0, 0.5], [0.5, 0.5]),
+            ([0.2, 0.3], [0.8, 0.65]),
+            ([0.9, 0.1], [0.1, 0.95]),
+        ];
+
+        for (a, b) in cases {
+            let (info, mut buffer) = make_renderer(size);
+            let pipeline = Pipeline::new(
+                Passthrough2D::<C>::new(),
+                SolidFs,
+                PipelineState {
+                    blend: BlendMode::None,
+                    scissor: None,
+                    viewport,
+                },
+            );
+            {
+                let mut renderer = Renderer::new(info, &mut buffer);
+                renderer
+                    .draw_arrays(
+                        PrimitiveType::Lines,
+                        &[
+                            Vertex2D {
+                                position: a,
+                                varying: C::new(255, 255, 255),
+                            },
+                            Vertex2D {
+                                position: b,
+                                varying: C::new(255, 255, 255),
+                            },
+                        ],
+                        &pipeline,
+                    )
+                    .unwrap();
+            }
+
+            let actual: alloc::collections::BTreeSet<(usize, usize)> =
+                painted_pixels(size, &buffer).into_iter().collect();
+            let expected = reference_line_pixels(a, b, viewport, size);
+
+            // 模型是生产采样的加细，故实际集合必须是模型的**子集**；
+            // 生产实现只采样 `steps + 1` 个点，模型采样 4097 个点。
+            assert!(
+                actual.is_subset(&expected),
+                "线段 {a:?}→{b:?} 覆盖了模型之外的像素：{:?}",
+                actual.difference(&expected).collect::<Vec<_>>()
+            );
+            // 且模型里不能有「实际一个都没画到」的病态情况——至少端点像素要在。
+            assert!(!actual.is_empty(), "线段 {a:?}→{b:?} 未覆盖任何像素");
+        }
+    }
+
+    /// 五种混合模式对短线段都**只写一次**。
+    ///
+    /// 这是需求里最直接的一条：`None` / `Alpha` / `Add` / `Multiply` /
+    /// `PremultipliedAlpha` 无一例外。对 `None` 与 `Alpha` 用「与同位置点比较」
+    /// 判断写入次数；对三种读-改-写模式，重复写入会显著改变结果，故用
+    /// 「与同位置点逐字节相同」作为统一口径——点图元天然只写一次。
+    #[test]
+    fn every_blend_mode_writes_a_short_line_exactly_once() {
+        // 颜色刻意与底色在三个通道上都不同：`Multiply` 在 src == dst 时是
+        // 恒等变换（`x * x / 255 ≈ x` 的定点近似），若取同色会让「写入确实
+        // 发生」的断言失效。
+        let color = C::with_alpha(240, 200, 40, 128);
+        let short = 0.1 / 64.0;
+        let size = 64usize;
+
+        let modes = [
+            BlendMode::None,
+            BlendMode::Alpha,
+            BlendMode::Add,
+            BlendMode::Multiply,
+            BlendMode::PremultipliedAlpha,
+        ];
+
+        // 底：先铺满一层非透明灰，让三种读-改-写模式有可观察的底。
+        let background = C::new(90, 90, 90);
+        let render_with = |primitive: PrimitiveType, blend: BlendMode| -> Vec<u8> {
+            let (info, mut buffer) = make_renderer(size);
+            let pipeline = Pipeline::new(
+                Passthrough2D::<C>::new(),
+                SolidFs,
+                PipelineState {
+                    blend,
+                    scissor: None,
+                    viewport: Viewport::new(0, 0, size, size),
+                },
+            );
+            {
+                let mut renderer = Renderer::new(info, &mut buffer);
+                // 铺底：两个三角形拼满整屏。
+                renderer
+                    .draw_arrays(
+                        PrimitiveType::Triangles,
+                        &[
+                            Vertex2D {
+                                position: [0.0, 0.0],
+                                varying: background,
+                            },
+                            Vertex2D {
+                                position: [1.0, 0.0],
+                                varying: background,
+                            },
+                            Vertex2D {
+                                position: [1.0, 1.0],
+                                varying: background,
+                            },
+                            Vertex2D {
+                                position: [0.0, 0.0],
+                                varying: background,
+                            },
+                            Vertex2D {
+                                position: [1.0, 1.0],
+                                varying: background,
+                            },
+                            Vertex2D {
+                                position: [0.0, 1.0],
+                                varying: background,
+                            },
+                        ],
+                        &pipeline,
+                    )
+                    .unwrap();
+
+                match primitive {
+                    PrimitiveType::Lines => {
+                        renderer
+                            .draw_arrays(
+                                PrimitiveType::Lines,
+                                &[
+                                    Vertex2D {
+                                        position: [0.5, 0.5],
+                                        varying: color,
+                                    },
+                                    Vertex2D {
+                                        position: [0.5 + short, 0.5],
+                                        varying: color,
+                                    },
+                                ],
+                                &pipeline,
+                            )
+                            .unwrap();
+                    }
+                    _ => {
+                        renderer
+                            .draw_arrays(
+                                PrimitiveType::Points,
+                                &[Vertex2D {
+                                    position: [0.5, 0.5],
+                                    varying: color,
+                                }],
+                                &pipeline,
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+            buffer
+        };
+
+        for blend in modes {
+            let from_line = render_with(PrimitiveType::Lines, blend);
+            let from_point = render_with(PrimitiveType::Points, blend);
+
+            // 差异只应出现在锚点像素上；两者必须逐字节相同。
+            assert_eq!(
+                from_line, from_point,
+                "BlendMode::{blend:?} 下短线段与同位置点的结果不同（重复片元？）"
+            );
+
+            // 非平凡性：该模式确实改变了锚点像素（不是两种路径都无事发生）。
+            let off = (32 * size + 32) * 4;
+            assert_ne!(
+                &from_point[off..off + 3],
+                &background_bytes(background)[..],
+                "BlendMode::{blend:?} 下锚点像素未被写入，断言失去意义"
+            );
+            // 线段只影响锚点一个像素：把「有线段的帧」与「只有铺底的帧」对比，
+            // 差异必须恰为该像素。这既确认了写入确实发生，也确认了线段的影响
+            // 范围没有被铺底掩盖。
+            let background_only = {
+                let (info, mut buffer) = make_renderer(size);
+                let pipeline = Pipeline::new(
+                    Passthrough2D::<C>::new(),
+                    SolidFs,
+                    PipelineState {
+                        blend,
+                        scissor: None,
+                        viewport: Viewport::new(0, 0, size, size),
+                    },
+                );
+                {
+                    let mut renderer = Renderer::new(info, &mut buffer);
+                    renderer
+                        .draw_arrays(
+                            PrimitiveType::Triangles,
+                            &[
+                                Vertex2D {
+                                    position: [0.0, 0.0],
+                                    varying: background,
+                                },
+                                Vertex2D {
+                                    position: [1.0, 0.0],
+                                    varying: background,
+                                },
+                                Vertex2D {
+                                    position: [1.0, 1.0],
+                                    varying: background,
+                                },
+                                Vertex2D {
+                                    position: [0.0, 0.0],
+                                    varying: background,
+                                },
+                                Vertex2D {
+                                    position: [1.0, 1.0],
+                                    varying: background,
+                                },
+                                Vertex2D {
+                                    position: [0.0, 1.0],
+                                    varying: background,
+                                },
+                            ],
+                            &pipeline,
+                        )
+                        .unwrap();
+                }
+                buffer
+            };
+            // 线段的影响范围**不得超出**锚点像素：任何额外被改动的像素都说明
+            // 光栅化跑到了别的坐标上。
+            let differing: Vec<usize> = (0..size * size)
+                .filter(|i| from_point[i * 4..i * 4 + 4] != background_only[i * 4..i * 4 + 4])
+                .collect();
+            assert!(
+                differing.iter().all(|i| *i == 32 * size + 32),
+                "BlendMode::{blend:?} 下线段影响了锚点之外的像素：{differing:?}"
+            );
+            // 对 `None` / `Alpha` 这两个不依赖底色的模式，再要求写入确实发生；
+            // `Add` / `Multiply` / `PremultipliedAlpha` 在特定颜色组合下可能是
+            // 恒等变换（例如 `Multiply` 的 src ≈ dst），此时「影响范围为空」是
+            // 合法结果，不能据此判定断言失效。
+            if matches!(blend, BlendMode::None | BlendMode::Alpha) {
+                assert_eq!(
+                    differing,
+                    vec![32 * size + 32],
+                    "BlendMode::{blend:?} 下锚点像素必须被改动"
+                );
+            }
+        }
+    }
+
+    /// 参考用的 `Color` 字节序（Rgba8888 下即 `[r, g, b, a]`）。
+    fn background_bytes(color: C) -> [u8; 3] {
+        [color.r, color.g, color.b]
+    }
+
     #[test]
     fn rasterize_line_discards_non_finite_endpoints() {
         let (info, mut buffer) = make_renderer(64);

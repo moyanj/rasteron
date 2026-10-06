@@ -1251,6 +1251,39 @@ impl<'a> Renderer<'a> {
     /// 1. 按 Y 对三个顶点排序。
     /// 2. 将三角形在中间顶点处分为上下两部分。
     /// 3. 对每行扫描线，计算与三角形两条边的交点并填充。
+    ///
+    /// # 半开扫描线规则（水平边的归属）
+    ///
+    /// 拆分点 `y2` 只属于**下半段**：
+    ///
+    /// * 上半段扫 `y1..y2`（不含 `y2`）；
+    /// * 下半段扫 `y2..=y3`（含 `y2`）。
+    ///
+    /// 早先两段都是闭区间（`y1..=y2` 与 `y2..=y3`），`y2` 行被发射两次：
+    /// 对不透明色无害（同值写两遍），但半透明色会被混合两次，中间行明显更亮。
+    ///
+    /// 水平边（`y2 == y3`，按 Y 排序后底边水平）由此获得与顶点顺序无关的语义：
+    /// 此时下半段只扫 `y2` 这一行，两条边重合，直接取 `min(x2, x3)` 与
+    /// `max(x2, x3)` 作为水平跨度。修复前改走 `interpolate_scan_x`，
+    /// 而它在 `delta_y == 0` 时短路返回 `base_x = x2`——`x2` 在
+    /// 三顶点 Y 排序不唯一时取决于输入顺序，于是同一三角形的两种绕向
+    /// 相差一个像素（详见 `fill_triangle_horizontal_bottom_edge_is_winding_symmetric`）。
+    ///
+    /// `y1 == y2`（水平顶边）时上半段为空，水平顶边由下半段的首行 `y2` 负责。
+    ///
+    /// # 退化输入
+    ///
+    /// 三个 Y 相同（`y1 == y3`）以及共线输入保持「不绘制」语义——前者由提前
+    /// 返回保证，后者退化成零宽跨度，仍由 `fill_visible_horizontal_span` 处理。
+    ///
+    /// # 顶点裁剪语义
+    ///
+    /// 顶点先被钳到 `[0, width - 1] × [0, height - 1]` 再进入扫描转换，
+    /// 这**不是几何裁剪**：屏幕外顶点的位置被改写，三角形的边会随之变化
+    /// （正确的做法是沿视口边裁剪多边形、保持边的方向）。当前行为是既有的
+    /// 公开语义，由 `fill_triangle_clamps_huge_vertices_without_narrowing_bug`
+    /// 与 `fill_triangle_clamps_out_of_screen_vertices_instead_of_clipping` 钉住；
+    /// 改成真正的 Sutherland–Hodgman 裁剪属于行为级变更，须单独评审。
     #[inline]
     pub fn fill_triangle(&mut self, p1: Pixel, p2: Pixel, p3: Pixel, color: &Color) {
         if self.info.width == 0 || self.info.height == 0 {
@@ -1291,25 +1324,36 @@ impl<'a> Renderer<'a> {
         let long_dx = x3 - x1;
         let long_dy = y3 - y1;
 
-        // 上半部分三角形 (p1 -> p2)
+        // 上半部分三角形 (p1 -> p2)，**不含** y2 行：y2 归下半段。
+        // `y1 == y2`（水平顶边）时本循环为空，顶边由下半段负责。
         let upper_dx = x2 - x1;
         let upper_dy = y2 - y1;
-        for y in y1..=y2 {
+        for y in y1..y2 {
             let dy = y - y1;
             let x_long = Self::interpolate_scan_x(x1, long_dx, long_dy, dy);
             let x_upper = Self::interpolate_scan_x(x1, upper_dx, upper_dy, dy);
             self.fill_visible_horizontal_span(x_long, x_upper, y, color);
         }
 
-        // 下半部分三角形 (p2 -> p3)
-        let lower_dx = x3 - x2;
-        let lower_dy = y3 - y2;
-        for y in y2..=y3 {
-            let dy_long = y - y1;
-            let dy_lower = y - y2;
-            let x_long = Self::interpolate_scan_x(x1, long_dx, long_dy, dy_long);
-            let x_lower = Self::interpolate_scan_x(x2, lower_dx, lower_dy, dy_lower);
-            self.fill_visible_horizontal_span(x_long, x_lower, y, color);
+        // 下半部分三角形，**含** y2 行。
+        if y2 < y3 {
+            let lower_dx = x3 - x2;
+            let lower_dy = y3 - y2;
+            for y in y2..=y3 {
+                let dy_long = y - y1;
+                let dy_lower = y - y2;
+                let x_long = Self::interpolate_scan_x(x1, long_dx, long_dy, dy_long);
+                let x_lower = Self::interpolate_scan_x(x2, lower_dx, lower_dy, dy_lower);
+                self.fill_visible_horizontal_span(x_long, x_lower, y, color);
+            }
+        } else {
+            // `y2 == y3`：底边水平，下半段只剩 `y2` 这一行。
+            //
+            // 两条边在这一行重合成同一条水平线，故跨度直接由 `x2` / `x3` 的
+            // 相对大小给出。**必须用 min/max 而不是把 `x2` 当 base 去插值**：
+            // 三顶点 Y 排序在 `y2 == y3` 时不唯一，`x2` 是「哪个顶点排在中间」
+            // 的产物，取它当左端点会让结果依赖输入顺序（即绕向）。
+            self.fill_visible_horizontal_span(x2.min(x3), x2.max(x3), y2, color);
         }
     }
 
@@ -3641,12 +3685,17 @@ mod tests {
     /// 返回 `Vec<(y, x_lo, x_hi)>`，已按行优先排序。`x_lo`/`x_hi` 未裁剪，
     /// 由调用方与帧缓冲求交。
     ///
-    /// # 重要：y2 行会被发射两次
+    /// # 半开扫描线规则
     ///
-    /// 实现对 `y in y1..=y2` 与 `y in y2..=y3` 各扫一遍，故当 `y1 == y2`
-    /// （顶边水平）时第 `y2` 行出现**两次**。这对不透明色无害（写两次同值），
-    /// 但半透明色会被混合两次——故 `fill_triangle_alpha_*` 两条测试据此断言，
-    /// 而不是笼统地要求「只混合一次」。
+    /// 拆分点 `y2` 只属于下半段：上半段 `y1..y2`、下半段 `y2..=y3`。
+    /// 因此每一行**恰好被发射一次**，`y1 == y2` 时上半段为空、水平顶边由
+    /// 下半段首行负责。这与生产实现的循环边界逐条对应——参考模型若退回
+    /// `y1..=y2`，`fill_triangle_alpha_*` 的逐像素写入计数断言会立刻失败。
+    ///
+    /// `y2 == y3`（水平底边）时下半段只剩 `y2` 一行，两条边重合成同一条
+    /// 水平线，跨度直接取 `min(x2, x3)..max(x2, x3)`。**不能**沿用
+    /// `interpolate_scan_x` 在 `delta_y == 0` 时的 `base_x` 短路：三顶点 Y
+    /// 排序在此时不唯一，`x2` 取决于输入顺序，用它当端点会让覆盖依赖绕向。
     fn reference_triangle_spans(p: [Pixel; 3]) -> Vec<(usize, i64, i64)> {
         let mut pts = p;
         // 按 Y 排序（与实现的三次 swap 等价）。
@@ -3679,27 +3728,35 @@ mod tests {
         let upper_dx = x2 - x1;
         let upper_dy = y2 - y1;
         let mut out = Vec::new();
-        for y in y1..=y2 {
+        // 上半段：y1..y2（不含 y2）。
+        for y in y1..y2 {
             let dy = y - y1;
             let a = scan(x1, long_dx, long_dy, dy);
             let b = scan(x1, upper_dx, upper_dy, dy);
             out.push((y as usize, a.min(b), a.max(b)));
         }
-        let lower_dx = x3 - x2;
-        let lower_dy = y3 - y2;
-        for y in y2..=y3 {
-            let a = scan(x1, long_dx, long_dy, y - y1);
-            let b = scan(x2, lower_dx, lower_dy, y - y2);
-            out.push((y as usize, a.min(b), a.max(b)));
+        if y2 < y3 {
+            // 下半段：y2..=y3。
+            let lower_dx = x3 - x2;
+            let lower_dy = y3 - y2;
+            for y in y2..=y3 {
+                let a = scan(x1, long_dx, long_dy, y - y1);
+                let b = scan(x2, lower_dx, lower_dy, y - y2);
+                out.push((y as usize, a.min(b), a.max(b)));
+            }
+        } else {
+            // 底边水平：只剩 y2 一行，跨度由 x2 / x3 直接给出（与绕向无关）。
+            out.push((y2 as usize, x2.min(x3), x2.max(x3)));
         }
         out
     }
 
     /// 把参考跨度裁到帧缓冲并展开成像素集合（行优先）。
     ///
-    /// 结果**排序并去重**：实现对 `y2` 行发射两次（见上），但重复写同一像素
-    /// 对像素**集合**没有影响，故比较集合时必须去重。半透明下的双写效果
-    /// 由 `fill_triangle_alpha_...` 单独断言。
+    /// 半开规则下每行只发射一次，`sort` + `dedup` 只是为了让调用方拿到的
+    /// 顺序与 `drawn_pixels` 一致（行优先、先 y 后 x），不再承担「消除重复
+    /// 写入」的职责——重复写入已由 `reference_triangle_write_counts` 单独
+    /// 断言，那样才不会被集合比较掩盖。
     fn triangle_pixels_ref(p: [Pixel; 3], w: usize, h: usize) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         for (y, lo, hi) in reference_triangle_spans(p) {
@@ -3848,11 +3905,32 @@ mod tests {
         assert_eq!(renderer.buffer(), &blank[..]);
     }
 
-    /// 大 `usize` 顶点不因坐标收窄而错位（饱和转换护栏）。
+    /// # 契约测试：`fill_triangle` 把屏幕外顶点**钳到边界**，而不是几何裁剪
     ///
-    /// 守护的是 `usize::MAX as i64 == -1` 陷阱：若用 `as` 转换，
-    /// 巨大顶点会折成负数，`p.x.min(max_x)` 之前就已被破坏，几何完全错位。
-    /// 这里断言：把顶点钳到屏幕边界后重画，结果与原调用一致。
+    /// 这条测试同时承担两个职责，改名是为了让第二个职责显式化。
+    ///
+    /// ## 职责一：饱和转换护栏
+    ///
+    /// 守护 `usize::MAX as i64 == -1` 陷阱：若用 `as` 转换，巨大顶点会折成负数，
+    /// 在 `p.x.min(max_x)` 之前就已被破坏，几何完全错位。
+    ///
+    /// ## 职责二：顶点裁剪语义的正式记录
+    ///
+    /// `fill_triangle` 的做法是 `p.x.min(max_x)` / `p.y.min(max_y)`——**顶点钳位**，
+    /// 不是标准 viewport clipping。两者的差别是实质性的：
+    ///
+    /// * 几何裁剪沿视口边切割多边形，边的**方向**保持不变，屏幕内可见的那部分
+    ///   形状与原始三角形一致；
+    /// * 顶点钳位改写了屏幕外顶点的**位置**，两条边的斜率随之改变，屏幕内画出的
+    ///   形状可能与原始三角形在该区域的交集完全不同。
+    ///
+    /// 本测试断言的就是「钳位后重画」这一等价性——即当前实现的**既有语义**。
+    /// 不要把它当成「裁剪正确」的证据，也不要仅凭这条断言就认为出屏三角形
+    /// 的渲染结果是几何正确的。
+    ///
+    /// 改成真正的 Sutherland–Hodgman 固定容量裁剪（多边形顶点数上限 7，
+    /// 无需堆分配）属于行为级变更，须单独评审与单独提交。
+    /// 相关测试：`fill_triangle_clamps_out_of_screen_vertices_instead_of_clipping`。
     #[test]
     fn fill_triangle_clamps_huge_vertices_without_narrowing_bug() {
         let color = Color::new(0x12, 0x34, 0x56);
@@ -3900,13 +3978,29 @@ mod tests {
         }
     }
 
-    /// 越界三角形裁剪：可见像素精确。
+    /// # 契约测试：出屏顶点被**钳到边界**，不是按原始几何裁剪
+    ///
+    /// 测试名从 `fill_triangle_clips_to_visible_pixels` 改为现在这个，是为了
+    /// 不再暗示这是标准 viewport clipping——它**不是**。
+    ///
+    /// `fill_triangle` 先做 `p.x.min(max_x)` / `p.y.min(max_y)`，把屏幕外顶点
+    /// 拉到边界上再进入扫描转换。这改变了屏幕外顶点的位置，因而改变了三角形
+    /// 边的斜率：屏幕内画出的形状是「钳位后三角形」的形状，不是原始三角形与
+    /// 视口的交集。真正的几何裁剪需要沿视口边切割多边形并保留边的方向。
+    ///
+    /// 本测试把这一既有语义钉死：结果必须逐像素等于「先把顶点钳到
+    /// `[0, w-1] × [0, h-1]` 再填充」的参考。若将来改为 Sutherland–Hodgman
+    /// 裁剪，**这条测试的期望值会变**——那时应连同文档一起更新，而不是
+    /// 保留一个名字在说「clips」实则断言钳位的护栏。
+    ///
+    /// 出屏三角形在本用例下并非空集：钳位后 `(20,0)→(5,0)`、`(40,1)→(5,1)`、
+    /// `(30,30)→(5,5)`，退化成贴着右边界的一条竖线，仍会画出像素。
     #[test]
-    fn fill_triangle_clips_to_visible_pixels() {
+    fn fill_triangle_clamps_out_of_screen_vertices_instead_of_clipping() {
         let color = Color::new(0x12, 0x34, 0x56);
         let (w, h) = (6usize, 6usize);
 
-        // 大部分顶点在屏幕外的三角形。
+        // 三个顶点全部在屏幕外（x ≥ 6）。
         let tri = [Pixel::new(20, 0), Pixel::new(40, 1), Pixel::new(30, 30)];
         let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
         let mut renderer = render_on(info, &mut fb);
@@ -3918,9 +4012,17 @@ mod tests {
             Pixel::new(tri[1].x.min(w - 1), tri[1].y.min(h - 1)),
             Pixel::new(tri[2].x.min(w - 1), tri[2].y.min(h - 1)),
         ];
+        let drawn = drawn_pixels(&renderer, w, h, &color);
         assert_eq!(
-            drawn_pixels(&renderer, w, h, &color),
-            triangle_pixels_ref(clamped, w, h)
+            drawn,
+            triangle_pixels_ref(clamped, w, h),
+            "出屏顶点的钳位语义变了（若改为几何裁剪，请更新本测试与文档）"
+        );
+        // 非平凡性：钳位后确实画出了像素——若将来改成几何裁剪，
+        // 原始三角形与 6×6 视口无交集，这里会变成空集。
+        assert!(
+            !drawn.is_empty(),
+            "钳位语义下应画出贴着右边界的像素；空集说明已改为几何裁剪"
         );
 
         // 三个顶点都在同一行（钳位后 y 相同）：提前返回，不画任何像素。
@@ -3938,29 +4040,21 @@ mod tests {
         }
     }
 
-    /// 半透明三角形与逐像素参考一致。
+    /// 半透明三角形：每个被画到的像素**恰好混合一次**，中间行不多不少。
     ///
-    /// # 与 TEST_PLAN S14 的偏差
+    /// # 为什么不能只比像素集合
     ///
-    /// 计划条目写「重叠像素只混合一次」，这对 `fill_triangle` **不成立**。
-    /// 实现对 `y in y1..=y2` 与 `y in y2..=y3` 各扫一遍，故 `y1 == y2`
-    /// （水平顶边）时第 `y2` 行被**发射两次**；两个跨度都覆盖到的像素
-    /// 于是被混合两次。已用脚本核实精确范围：
+    /// 早先的实现对 `y1..=y2` 与 `y2..=y3` 各扫一遍，`y2` 行（`y1 == y2` 时是
+    /// 中间行）被发射两次；两个跨度交集里的像素于是被混合两次，比邻域更亮。
+    /// 集合比较对此**完全免疫**——重复写同一像素不改变像素集合，只有逐像素的
+    /// 写入次数才能暴露它。因此本测试断言的是：
     ///
-    /// | 三角形 | 被写 2 次的像素 | 被写 1 次的像素 |
-    /// |--------|-----------------|----------------|
-    /// | `(0,0),(8,0),(2,5)` | 仅 `(0,0)` | 33 |
-    /// | `(1,2),(7,2),(4,7)` | 仅 `(1,2)` | 27 |
-    /// | `(0,0),(9,9),(0,9)` | `y=9` 整行 10 个 | 45 |
+    /// 1. 每个像素的参考计数恒为 1（半开规则下每行只发射一次）；
+    /// 2. 每个被画到的像素的最终颜色等于**单次**混合的结果。
     ///
-    /// 可见「被写两次」的是**两跨度交集**，不是整行——第三例里 y2 行只被
-    /// 部分覆盖，故只有交集像素才双写。
-    ///
-    /// 本测试因此断言：每个被画到的像素都等于 `reference_triangle_write_counts`
-    /// 给出的**精确次数**的混合结果（1 次或 2 次）。这比笼统的「只混合一次」
-    /// 更强：实现若改变任一像素的写入次数，断言即失败。
+    /// 两者合起来把「重复混合」钉死：实现若恢复闭区间扫描，第 2 条立刻失败。
     #[test]
-    fn fill_triangle_alpha_matches_reference_with_documented_y2_double_write() {
+    fn fill_triangle_alpha_blends_each_pixel_exactly_once() {
         let dst = Color::new(0, 0, 0);
         let src = Color::with_alpha(255, 255, 255, 128);
         let (w, h) = (10usize, 10usize);
@@ -3968,24 +4062,27 @@ mod tests {
         let twice = blend_ref(&src, &once, src.a);
         assert_ne!(once, twice, "单次与两次混合的结果必须可区分");
 
-        let tris: [[Pixel; 3]; 4] = [
+        // 覆盖四类水平边情形：水平顶边（y1==y2）、水平底边（y2==y3）、
+        // 无水平边、以及排序后 y1==y2==y3 之外的极端比例。
+        let tris: [[Pixel; 3]; 6] = [
             [Pixel::new(0, 0), Pixel::new(8, 0), Pixel::new(2, 5)],
             [Pixel::new(0, 0), Pixel::new(2, 5), Pixel::new(8, 0)],
             [Pixel::new(1, 2), Pixel::new(7, 2), Pixel::new(4, 7)],
             [Pixel::new(0, 0), Pixel::new(9, 9), Pixel::new(0, 9)],
+            [Pixel::new(8, 0), Pixel::new(0, 8), Pixel::new(8, 8)],
+            [Pixel::new(2, 1), Pixel::new(8, 3), Pixel::new(3, 8)],
         ];
 
-        let mut total_doubled = 0usize;
-        let mut total_once = 0usize;
+        let mut total_pixels = 0usize;
 
         for tri in tris {
             // 参考：逐像素的**写入次数**（保留重复，不去重）。
             let counts = reference_triangle_write_counts(tri, w, h);
             assert!(!counts.is_empty(), "三角形 {tri:?} 的参考集为空");
-            // 非平凡性：至少要包含一个被写两次的像素，否则本测试退化。
+            // 非平凡性：半开规则下每行只发射一次，计数必须处处为 1。
             assert!(
-                counts.values().any(|c| *c == 2),
-                "三角形 {tri:?} 没有被写两次的像素，覆盖不到 y2 双写语义"
+                counts.values().all(|c| *c == 1),
+                "三角形 {tri:?} 的参考计数出现非 1 值，参考模型或实现退回了闭区间扫描：{counts:?}"
             );
 
             let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
@@ -4005,29 +4102,127 @@ mod tests {
                         assert_eq!(got, dst, "三角形 {tri:?} 的 ({x},{y}) 不应被画到");
                         continue;
                     }
-                    assert!(
-                        times <= 2,
-                        "三角形 {tri:?} 的 ({x},{y}) 被写 {times} 次，\
-                         说明出现了计划外的三重覆盖"
-                    );
-                    let want = if times == 1 { once } else { twice };
+                    // 这就是防重复写入的核心断言：任何双写都会得到 `twice`。
                     assert_eq!(
-                        got, want,
-                        "三角形 {tri:?} 的 ({x},{y})：参考写入 {times} 次，\
-                         期望 {want:?}，实际 {got:?}"
+                        got, once,
+                        "三角形 {tri:?} 的 ({x},{y}) 不是单次混合的结果 \
+                         （实际 {got:?}，双写会得到 {twice:?}）"
                     );
-                    if times == 2 {
-                        total_doubled += 1
-                    } else {
-                        total_once += 1
-                    }
+                    total_pixels += 1;
                 }
             }
         }
 
-        // 非平凡性把关：两种情形都要覆盖到。
-        assert!(total_once > 100, "单次混合的像素过少（{total_once}）");
-        assert!(total_doubled > 0, "双写像素一个都没覆盖到，断言失去意义");
+        // 非平凡性把关：确实覆盖了足够多的像素，断言不是空转。
+        assert!(total_pixels > 100, "被混合到的像素过少（{total_pixels}）");
+    }
+
+    /// 水平顶边（排序后 `y1 == y2`）：上半段为空，顶边由下半段首行负责。
+    ///
+    /// 这是半开规则的关键一侧——修复前上半段 `y1..=y2` 只扫 `y2` 一行、
+    /// 下半段 `y2..=y3` 又从 `y2` 起，`y2` 被写两次。
+    #[test]
+    fn fill_triangle_horizontal_top_edge_is_owned_by_the_lower_half() {
+        let color = Color::new(0x12, 0x34, 0x56);
+        let (w, h) = (12usize, 12usize);
+        let tri = [Pixel::new(2, 2), Pixel::new(9, 2), Pixel::new(5, 9)];
+
+        let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
+        let mut renderer = render_on(info, &mut fb);
+        renderer.fill_triangle(tri[0], tri[1], tri[2], &color);
+
+        assert_eq!(
+            drawn_pixels(&renderer, w, h, &color),
+            triangle_pixels_ref(tri, w, h),
+            "水平顶边三角形与参考不一致"
+        );
+
+        // 顶边那一行必须被完整覆盖（左端点到右端点），不能因为上半段为空而漏掉。
+        let top_row: Vec<(usize, usize)> = drawn_pixels(&renderer, w, h, &color)
+            .into_iter()
+            .filter(|(_, y)| *y == 2)
+            .collect();
+        assert_eq!(
+            top_row,
+            (2..=9).map(|x| (x, 2)).collect::<Vec<_>>(),
+            "水平顶边应被完整填充"
+        );
+
+        // 半透明下同一行也只能混合一次。
+        let dst = Color::new(0, 0, 0);
+        let src = Color::with_alpha(255, 255, 255, 128);
+        let once = blend_ref(&src, &dst, src.a);
+        let twice = blend_ref(&src, &once, src.a);
+        let (info, mut fb2) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
+        let mut r2 = render_on(info, &mut fb2);
+        for y in 0..h {
+            for x in 0..w {
+                r2.set_pixel(x, y, &dst);
+            }
+        }
+        r2.fill_triangle(tri[0], tri[1], tri[2], &src);
+        for x in 2..=9 {
+            assert_eq!(
+                r2.get_pixel(x, 2),
+                Some(once),
+                "水平顶边的 ({x},2) 被混合了多次"
+            );
+        }
+        assert_ne!(once, twice);
+    }
+
+    /// 水平底边（排序后 `y2 == y3`）：只用 `y2` 一行，跨度取 `min/max(x2, x3)`。
+    #[test]
+    fn fill_triangle_horizontal_bottom_edge_spans_min_to_max() {
+        let color = Color::new(0x12, 0x34, 0x56);
+        let (w, h) = (16usize, 16usize);
+
+        // 底边水平、顶点在底边中点两侧不对称，能区分「取 x2」与「取 min/max」。
+        let cases: [[Pixel; 3]; 3] = [
+            [Pixel::new(8, 0), Pixel::new(0, 8), Pixel::new(8, 8)],
+            [Pixel::new(6, 1), Pixel::new(2, 9), Pixel::new(11, 9)],
+            [Pixel::new(3, 0), Pixel::new(3, 7), Pixel::new(12, 7)],
+        ];
+
+        for tri in cases {
+            let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
+            let mut renderer = render_on(info, &mut fb);
+            renderer.fill_triangle(tri[0], tri[1], tri[2], &color);
+
+            let drawn = drawn_pixels(&renderer, w, h, &color);
+            assert_eq!(
+                drawn,
+                triangle_pixels_ref(tri, w, h),
+                "水平底边三角形 {tri:?} 与参考不一致"
+            );
+            assert!(!drawn.is_empty(), "水平底边三角形 {tri:?} 未覆盖任何像素");
+
+            // 底边整行必须覆盖 `min(x2,x3)..=max(x2,x3)`。
+            let (bx2, bx3, by) = (tri[1].x, tri[2].x, tri[1].y);
+            let (lo, hi) = (bx2.min(bx3), bx2.max(bx3));
+            let bottom: Vec<(usize, usize)> =
+                drawn.iter().copied().filter(|(_, y)| *y == by).collect();
+            assert_eq!(
+                bottom,
+                (lo..=hi).map(|x| (x, by)).collect::<Vec<_>>(),
+                "三角形 {tri:?} 的底边跨度应为 {lo}..={hi}"
+            );
+        }
+    }
+
+    /// `y1 == y2 == y3`（三点同高）保持「不绘制」语义。
+    #[test]
+    fn fill_triangle_all_vertices_on_one_row_draws_nothing() {
+        let color = Color::new(0xFF, 0x00, 0x00);
+        let (w, h) = (8usize, 8usize);
+        let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
+        let blank = vec![0u8; w * h * 3];
+        let mut renderer = render_on(info, &mut fb);
+
+        // 三点同高，且两端点也不同（避免退化成「两点重合」的另一条路径）。
+        renderer.fill_triangle(Pixel::new(0, 4), Pixel::new(4, 4), Pixel::new(7, 4), &color);
+
+        assert_eq!(renderer.buffer(), &blank[..], "三点同高不应画任何像素");
     }
 
     // ——————————————————————— S15 · 圆 ———————————————————————
@@ -4986,25 +5181,20 @@ mod tests {
     ///
     /// 本测试断言：`fill_triangle` 在反序绕向下与正序绕向填出**同一像素集合**，
     /// 且两者都等于逐扫描线参考。
-    ///
-    /// # 用例选取：排除水平底边
-    ///
-    /// 用例集刻意**不含** `y2 == y3` 的水平底边三角形——那类输入存在**既有的**
-    /// 几何不对称（成因见 `fill_triangle_horizontal_bottom_edge_is_winding_asymmetric`），
-    /// 与「反序跨度被丢弃」是两回事，混在一起会让本护栏的红绿含义不清。
     #[test]
     fn fill_triangle_fills_reversed_spans_same_as_forward_winding() {
         let color = Color::new(0x12, 0x34, 0x56);
         let (w, h) = (16usize, 16usize);
 
-        // 这些三角形会产生大量反序跨度（实测比例 8/10 ~ 9/12），且无水平底边。
-        // 全部用例必须**无水平底边**（即排序后 `y2 != y3`），否则会落进
-        // `fill_triangle_horizontal_bottom_edge_is_winding_asymmetric` 记录的既有缺陷。
-        let tris: [[Pixel; 3]; 4] = [
+        // 这些三角形会产生大量反序跨度（实测比例 8/10 ~ 9/12）。
+        // 半开扫描线修复后水平底边也纳入本护栏——绕向不变性现在对**全部**
+        // 顶点排列成立，不再需要为绕向敏感用例开例外。
+        let tris: [[Pixel; 3]; 5] = [
             [Pixel::new(10, 2), Pixel::new(1, 9), Pixel::new(12, 12)],
             [Pixel::new(0, 0), Pixel::new(8, 8), Pixel::new(0, 8)],
             [Pixel::new(2, 2), Pixel::new(14, 3), Pixel::new(1, 14)],
             [Pixel::new(1, 2), Pixel::new(7, 2), Pixel::new(4, 7)],
+            [Pixel::new(8, 0), Pixel::new(0, 8), Pixel::new(8, 8)],
         ];
 
         for tri in tris {
@@ -5033,42 +5223,32 @@ mod tests {
         }
     }
 
-    /// # 已知缺陷：`fill_triangle` 在水平底边下对顶点绕向不对称
+    /// # 回归护栏：`fill_triangle` 的覆盖与顶点绕向无关（水平底边在内）
     ///
-    /// 本测试**记录当前缺陷现状**，不是认可该行为。修复后它会以明确信息失败，
-    /// 届时应把断言改成「两种绕向完全一致」。
+    /// 本测试是 `fill_triangle_horizontal_bottom_edge_is_winding_asymmetric`
+    /// 的**改写版**——那条测试记录的是已修复的缺陷，断言的是 `assert_ne!`
+    /// （两种绕向必须不同），缺陷修好时它按设计主动失败。
     ///
-    /// ## 现象
+    /// ## 原缺陷
     ///
-    /// 三角形 `(8,0), (0,8), (8,8)` 与其反绕向 `(8,0), (8,8), (0,8)` 填出的
-    /// 像素集合相差**恰好 1 个像素**（`(0,8)`），即同一个三角形换个顶点顺序
-    /// 轮廓就差一个像素。
+    /// 三角形 `(8,0), (0,8), (8,8)` 与其反绕向 `(8,0), (8,8), (0,8)`
+    /// 填出的像素集合相差**恰好 1 个像素**（`(0,8)`）：底边水平，按 Y 排序后
+    /// `y2 == y3`，此时三顶点 Y 排序不唯一，`x2` 是「哪个顶点排在中间」的
+    /// 产物，却被当作 `lower` 段的 `base_x`。
     ///
-    /// ## 成因
-    ///
-    /// 底边水平，故按 Y 排序后 `y2 == y3`：
-
-    /// | | 按 y 排序后 | `x2` | `lower_dy = y3 - y2` | `interpolate_scan_x` | y=8 跨度 |
+    /// | | 按 y 排序后 | `x2` | `lower_dy` | `interpolate_scan_x` | y=8 跨度 |
     /// |---|---|---|---|---|---|
-    /// | 正序 | `(8,0),(0,8),(8,8)` | `(0,8)` | `0` | 命中 `delta_y == 0` 短路 → `return x2 = 0` | `[0, 8]` |
+    /// | 正序 | `(8,0),(0,8),(8,8)` | `(0,8)` | `0` | 命中 `delta_y == 0` 短路 → `0` | `[0, 8]` |
     /// | 反序 | `(8,0),(8,8),(0,8)` | `(8,8)` | `-8` | 正常插值（`off = 0`）→ `8` | `[1, 8]` |
     ///
-    /// `interpolate_scan_x` 的短路本身是对的（水平边不该插值）；不对称来自
-    /// **三顶点 Y 排序在 `y2 == y3` 时不唯一**——`x2` 是 `lower` 段的 `base_x`，
-    /// 而 `x2` 取决于输入顶点顺序。
+    /// ## 修法与语义
     ///
-    /// ## 与越界写修复的关系
-    ///
-    /// 已用实验确认这是**既有缺陷**、与 `fill_visible_horizontal_span` 的
-    /// 越界写修复无关：把该函数改回修复前版本（`max` / `min` / `swap`），
-    /// 本用例产出完全相同的结果。
-    ///
-    /// ## 正确的修法方向
-    ///
-    /// `lower` 段在 `y2 == y3` 时应取 `x3`（水平边的另一个端点）而非 `x2`，
-    /// 或改用与顶点顺序无关的边选择。等几何语义变更时再动，勿在本次顺手改。
+    /// 半开扫描线规则下 `y2` 只属于下半段，`y2 == y3` 时下半段只剩这一行、
+    /// 两条边重合，跨度直接取 `min(x2, x3)..max(x2, x3)`——与哪个顶点排在中间
+    /// 无关。原缺陷所需的「`interpolate_scan_x` 在 `delta_y == 0` 时返回 `x2`」
+    /// 这条路径在该分支下不再被走到。
     #[test]
-    fn fill_triangle_horizontal_bottom_edge_is_winding_asymmetric() {
+    fn fill_triangle_horizontal_bottom_edge_is_winding_symmetric() {
         let color = Color::new(0x12, 0x34, 0x56);
         let (w, h) = (16usize, 16usize);
         let tri = [Pixel::new(8, 0), Pixel::new(0, 8), Pixel::new(8, 8)];
@@ -5084,34 +5264,89 @@ mod tests {
         rev.fill_triangle(flipped[0], flipped[1], flipped[2], &color);
         let backward = drawn_pixels(&rev, w, h, &color);
 
-        // 若此断言失败，说明不对称已被修复——请把本测试改写成「两者应当完全一致」。
-        assert_ne!(
+        // 强断言：两种绕向必须填出**完全一致**的像素集合，且都等于参考。
+        assert_eq!(
             forward, backward,
-            "水平底边的不对称似乎已被修复：应更新本测试为强断言 \
-             （两种绕向应填出同一像素集合）"
+            "水平底边的填充对顶点绕向不对称（原缺陷回归了）"
+        );
+        assert_eq!(
+            forward,
+            triangle_pixels_ref(tri, w, h),
+            "水平底边三角形与逐扫描线参考不符"
         );
 
-        // 差异恰好一个像素，且位于下边界行。
-        let only_forward: Vec<(usize, usize)> = forward
-            .iter()
-            .copied()
-            .filter(|p| !backward.contains(p))
-            .collect();
-        assert_eq!(
-            only_forward,
-            [(0, 8)],
-            "差异应恰为下边界行的 (0,8)，实际 {only_forward:?}"
-        );
-        // 其余像素完全一致。
-        let only_backward: Vec<(usize, usize)> = backward
-            .iter()
-            .copied()
-            .filter(|p| !forward.contains(p))
-            .collect();
+        // 具体到原缺陷丢掉的像素：两种绕向都必须画到 (0,8)。
         assert!(
-            only_backward.is_empty(),
-            "反序不应多画出像素：{only_backward:?}"
+            forward.contains(&(0, 8)),
+            "底边左端点 (0,8) 必须被填充，实际 {forward:?}"
         );
+        // 底边整行覆盖 `0..=8`，不多不少。
+        let bottom: Vec<(usize, usize)> =
+            forward.iter().copied().filter(|(_, y)| *y == 8).collect();
+        assert_eq!(
+            bottom,
+            (0..=8).map(|x| (x, 8)).collect::<Vec<_>>(),
+            "底边行覆盖应为 0..=8"
+        );
+    }
+
+    /// 三角形三顶点的**全部 6 种排列**必须填出同一像素集合。
+    ///
+    /// 绕向不变性的最强形式：不只是「正序 vs 反序」两两对照，而是把排列穷举。
+    /// 三顶点 Y 排序在存在等高顶点时不唯一，故 6 种排列会走到不同的
+    /// `x1/x2/x3` 组合——这正是原水平底边缺陷的温床。
+    #[test]
+    fn fill_triangle_covers_identically_for_all_six_vertex_permutations() {
+        let color = Color::new(0x12, 0x34, 0x56);
+        let (w, h) = (20usize, 20usize);
+
+        /// 6 种排列的索引表。
+        const PERMUTATIONS: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+
+        // 覆盖三类几何：一般三角形、水平底边、水平顶边。
+        // 每类都必须对全部 6 种排列给出同一结果。
+        let cases: [[Pixel; 3]; 4] = [
+            [Pixel::new(2, 1), Pixel::new(17, 5), Pixel::new(6, 18)],
+            [Pixel::new(8, 0), Pixel::new(0, 8), Pixel::new(8, 8)],
+            [Pixel::new(2, 2), Pixel::new(9, 2), Pixel::new(5, 15)],
+            [Pixel::new(1, 3), Pixel::new(15, 12), Pixel::new(4, 12)],
+        ];
+
+        for tri in cases {
+            let reference = triangle_pixels_ref(tri, w, h);
+            assert!(!reference.is_empty(), "三角形 {tri:?} 的参考集为空");
+
+            let mut results: Vec<([usize; 3], Vec<(usize, usize)>)> = Vec::new();
+            for perm in PERMUTATIONS {
+                let p = [tri[perm[0]], tri[perm[1]], tri[perm[2]]];
+                let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
+                let mut renderer = render_on(info, &mut fb);
+                renderer.fill_triangle(p[0], p[1], p[2], &color);
+                let drawn = drawn_pixels(&renderer, w, h, &color);
+
+                assert_eq!(
+                    drawn, reference,
+                    "三角形 {tri:?} 的排列 {perm:?} 与参考不符"
+                );
+                results.push((perm, drawn));
+            }
+
+            // 全部排列两两一致（逐对比较比只跟首个比较更能定位差异）。
+            let (first_perm, first) = &results[0];
+            for (perm, drawn) in &results[1..] {
+                assert_eq!(
+                    drawn, first,
+                    "三角形 {tri:?} 的排列 {perm:?} 与排列 {first_perm:?} 结果不同"
+                );
+            }
+        }
     }
 
     /// 私有内核 `disk_params` 的半径钳制口径。
@@ -5191,8 +5426,9 @@ mod tests {
 
     /// `fill_triangle` 每个像素的**写入次数**参考（保留重复计数，不去重）。
     ///
-    /// 实现对 `y1..=y2` 与 `y2..=y3` 各扫一遍，两段都覆盖到的像素会被写两次。
-    /// 半透明混合的结果取决于这个次数，故参考必须逐像素记数而非只记集合。
+    /// 半开扫描线规则下每行只发射一次，故正常情况下每个像素的计数恒为 1。
+    /// 保留计数而不是改成布尔，是为了让「某行被扫了两遍」这类回归直接暴露成
+    /// 计数 2，而不是被集合比较悄悄吸收。
     fn reference_triangle_write_counts(
         tri: [Pixel; 3],
         w: usize,
