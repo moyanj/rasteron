@@ -32,6 +32,30 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 
+# 基准按被测子系统拆成 5 个独立目标，每个都是自己的 criterion 入口。
+# 都用 `harness = false`（criterion 自带 main），并按所需 feature 声明
+# `required-features`——使 `cargo bench --no-default-features` 直接跳过
+# 无法编译的目标，而不是报一堆缺失符号的错。
+
 [[bench]]
-name = "renderer"
+name = "pixel_and_buffer"
 harness = false
+
+[[bench]]
+name = "primitives"
+harness = false
+
+[[bench]]
+name = "color_and_angle"
+harness = false
+
+[[bench]]
+name = "programmable_pipeline"
+harness = false
+required-features = ["programmable"]
+
+[[bench]]
+name = "font"
+harness = false
+# 两个字体 feature 至少开一个，`rasteron::font` 才存在。
+required-features = ["font_bitmap"]
