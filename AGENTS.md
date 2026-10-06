@@ -23,7 +23,7 @@ rasteron/
 ├── src/font/               # 字体 trait + 位图/TrueType 实现
 ├── examples/               # 4 个示例 + 跨目录共享的 BMP 落盘工具
 ├── tests/fixtures/         # minimal_ascii.ttf（DejaVu 子集，10768 B，7 字形）
-├── benches/renderer.rs     # criterion 基准（单文件，16 个 bench 组）
+├── benches/                # 5 个 criterion 目标 + shared/ 共享脚手架
 ├── Cargo.toml              # 无 [dependencies]；feature 与 profile 全在此
 └── *.bmp                   # 示例产物，已被 .gitignore 排除
 ```
@@ -45,7 +45,7 @@ rasteron/
 | 加/改字体接口 | `src/font/mod.rs` | `Font` trait + `draw_char` / `draw_text` |
 | 改 TrueType 支持 | `src/font/ttf.rs` | `TtfFont`；度量来自 fontdue，光栅化写调用方缓冲 |
 | 加错误类型 | `src/error.rs` | 全库错误唯一定义处 |
-| 加基准 | `benches/renderer.rs` | 已有 `criterion_config()` 统一配置 |
+| 加基准 | `benches/<子系统>.rs` | 按被测子系统选文件；复用 `benches/shared/mod.rs` 的 `criterion_config()` / `PixFb` |
 | 加示例 | `examples/<name>/main.rs` | 复用 `examples/shared/bmp.rs` |
 
 ## 代码地图
@@ -129,8 +129,10 @@ rasteron/
   新增格式时须明确它落在哪一侧。
 - **`Angle` 用圈值而非毫度**：为了 `>> 30` 即得象限号、加减自动环绕。
 - **示例即基准图**：`examples/gallery` 排布全部图元成带编号网格，供人工比对。
-- **基准绕过借用检查**：`benches/renderer.rs:71` 用
-  `from_raw_parts_mut` 造 `'static`，让 `Renderer<'static>` 逃出函数作用域。
+- **基准的帧缓冲只在一处 `unsafe`**：`benches/shared/mod.rs` 的 `PixFb`
+  用 `from_raw_parts_mut` 造 `'static`，让 `Renderer<'static>` 能跨
+  `b.iter()` 复用。该处同时断言切片 ≥ `pitch × height`（`Renderer::new`
+  的前置条件），写错尺寸得到的是清晰 panic 而非越界写。
 - **越权防护视为功能**：`11c3e58` 与 `33f951b` 把半径钳制、线段迭代收窄、
   精确圆盘语义当作正确性修复而非优化，勿"简化"回去。
 
@@ -161,8 +163,22 @@ cargo test --lib          # 396 passed
 cargo test --lib --no-default-features   # 216 passed（验证 feature 门控）
 cargo test --doc          # 41 passed, 0 ignored
 
-# 基准
-cargo bench               # 约 16 组，warm_up 4s / measure 10s，耗时较长
+# ⚠️ 不要跑 bench！仅维护基准代码，不主动执行。需要数据时由用户本人运行。
+#
+# 以下命令仅作「基准存在哪些目标」的记录，供理解代码结构用：
+#   5 个目标，按被测子系统拆分；各自声明 required-features
+cargo bench --bench pixel_and_buffer        # 像素读写/清屏/双缓冲/blit/子视口
+cargo bench --bench primitives              # 线段/三角形/矩形/圆/弧/掩码混合
+cargo bench --bench color_and_angle         # 颜色、格式编解码、角度三角函数
+cargo bench --bench programmable_pipeline   # 可编程管线（需 programmable）
+cargo bench --bench font                    # 位图与 TrueType 字体（需字体 feature）
+cargo bench                                 # 全部目标
+
+# 抖动的机器上收窄置信区间（默认 282 条 / 1s 预热 / 3s 测量 / 100 采样，约 18 分钟）
+BENCH_MEASURE_MS=10000 BENCH_SAMPLES=300 cargo bench --bench primitives
+BENCH_QUICK=1 cargo bench --bench color_and_angle   # 冒烟档，数据不可引用
+# 每个目标启动时会打印一次抖动自检结论（可信 / 不可信）
+# 基准设计与解读见 benches/README.md
 
 # 示例（均输出 BMP 到仓库根目录）
 cargo run --example basic
@@ -202,6 +218,7 @@ cargo run --example subviewport
   unwind 以捕获 panic）。
 - `no_std` 但库内不含 `unsafe` 的 `extern "C"` ABI，全部通过安全 API 暴露。
 - 测试规模与分布见 `target/TEST_PLAN.md` §6.1（该文件在 `.gitignore` 内）。
+- **不要跑 bench**：仅维护基准代码，不主动执行采集。需要数据时由用户本人运行。
 
 ## 已修复的历史缺陷（均有回归护栏）
 
