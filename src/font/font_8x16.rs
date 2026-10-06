@@ -542,15 +542,87 @@ const fn expand_font() -> [[u8; 128]; 128] {
 
 static EXPANDED_FONT8X16: [[u8; 128]; 128] = expand_font();
 
-pub struct DefaultFont;
-impl Font for DefaultFont {
-    fn get_char(&self, c: char) -> Option<super::Char<'_>> {
+/// 位图的像素尺寸（宽 8 / 高 16）。
+const GLYPH_SIZE: (usize, usize) = (8, 16);
+
+/// 基线在第 12 行：由字库实测得出——128 个字形里 92 个的最低墨迹在第 11 行，
+/// `$^~` 顶到第 0 行，`gjpqy` 沉到第 14 行，故取 ascent 12 / descent 4。
+///
+/// 这个常量不是拍脑袋的：它让内置点阵字体与 TrueType 路径的基线语义一致，
+/// 两种字体混排时文字才能对齐同一行。
+const BASELINE: i32 = 12;
+
+/// 字形位图左沿相对基线原点的偏移。点阵字体没有悬挂部，恒为 0。
+const BEARING_X: i32 = 0;
+
+/// 前进宽度（像素）。点阵字体无字距调整，恒等于字宽。
+const ADVANCE: f32 = 8.0;
+
+impl DefaultFont {
+    /// 取字符的展开掩码；非 ASCII 返回 [`None`]。
+    const fn expanded(c: char) -> Option<&'static [u8; 128]> {
         if c.is_ascii() {
-            Some(super::Char::new(&EXPANDED_FONT8X16[c as usize], (8, 16)))
+            Some(&EXPANDED_FONT8X16[c as usize])
         } else {
             None
         }
     }
 }
 
+impl Font for DefaultFont {
+    fn has_glyph(&self, c: char) -> bool {
+        c.is_ascii()
+    }
+
+    /// 点阵字体只有一种字号：`px` 只做合法性检查（必须有限且 > 0），
+    /// 对结果没有任何影响——它没有可缩放的轮廓，只有这一份 8×16 位图。
+    fn layout(&self, c: char, px: f32) -> Option<super::GlyphLayout> {
+        if px <= 0.0 || !px.is_finite() {
+            return None;
+        }
+        Self::expanded(c).map(|_| super::GlyphLayout {
+            width: GLYPH_SIZE.0,
+            height: GLYPH_SIZE.1,
+            bearing_x: BEARING_X,
+            bearing_y: BASELINE,
+            advance: ADVANCE,
+        })
+    }
+
+    fn metrics(&self, _px: f32) -> super::FontMetrics {
+        super::FontMetrics {
+            ascent: BASELINE as f32,
+            descent: (GLYPH_SIZE.1 as i32 - BASELINE) as f32,
+            line_gap: 0.0,
+        }
+    }
+
+    /// 掩码是编译期展开的常量表，只需把对应字形整段拷进调用方的缓冲。
+    fn rasterize(
+        &self,
+        c: char,
+        _px: f32,
+        layout: &super::GlyphLayout,
+        mask: &mut [u8],
+    ) -> Option<usize> {
+        let expanded = Self::expanded(c)?;
+        let needed = layout.mask_len()?;
+        // 容量策略与 trait 契约一致：缓冲不足 panic（调用方按 layout 算出容量）。
+        assert!(
+            mask.len() >= needed,
+            "DefaultFont::rasterize: mask 容量 {mask_len} 小于所需 {needed}",
+            mask_len = mask.len()
+        );
+        mask[..needed].copy_from_slice(&expanded[..needed]);
+        Some(needed)
+    }
+}
+
+/// 内置的 8×16 ASCII 点阵字体。
+///
+/// 零分配、无浮点运算，是 `font_bitmap` feature 的默认字体。
 pub static DEFAULT_FONT: DefaultFont = DefaultFont;
+
+/// 8×16 ASCII 点阵字体的实现。
+#[derive(Clone, Copy)]
+pub struct DefaultFont;

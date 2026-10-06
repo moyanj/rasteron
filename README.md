@@ -47,13 +47,14 @@ rasteron = { path = "../rasteron" }   # 或 git = "<仓库地址>"
 
 - **写内核 GUI / bootloader 的**：能在 `no_std` 下用，没有依赖包袱，不要求 FPU。
 - **自建图形栈的**：需要精确控制帧缓冲布局，且不想被某个框架的抽象绑住。
-- **做底层绘图的 Rust 学习者**：全部实现可读，398 个测试护栏，几何与内存契约都写进了文档。
+- **做底层绘图的 Rust 学习者**：全部实现可读，458 个测试护栏，几何与内存契约都写进了文档。
 
 ## 不适合谁
 
 - **要 3D、抗锯齿、变换矩阵**——这是纯 2D 光栅化器，不含投影、深度、光照。
 - **纹理密集的场景**——纹理采样只有 nearest / bilinear，无 mipmap，缩小会走样。
-- **要 Unicode 文本排版**——内置字体只覆盖 ASCII，且无换行、无抗锯齿缩放。
+- **要完整的 Unicode 排版**——文本层有基线 / bearing / 换行，但**不做 kerning、
+  连字、双向文字与断行**，这些得在调用方或 `Font` 实现里补。
 - **图元数量极多且需抗锯齿**——固定功能图元是硬边整数光栅化，没有 AA。
 
 ## 特性
@@ -65,18 +66,24 @@ rasteron = { path = "../rasteron" }   # 或 git = "<仓库地址>"
 - **双缓冲与子视口**：前后台缓冲区都由你提供；子视口让每个 UI 面板拥有独立坐标系，无需全局 scissor。
 - **可选可编程管线**：顶点着色器 + varying 重心插值 + 片元着色器 + viewport/scissor + 索引绘制 + 2D 纹理采样。
 - **可选 SIMD**：AVX-512 / AVX2 / SSE2 / NEON / RISC-V Vector 上的内存操作优化，未对齐自动回退标量。
-- **可选内置字体**：8×16 点阵 ASCII，`draw_char` 直接用。
+- **可选字体**：内置 8×16 点阵 ASCII（零分配），或 TrueType/OpenType 抗锯齿字体
+  （`fontdue` 后端）。`draw_char` / `draw_text` 通用，字号、基线、bearing 全部走
+  度量接口，排版累加用 26.16 定点，长串不漂移。
 
 ## Feature 标志
 
 | Feature | 默认 | 作用 |
 |---------|------|------|
-| `programmable` | ✅ | 可编程 2D 管线。**唯一引入 `f32` 的标志**，无 FPU 目标请关闭。 |
+| `programmable` | ✅ | 可编程 2D 管线。固定功能路径里**唯一引入 `f32` 的标志**，
+  无 FPU 目标请关闭（`font_truetype` 同样会引入浮点，见上）。 |
 | `simd` | ✅ | SIMD 内存操作优化。不影响正确性，只影响速度。 |
-| `font_bitmap` | ✅ | 内置 8×16 点阵字体（ASCII）。 |
-| `font_truetype` | ❌ | 预留，当前无实现。 |
+| `alloc` | ✅ | 允许库内堆分配，提供 `draw_char_owned` / `draw_text_owned` 免 scratch 方法。关闭后库内**绝不分配**。 |
+| `font_bitmap` | ✅ | 内置 8×16 点阵字体（ASCII），零分配、不碰浮点。 |
+| `font_truetype` | ✅ | TrueType / OpenType 抗锯齿字体。**会引入 `fontdue` 依赖与
+  `alloc`**，且光栅化内部用浮点——内核态目标须关闭。 |
 
-全部组合都不引入运行时依赖。纯整数渲染：
+除 `font_truetype` 外全部组合零运行时依赖；它依赖 `fontdue`（`no_std` + `alloc`）。
+纯整数渲染：
 
 ```bash
 cargo build --no-default-features
@@ -95,6 +102,46 @@ cargo build --no-default-features
 | 图元超出可见区 | **不算错误**，静默裁剪 |
 
 缓冲区大小用 `info.buffer_size()` 取准确值（它会计入行填充）。
+
+## 文本
+
+字体接口把**度量**（`layout` / `metrics`，零分配）与**光栅化**（`rasterize`，写调用方
+缓冲）分开。**库内默认绝不分配**，光栅化用的 scratch 由调用方提供：
+
+```rust
+use rasteron::color::Color;
+use rasteron::font::ttf::TtfFont;   // 需 font_truetype
+use rasteron::{Pixel, Renderer};
+
+let font = TtfFont::new(&ttf_bytes);
+let mut scratch = [0u8; 64 * 64];   // 单字位图上限，调用方出
+
+// 一行字：自动对齐基线、推进画笔、遇 \n 换行
+renderer.draw_text(Pixel::new(8, 8), "Hello", 24.0, Color::WHITE, &font, &mut scratch);
+
+// 单字：origin 是**基线**原点，不是左上角
+renderer.draw_char(Pixel::new(8, 32), 'A', 24.0, Color::WHITE, Some(&font), &mut scratch);
+
+// 开了 alloc feature 时可以省掉 scratch，库内按字号精确分配：
+renderer.draw_text_owned(Pixel::new(8, 8), "Hello", 24.0, Color::WHITE, &font);
+```
+
+三条要点：
+
+- **基线坐标系**：`origin.y` 是基线所在行，字形按 `bearing` 相对它定位。带悬挂部的
+  字（斜体、`f`、`j`）`bearing_x` 为负，`draw_glyph` 会同时裁掉源掩码的左边界。
+- **字号是 `f32`**：`font_truetype` 的光栅化本就以浮点累加（fontdue 内部），故
+  接口不再假装能定点。**内核态目标应关闭 `font_truetype`**；`font_bitmap` 路径
+  不产生任何浮点运算。
+- **排版累加走定点**：画笔由 `PenX`（26.16 定点）持有，每步量化到 1/65536 px。
+  1/64 px 的网格表示不了常见的比例 advance（`1+1/128`），一行 1600 字会漂移
+  12.5 px；1/65536 下常见 advance 全部精确，误差恒为 0。
+
+`Font` 是可自己实现的 trait：`layout` 与 `metrics` 不得分配，`rasterize` 把掩码写进
+你给的 `&mut [u8]`（容量不足即 panic——按 `layout.mask_len()` 准备即可）。
+
+签名**不按 feature 分裂**：`draw_char` / `draw_text` 在任何构建下都收 scratch，
+调用点不会因 feature 变化而改代码；`*_owned` 变体只在开启 `alloc` 时存在。
 
 ## 示例
 
@@ -121,13 +168,14 @@ cargo run --example programmable  # 可编程管线画点阵
 ## 开发
 
 ```bash
-cargo test                                          # 398 项：lib 335 + 集成 22 + doctest 41
-cargo test --lib --no-default-features              # 198 项，验证 feature 门控与无浮点契约
+cargo test                                          # 458 项：lib 396 + 集成 22 + doctest 41
+cargo test --lib --no-default-features              # 216 项，验证 feature 门控
 cargo check --all-features
 cargo bench                                         # 16 组 criterion 基准，耗时较长
 ```
 
-`--no-default-features` 是验证「关闭 `programmable` 后不碰浮点」的唯一门径，任何改动后都应跑一遍。
+`--no-default-features` 是验证「关闭 `programmable` / `font_truetype` 后不碰浮点」的
+唯一门径，任何改动后都应跑一遍。
 
 MSRV 为 Rust 1.85+（下限由 `edition = "2024"` 决定）。
 

@@ -10,11 +10,16 @@ fontdue = { version = "0.9.4", optional = true }
 criterion = { version = "0.7", default-features = false }
 
 [features]
-default = ["programmable", "simd", "font_bitmap", "font_truetype"]
+default = ["programmable", "simd", "alloc", "font_bitmap", "font_truetype"]
 programmable = []
 simd = []
+# 允许库内使用堆分配（提供 `draw_char_owned` / `draw_text_owned` 便利方法）。
+# 无 alloc 的构建里所有缓冲仍由调用方提供——「库内不做分配」是默认契约，
+# 本 feature 只是显式放弃它以换取免 scratch 的便利。
+alloc = []
 font_bitmap = []
-font_truetype = ["fontdue"]
+# fontdue 本身是 `no_std` + `alloc` 依赖，故隐含 `alloc`。
+font_truetype = ["fontdue", "alloc"]
 
 [profile.release]
 opt-level = 3

@@ -6,8 +6,8 @@
 ## 概述
 
 `rasteron` 是 `#![no_std]` 的 2D 软件光栅化库，面向嵌入式与内核态帧缓冲渲染。
-零 `[dependencies]`（`criterion` 仅 dev），核心栈只有整数运算、裸指针与内建
-SIMD intrinsics。
+除 `font_truetype` 门控的 `fontdue` 外零 `[dependencies]`（`criterion` 仅 dev），
+核心栈只有整数运算、裸指针与内建 SIMD intrinsics。
 
 同时产出两种目标：
 
@@ -20,7 +20,9 @@ SIMD intrinsics。
 rasteron/
 ├── src/                    # 全部实现，见 src/AGENTS.md
 │   └── programmable/       # feature 门控的 f32 可编程管线
+├── src/font/               # 字体 trait + 位图/TrueType 实现
 ├── examples/               # 4 个示例 + 跨目录共享的 BMP 落盘工具
+├── tests/fixtures/         # minimal_ascii.ttf（DejaVu 子集，10768 B，7 字形）
 ├── benches/renderer.rs     # criterion 基准（单文件，16 个 bench 组）
 ├── Cargo.toml              # 无 [dependencies]；feature 与 profile 全在此
 └── *.bmp                   # 示例产物，已被 .gitignore 排除
@@ -40,6 +42,8 @@ rasteron/
 | 加/改纹理与采样 | `src/programmable/texture.rs` | `Texture2D` + `sample(uv, filter, wrap)` |
 | 改子视口裁剪 | `src/utils.rs` | `sub_view` 系列 |
 | 改 SIMD memcpy | `src/simd.rs` | 仅 `memcpy`，feature = `simd` |
+| 加/改字体接口 | `src/font/mod.rs` | `Font` trait + `draw_char` / `draw_text` |
+| 改 TrueType 支持 | `src/font/ttf.rs` | `TtfFont`；度量来自 fontdue，光栅化写调用方缓冲 |
 | 加错误类型 | `src/error.rs` | 全库错误唯一定义处 |
 | 加基准 | `benches/renderer.rs` | 已有 `criterion_config()` 统一配置 |
 | 加示例 | `examples/<name>/main.rs` | 复用 `examples/shared/bmp.rs` |
@@ -60,14 +64,23 @@ rasteron/
 | `Texture2D<'a>` | struct | `src/programmable/texture.rs:113` | 借用式 2D 纹理；半 texel 采样 |
 | `TextureFs<'a>` | struct | `src/programmable/shader.rs:263` | 按 UV varying 采样的内建片元着色器 |
 | `mod simd` | mod | `src/simd.rs` | AVX-512/AVX2/SSE2/NEON/RVV memcpy（7 个测试） |
+| `Font` | trait | `src/font/mod.rs` | 度量 / 光栅化两阶段；返回值**不借用** `&self` |
+| `GlyphLayout` | struct | `src/font/mod.rs` | 单字度量：`width`/`height`/`bearing_x`/`bearing_y`/`advance` |
+| `FontMetrics` | struct | `src/font/mod.rs` | 行度量：`ascent` / `descent` / `line_gap` |
+| `PenX` | struct | `src/font/mod.rs` | 26.16 定点画笔；`advance()` 精确累加，长串不漂移 |
+| `Char<'a>` | struct | `src/font/mod.rs` | 已光栅化字形（尺寸 + 掩码借用），供调用方缓存 |
+| `TtfFont` | struct | `src/font/ttf.rs:44` | fontdue 后端；`new` 解析失败即 panic |
+| `DefaultFont` | struct | `src/font/font_8x16.rs:628` | 内置 8×16 ASCII；基线第 12 行，零分配 |
 
 ## 约定
 
 - **坐标系**：Y 轴向下，`(0,0)` 在左上角；角度沿屏幕坐标增大（`0°`→右、
   `90°`→下）。全库统一，改动任何图元都不要引入别的约定。
 - **无浮点契约**：关闭 `programmable` feature 时几何计算**全整数**
-  （`Angle` 圈值 + 波表，无 `f32`）。`programmable` 是唯一引入 `f32` 的 feature，
-  内核态目标须据此评估 FPU 状态保存。
+  （`Angle` 圈值 + 波表，无 `f32`）。**注意 `font_truetype` 同样引入 `f32`**
+  ——fontdue 的光栅化本就以浮点累加（`scale_factor(px)`、亚像素偏移），接口
+  选 `f32` 字号是顺势而为而非破坏约定。内核态目标须关闭**两个** feature 并据此
+  评估 FPU 状态保存；`font_bitmap` 路径不产生任何浮点运算。
 - **错误分层**（`src/error.rs` 模块文档有完整表格）：
   - 构造期不变量被破坏 → `panic`（如 `FramebufferInfo::new` 的 pitch 断言）
   - 运行期可恢复失败 → `Result` / `Option`
@@ -80,7 +93,10 @@ rasteron/
   `get_unchecked_mut`。`Renderer::new` 断言切片 ≥ `pitch × height` 是这套
   方案不越界的前提，不可移除。
 - **不做分配**：所有缓冲区由调用方提供；双缓冲的后台缓冲区同样由调用方传入
-  （`Renderer::with_back_buffer`）。
+  （`Renderer::with_back_buffer`）。**`alloc` feature 是显式放弃这条契约的唯一
+  出口**——它只新增 `draw_char_owned` / `draw_text_owned` 两个便利方法，
+  其余 API 在任何 feature 组合下都不分配。`font_truetype` 隐含 `alloc`
+  （fontdue 本身依赖 `alloc`）。
 - **文档语言**：全中文。每个公开项带 `///` 文档，模块顶部 `//!` 用
   `# 概述` / `# 示例` / `# 恐慌` / `# Safety` 分节。新增公开 API 必须带
   可运行 doctest。
@@ -91,8 +107,11 @@ rasteron/
 
 ## 禁止模式
 
-- ❌ 引入 `[dependencies]` 中除 `criterion` 外的运行时依赖（破坏 `no_std` /
-  零依赖定位；确需引入须先确认）
+- ❌ 引入 `[dependencies]` 中除 `criterion` / `fontdue` 外的运行时依赖
+  （`fontdue` 由 `font_truetype` 门控，是唯一的例外；其余确需引入须先确认）
+- ❌ 在无 `alloc` 的构建里让库内分配。`draw_char` / `draw_text` 的 scratch
+  一律由调用方传入；`*_owned` 变体必须 `#[cfg(feature = "alloc")]` 门控。
+  `ttf.rs` 里的 `alloc::vec::Vec` 只用于承接 fontdue 的返回值，是适配层的必然
 - ❌ 用 `as` 做 `usize → i64` 转换。必须用饱和转换，否则
   `usize::MAX as i64 == -1`，端点会被折到画布另一侧（`src/core.rs` 的 `draw_line_unchecked` 有完整说明）
 - ❌ 给错误类型实现 `std::error::Error`。MSRV 早于其稳定，仅实现
@@ -122,17 +141,23 @@ rasteron/
 cargo build
 cargo check --release
 
-# 全部 feature 组合都必须能编译（已验证 5 种全 PASS）
-# 注：原计划的 `--features alloc` 一项已作废——alloc 是死 feature，已删除。
+# 全部 feature 组合都必须能编译（已验证 8 种全 PASS）
+# 注：`alloc` 曾是死 feature 已删除，本次重构重新引入——它现在是
+# `draw_char_owned` / `draw_text_owned` 两个免 scratch 方法的门控。
 cargo check --no-default-features
 cargo check --no-default-features --features simd
 cargo check --no-default-features --features programmable
+cargo check --no-default-features --features alloc
+cargo check --no-default-features --features font_bitmap
+cargo check --no-default-features --features font_bitmap,alloc
+cargo check --no-default-features --features font_truetype
+cargo check --no-default-features --features font_truetype,font_bitmap
 cargo check --no-default-features --features programmable,simd
 cargo check --all-features
 
 # 测试
-cargo test                # 423 passed（lib 360 + 集成 22 + doctest 41）
-cargo test --lib          # 360 passed
+cargo test                # 459 passed（lib 396 + 集成 22 + doctest 41）
+cargo test --lib          # 396 passed
 cargo test --lib --no-default-features   # 216 passed（验证 feature 门控）
 cargo test --doc          # 41 passed, 0 ignored
 
@@ -196,11 +221,17 @@ cargo run --example subviewport
 
 ## 浮点取整：`no_std` 下没有 `f32::floor`
 
-无 std 无 libm 时 `floor` / `round` / `ceil` / `sqrt` **全部不可用**
-（已实测确认）。库内因此有三份手写取整：`utils::floor_to_usize`、
-`utils::ceil_to_usize`、`texture::floor_to_i32`。改任一份都要保持三条共同契约：
+无 std 无 libm 时 `floor` / `round` / `ceil` / `trunc` / `sqrt` **全部不可用**
+（已实测确认）。库内因此有四份手写取整：`utils::floor_to_usize`、
+`utils::ceil_to_usize`、`texture::floor_to_i32`、`font::PenX::quantize`。
+改任一份都要保持三条共同契约：
 
 1. **`NaN` 显式归零**，不能靠 `as` 的饱和转换蒙对（`ceil_to_usize` 曾返回 1）。
 2. **饱和后不再做加减**。`as` 在 `|value| ≥ i32::MAX` 饱和到 `i32::MAX`，
    此时负数分支的 `- 1` 会下溢 panic——必须 `saturating_sub(1)`。
 3. **`ceil` / `floor` 只对非负值有意义**，`utils` 侧靠调用方保证。
+
+`PenX::quantize` 多一条：**进位条件必须比对小数部分**
+（`scaled - truncated >= 0.5`）。写成 `scaled >= truncated as f32` 时，整数刻度
+（如 `0.5px` → `32.0`）会让条件恒成立，每个刻度都被多进一位，1000 次步进漂移
+15.6 px。
