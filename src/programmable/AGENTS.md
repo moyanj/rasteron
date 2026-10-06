@@ -1,6 +1,6 @@
 # src/programmable — 2D 可编程管线
 
-**生成时间:** 2026-10-06 · 4 文件 4746 行
+**生成时间:** 2026-10-06 · 4 文件 5906 行
 **feature 门控:** 整个目录由 `#[cfg(feature = "programmable")]` 包裹（`lib.rs:142`），默认开启
 
 这是全库**唯一**引入 `f32` 的地方。关闭该 feature 后几何计算回到全整数
@@ -10,10 +10,10 @@
 
 | 文件 | 行数 | 内容 |
 |------|------|------|
-| `mod.rs` | 2582 | 类型体系、`Pipeline`、3 个 `rasterize_*` 内核、2 个公开绘制入口 |
-| `cache.rs` | 387 | `VertexCache<'a, V>`——按顶点索引复用着色结果的 post-transform cache |
-| `texture.rs` | 1136 | `Texture2D` + `WrapMode` / `FilterMode` + 寻址 / 采样（37 个测试） |
-| `shader.rs` | 641 | `Passthrough2D<V>`（顶点）+ `SolidFs` / `GradientFs` / `TextureFs`（片元） |
+| `mod.rs` | 3507 | 类型体系、`Pipeline`、3 个 `rasterize_*` 内核、2 个公开绘制入口（55 个测试） |
+| `cache.rs` | 387 | `VertexCache<'a, V>`——按顶点索引复用着色结果的 post-transform cache（11 个测试） |
+| `texture.rs` | 1266 | `Texture2D` + `WrapMode` / `FilterMode` + 寻址 / 采样（39 个测试） |
+| `shader.rs` | 746 | `Passthrough2D<V>`（顶点）+ `SolidFs` / `GradientFs` / `TextureFs`（片元）（20 个测试） |
 
 ## 数据流
 
@@ -51,18 +51,34 @@ vertices ──VS::shade_vertex──▶ FragmentInput ──缓存按 index 复
 
 | 内核 | 位置 | 职责 |
 |------|------|------|
-| `visible_bounds` | `:453` | 帧缓冲 ∩ viewport ∩ scissor，三者交集为空则整批图元直接成功返回（连顶点着色都不执行） |
-| `write_fragment_color` | `:477` | 按 `BlendMode` 落盘。**取整不在这里做**——各图元落位规则不同（点向零取整、线四舍五入） |
-| `rasterize_point` | `:512` | 二值可见判定，无参数域裁剪 |
-| `rasterize_line` | `:541` | 参数域裁剪 + 插值 |
-| `rasterize_triangle` | `:605` | 重心坐标插值，`w0/w1/w2` 除以 `area` |
+| `visible_bounds` | `:504` | 帧缓冲 ∩ viewport ∩ scissor，三者交集为空则整批图元直接成功返回（连顶点着色都不执行） |
+| `write_fragment_color` | `:528` | 按 `BlendMode` 落盘。**取整不在这里做**——各图元落位规则不同（点向零取整、线四舍五入） |
+| `rasterize_point` | `:563` | 二值可见判定，无参数域裁剪 |
+| `rasterize_line` | `:612` | 参数域裁剪 + 插值 + **按像素去重片元**（见下） |
+| `rasterize_triangle` | `:703` | 重心坐标插值，`w0/w1/w2` 除以 `area` |
 
-公开入口只有两个：`draw_arrays`（`:688`）与 `draw_indexed`（`:778`），
+公开入口只有两个：`draw_arrays`（`:829`）与 `draw_indexed`（`:919`），
 都返回 `Result<(), DrawError>`——索引越界是**调用方程序错误**，
 fail-fast 上抛而非静默跳过整条图元。
 
 ## 陷阱
 
+- **线段 DDA 的采样点≠像素，必须去重**（`9e56098` 修复）。`rasterize_line`
+  按 `steps = ceil(max|dx|, |dy|)` 采样，短于一个像素的线段会有多个 `t`
+  映射到同一整数像素。`Alpha` / `Add` / `Multiply` / `PremultipliedAlpha`
+  都是读-改-写，重复着色就得到两倍效果——半透明短线段比同位置的点更亮，
+  且亮度取决于线段方向。
+  修法是循环里记住 `previous: Option<(usize, usize)>`，取整并通过
+  `bound.contains` 后与之比较、相同则跳过，**只有真正写入后才更新**。
+  DDA 主采样轴单调递增，重复坐标必然连续出现，故单个变量足够、无需分配。
+  保留的是**第一次**映射到该像素的 `t`。
+  改这段时注意：`previous` 必须在 `continue`（`bound` 判定之外）之后才更新，
+  漏更新会让整段线段只画一个像素。
+  守护测试：`short_line_shades_each_pixel_once`、
+  `short_line_alpha_matches_a_point_at_the_same_pixel`、
+  `short_lines_of_different_directions_have_equal_brightness`、
+  `every_blend_mode_writes_a_short_line_exactly_once`、
+  `line_coverage_matches_independent_reference_model`。
 - **坐标系不是 OpenGL**：顶点着色器输出的 `position` 是 normalized
   `[0, 1]` viewport 坐标，`[0, 0]` 为左上角，**不是** `[-1, 1]` clip space。
 - **视口变换是「边缘空间」，跨度乘全宽**：`normalized_to_screen` 算的是
@@ -230,6 +246,6 @@ mipmap（需自持有存储，破坏零分配）、`Mirror` 寻址（边界歧�
 ```bash
 cargo check --no-default-features                          # 确认本目录被完全排除
 cargo check --no-default-features --features programmable   # 单独开启
-cargo test --lib                                            # 本目录 113 个测试
+cargo test --lib                                            # 本目录 125 个测试
 cargo run --example programmable                            # 最小可用示例
 ```

@@ -131,10 +131,10 @@ cargo check --no-default-features --features programmable,simd
 cargo check --all-features
 
 # 测试
-cargo test                # 388 passed（lib 326 + 集成 22 + doctest 40）
-cargo test --lib          # 326 passed
-cargo test --lib --no-default-features   # 198 passed（验证 feature 门控）
-cargo test --doc          # 40 passed, 0 ignored
+cargo test                # 423 passed（lib 360 + 集成 22 + doctest 41）
+cargo test --lib          # 360 passed
+cargo test --lib --no-default-features   # 216 passed（验证 feature 门控）
+cargo test --doc          # 41 passed, 0 ignored
 
 # 基准
 cargo bench               # 约 16 组，warm_up 4s / measure 10s，耗时较长
@@ -148,13 +148,13 @@ cargo run --example subviewport
 
 ## 注意事项
 
-- **已知缺陷：`fill_triangle` 水平底边的绕向不对称**。`y2 == y3`（水平底边）时
-  三顶点按 Y 排序不唯一，`x2` 取决于顶点顺序，而 `x2` 是 `lower` 段的 `base_x`：
-  正序触发 `interpolate_scan_x` 的 `delta_y == 0` 短路返回 `x2`，反序走插值，
-  同一三角形两种绕向**相差 1 个像素**。已用实验确认与其它修复无关。
-  修它要改几何语义（`lower` 段在 `y2 == y3` 时应取 `x3`），风险高于收益。
-  现状由 `fill_triangle_horizontal_bottom_edge_is_winding_asymmetric` 记录——
-  **该测试断言的是 `assert_ne!`，缺陷修好的那一刻它会主动失败并提示你改写。**
+- **三角形扫描转换用半开扫描线规则**（`f80d896` 修复）。拆分点 `y2` **只属于
+  下半段**：上半段扫 `y1..y2`、下半段扫 `y2..=y3`，故每行恰好发射一次；
+  `y2 == y3`（水平底边）时下半段只剩一行、两条边重合，跨度直接取
+  `min(x2, x3)..max(x2, x3)`——**不要**改回把 `x2` 当 `base_x` 去插值，
+  那会让覆盖依赖顶点顺序（原缺陷：同一三角形两种绕向相差 1 个像素）。
+  改这段代码时注意：像素**集合**比较对重复写完全免疫，
+  只有 `reference_triangle_write_counts` 的逐像素计数能守住「每行只扫一遍」。
 - **`sub_view` 在 `x > 0` 时恒定少一行**：这不是保守取舍，而是 `Renderer::new`
   要求切片至少 `pitch × height` 的硬约束（窗口切片取自
   `&mut fb[off..off + pitch × height]`，末行也必须凑满一整行）。按可见像素算本可
@@ -162,6 +162,17 @@ cargo run --example subviewport
   「为什么 `x > 0` 时恒定少一行」小节。
 - **`clip_line` 的左/上边界分支是死代码**：`compute_code` 里的 `LEFT`/`BOTTOM`
   判断永不成立——`Pixel` 字段是 `usize`，负坐标无法表达。
+- **`fill_triangle` 的顶点裁剪是「钳位」不是几何裁剪**：屏幕外顶点被
+  `min(max_x/max_y)` 拉到边界，斜率和形状随之改变，屏幕内结果**不等于**
+  原始三角形与视口的交集。这是既有的公开语义，由
+  `fill_triangle_clamps_out_of_screen_vertices_instead_of_clipping` 与
+  `fill_triangle_clamps_huge_vertices_without_narrowing_bug` 钉住。
+  改成固定容量 Sutherland–Hodgman 裁剪属行为级变更，须单独评审。
+- **`FramebufferInfo` 的字段是 `pub`，构造期校验管不到构造之后**：所有按布局
+  做的算术（`buffer_size`、`pixel_offset`、`clear`、`swap_buffers`、
+  `fill_span_*`、`blit*`、`sub_view_geometry`）都必须独立 `checked_*`，
+  溢出即 panic 或静默返回，**不能裸乘**——回绕出的偏移落在缓冲区内，
+  会让 `get_unchecked_mut` 写到错误的像素上。
 - `release` profile 开了 `panic = "abort"`；`bench` profile 未开（基准需要
   unwind 以捕获 panic）。
 - `no_std` 但库内不含 `unsafe` 的 `extern "C"` ABI，全部通过安全 API 暴露。
@@ -177,6 +188,11 @@ cargo run --example subviewport
 | `fill_circle`/`fill_arc` 的 `cx ± half` i64 溢出 | 大坐标 panic |
 | `ceil_to_usize(f32::NAN)` 返回 1 | 三角形 bbox 凭空多扩一像素 |
 | `floor_to_i32` 饱和后 `truncated - 1` 下溢 | 纹理采样遇 `±∞` 坐标时 panic（已改 `saturating_sub`） |
+| `FramebufferInfo::new` 用 `saturating_mul` | `width = usize::MAX` 时饱和值让不存在的布局「通过」校验 |
+| `buffer_size()` / `pixel_offset` 等裸乘 | 回绕出的偏移落在缓冲区内 → `get_unchecked_mut` 写错像素（静默渲染错误） |
+| `fill_triangle` 上下段都是闭区间 | `y2` 行被扫两次，半透明色重复混合 |
+| `fill_triangle` 水平底边取 `x2` 当端点 | 三顶点 Y 排序不唯一 → 覆盖依赖绕向（相差 1 像素） |
+| 可编程管线线段 DDA 重复片元 | 短线段多次着色：半透明线段比同位置点更亮，亮度还取决于方向 |
 
 ## 浮点取整：`no_std` 下没有 `f32::floor`
 
