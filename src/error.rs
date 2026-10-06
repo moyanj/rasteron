@@ -120,11 +120,9 @@ impl fmt::Display for DrawError {
 /// 构造二维纹理失败的原因。
 ///
 /// 纹理尺寸是纯数据，不涉及帧缓冲尺寸，因此这里的两类失败**都可以在调用方侧修正**，
-/// 对应未来 `Texture2D::try_new` 的可恢复版本；`Texture2D::new` 则对同样的条件直接
-/// 恐慌，作为构造期不变量的断言入口。
-///
-/// **当前状态**：可编程管线尚未提供 `Texture2D`（纹理采样待重新实现），本枚举作为
-/// 对外错误契约先行固定，库内暂无使用者。
+/// 对应 [`crate::programmable::texture::Texture2D::try_new`] 的可恢复版本；
+/// [`crate::programmable::texture::Texture2D::new`] 则对同样的条件直接恐慌，
+/// 作为构造期不变量的断言入口。
 ///
 /// # 示例
 ///
@@ -139,9 +137,9 @@ impl fmt::Display for DrawError {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextureError {
-    /// `width × height` 溢出 `usize`。
+    /// `width × height × bytes_per_pixel` 溢出 `usize`。
     DimensionOverflow,
-    /// `texels.len()` 不等于 `width × height`。
+    /// `texels.len()` 小于 `width × height × bytes_per_pixel`。
     LengthMismatch,
 }
 

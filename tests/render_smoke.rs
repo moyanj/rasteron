@@ -64,7 +64,11 @@ fn draw_everything(renderer: &mut Renderer<'_>, size: usize) {
     if size >= 2 {
         renderer.draw_line(Pixel::new(0, 0), Pixel::new(size - 1, size - 1), &YELLOW);
         renderer.draw_line(Pixel::new(0, size - 1), Pixel::new(size - 1, 0), &CYAN);
-        renderer.draw_line(Pixel::new(4, 10), Pixel::new(size.saturating_sub(5), 10), &semi);
+        renderer.draw_line(
+            Pixel::new(4, 10),
+            Pixel::new(size.saturating_sub(5), 10),
+            &semi,
+        );
     }
 
     // 矩形
@@ -113,11 +117,7 @@ fn draw_everything(renderer: &mut Renderer<'_>, size: usize) {
 
     // 缩放 / 裁剪护栏：超大尺寸与屏幕外起点都必须静默裁剪，不 panic。
     renderer.fill_rect(Pixel::new(0, 0), size * 4, size * 4, GREEN);
-    renderer.draw_line(
-        Pixel::new(0, 0),
-        Pixel::new(usize::MAX, usize::MAX),
-        &WHITE,
-    );
+    renderer.draw_line(Pixel::new(0, 0), Pixel::new(usize::MAX, usize::MAX), &WHITE);
     renderer.fill_circle(Pixel::new(usize::MAX, usize::MAX), usize::MAX, RED);
     renderer.fill_arc(
         Pixel::new(size + 50, size + 50),
@@ -200,8 +200,7 @@ fn each_format_produces_a_distinct_image() {
                 continue;
             }
             assert_ne!(
-                hash,
-                other_hash,
+                hash, other_hash,
                 "{format:?} 与 {other_format:?} 的指纹相同，格式参数可能未被生效"
             );
         }
@@ -226,10 +225,22 @@ fn rendering_fingerprints_match_the_recorded_baseline() {
     let baseline: Vec<(PixelFormat, u64)> = vec![
         (PixelFormat::Rgb24, fingerprint_for(PixelFormat::Rgb24)),
         (PixelFormat::Bgr24, fingerprint_for(PixelFormat::Bgr24)),
-        (PixelFormat::Xrgb8888, fingerprint_for(PixelFormat::Xrgb8888)),
-        (PixelFormat::Argb8888, fingerprint_for(PixelFormat::Argb8888)),
-        (PixelFormat::Rgba8888, fingerprint_for(PixelFormat::Rgba8888)),
-        (PixelFormat::Bgra8888, fingerprint_for(PixelFormat::Bgra8888)),
+        (
+            PixelFormat::Xrgb8888,
+            fingerprint_for(PixelFormat::Xrgb8888),
+        ),
+        (
+            PixelFormat::Argb8888,
+            fingerprint_for(PixelFormat::Argb8888),
+        ),
+        (
+            PixelFormat::Rgba8888,
+            fingerprint_for(PixelFormat::Rgba8888),
+        ),
+        (
+            PixelFormat::Bgra8888,
+            fingerprint_for(PixelFormat::Bgra8888),
+        ),
         (PixelFormat::Rgb565, fingerprint_for(PixelFormat::Rgb565)),
         (PixelFormat::Bgr565, fingerprint_for(PixelFormat::Bgr565)),
     ];
@@ -254,15 +265,17 @@ fn rendering_fingerprints_match_the_recorded_baseline() {
         let off = y * pitch + x * format.bytes_per_pixel();
         format.read_color(&buffer[off..off + format.bytes_per_pixel()])
     };
-    assert_eq!(read(0, 0), Color::new(16, 24, 32), "clear 后首像素应为背景色");
-    assert_eq!(read(SIZE - 1, SIZE - 1), Color::new(16, 24, 32), "clear 后末像素应为背景色");
+    assert_eq!(
+        read(0, 0),
+        Color::new(16, 24, 32),
+        "clear 后首像素应为背景色"
+    );
+    assert_eq!(
+        read(SIZE - 1, SIZE - 1),
+        Color::new(16, 24, 32),
+        "clear 后末像素应为背景色"
+    );
     assert_eq!(read(SIZE - 1, height - 1), Color::new(16, 24, 32));
-}
-
-/// 按帧缓冲格式解出一个像素（集成测试不走 `pub(crate)` 内部路径）。
-fn renderer_pixel(info: &FramebufferInfo, buffer: &[u8], x: usize, y: usize) -> Color {
-    let off = y * info.pitch + x * info.bytes_per_pixel();
-    info.format.read_color(&buffer[off..off + info.bytes_per_pixel()])
 }
 
 /// 非对齐 `pitch` 的帧缓冲同样能跑完全部图元，且不污染行填充区。

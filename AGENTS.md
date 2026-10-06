@@ -37,6 +37,7 @@ rasteron/
 | 加/改像素格式 | `src/color.rs` | `PixelFormat` 变体 + SWAR 内核同文件 |
 | 改角度/三角函数 | `src/angle.rs` | 圈值 `Angle` + 257 项四分之一波表 |
 | 改可编程管线 | `src/programmable/mod.rs` | `draw_arrays` / `draw_indexed` 在此 |
+| 加/改纹理与采样 | `src/programmable/texture.rs` | `Texture2D` + `sample(uv, filter, wrap)` |
 | 改子视口裁剪 | `src/utils.rs` | `sub_view` 系列 |
 | 改 SIMD memcpy | `src/simd.rs` | 仅 `memcpy`，feature = `simd` |
 | 加错误类型 | `src/error.rs` | 全库错误唯一定义处 |
@@ -56,6 +57,8 @@ rasteron/
 | `Angle` | struct | `src/angle.rs:94` | 圈值（整圈 `2^32`），加减自动回绕 |
 | `Interpolate` | trait | `src/programmable/mod.rs:34` | varying 重心插值 |
 | `Pipeline` | struct | `src/programmable/mod.rs:432` | `VS` + `FS` + `PipelineState` |
+| `Texture2D<'a>` | struct | `src/programmable/texture.rs:113` | 借用式 2D 纹理；半 texel 采样 |
+| `TextureFs<'a>` | struct | `src/programmable/shader.rs:263` | 按 UV varying 采样的内建片元着色器 |
 | `mod simd` | mod | `src/simd.rs` | AVX-512/AVX2/SSE2/NEON/RVV memcpy（7 个测试） |
 
 ## 约定
@@ -128,10 +131,10 @@ cargo check --no-default-features --features programmable,simd
 cargo check --all-features
 
 # 测试
-cargo test                # 323 passed（lib 274 + 集成 22 + doctest 27）
-cargo test --lib          # 274 passed
+cargo test                # 388 passed（lib 326 + 集成 22 + doctest 40）
+cargo test --lib          # 326 passed
 cargo test --lib --no-default-features   # 198 passed（验证 feature 门控）
-cargo test --doc          # 27 passed, 0 ignored
+cargo test --doc          # 40 passed, 0 ignored
 
 # 基准
 cargo bench               # 约 16 组，warm_up 4s / measure 10s，耗时较长
@@ -173,3 +176,15 @@ cargo run --example subviewport
 | `fill_visible_horizontal_span` 越界写 | **内存破坏**（release 静默写坏内存） |
 | `fill_circle`/`fill_arc` 的 `cx ± half` i64 溢出 | 大坐标 panic |
 | `ceil_to_usize(f32::NAN)` 返回 1 | 三角形 bbox 凭空多扩一像素 |
+| `floor_to_i32` 饱和后 `truncated - 1` 下溢 | 纹理采样遇 `±∞` 坐标时 panic（已改 `saturating_sub`） |
+
+## 浮点取整：`no_std` 下没有 `f32::floor`
+
+无 std 无 libm 时 `floor` / `round` / `ceil` / `sqrt` **全部不可用**
+（已实测确认）。库内因此有三份手写取整：`utils::floor_to_usize`、
+`utils::ceil_to_usize`、`texture::floor_to_i32`。改任一份都要保持三条共同契约：
+
+1. **`NaN` 显式归零**，不能靠 `as` 的饱和转换蒙对（`ceil_to_usize` 曾返回 1）。
+2. **饱和后不再做加减**。`as` 在 `|value| ≥ i32::MAX` 饱和到 `i32::MAX`，
+   此时负数分支的 `- 1` 会下溢 panic——必须 `saturating_sub(1)`。
+3. **`ceil` / `floor` 只对非负值有意义**，`utils` 侧靠调用方保证。

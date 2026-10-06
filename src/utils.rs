@@ -371,11 +371,11 @@ pub(crate) fn floor_to_usize(value: f32) -> usize {
 #[cfg(feature = "programmable")]
 #[inline(always)]
 pub fn ceil_to_usize(value: f32) -> usize {
-    // 用 `!(value > 0.0)` 一次性覆盖「<= 0」与「NaN」两种情形：
-    // NaN 的任何比较都为 false，故 `NaN > 0.0` 为 false，取反即为 true。
-    if !(value > 0.0) {
+    // 覆盖「<= 0」与「NaN」：NaN 视为非正，返回 0。
+    if value.is_nan() || value <= 0.0 {
         return 0;
     }
+
     let truncated = value as usize;
     if truncated as f32 == value {
         truncated
@@ -523,8 +523,14 @@ mod tests {
     fn sub_view_rejects_zero_size_and_out_of_range_origin() {
         let (info, mut fb) = make_parent();
         // 零宽 / 零高。
-        assert!(sub_view(&mut fb, &info, 8, 8, 0, 16).is_none(), "零宽应拒绝");
-        assert!(sub_view(&mut fb, &info, 8, 8, 16, 0).is_none(), "零高应拒绝");
+        assert!(
+            sub_view(&mut fb, &info, 8, 8, 0, 16).is_none(),
+            "零宽应拒绝"
+        );
+        assert!(
+            sub_view(&mut fb, &info, 8, 8, 16, 0).is_none(),
+            "零高应拒绝"
+        );
         // 起点恰在右/下边界（`>=` 而非 `>`）：越出可见区一像素即不可用。
         assert!(
             sub_view(&mut fb, &info, FB_W, 8, 16, 16).is_none(),
@@ -573,7 +579,11 @@ mod tests {
     #[test]
     fn sub_view_shrinks_to_smaller_of_visible_area_and_available_rows() {
         let (info, mut fb) = make_parent();
-        assert_eq!(info.buffer_size(), FB_PITCH * FB_H, "本测试以 pitch × height 为口径");
+        assert_eq!(
+            info.buffer_size(),
+            FB_PITCH * FB_H,
+            "本测试以 pitch × height 为口径"
+        );
 
         // x == 0：行数上限与可视高度一致，不额外收紧。
         let panel = sub_view(&mut fb, &info, 0, 8, 1000, 1000).expect("应收缩");
@@ -653,7 +663,10 @@ mod tests {
         assert_eq!(panel.info().height, 1);
         // 零字节可用：拒绝。
         let mut empty = vec![0u8; offset];
-        assert!(sub_view(&mut empty, &info, 8, 8, 16, 16).is_none(), "无完整行应拒绝");
+        assert!(
+            sub_view(&mut empty, &info, 8, 8, 16, 16).is_none(),
+            "无完整行应拒绝"
+        );
     }
 
     /// `sub_view_with_back_buffer` 的窗口判定与收缩几何**完全等同** `sub_view`：
@@ -743,7 +756,10 @@ mod tests {
         assert_eq!(panel_snapshot, 16);
 
         // 窗口左上角像素为红。
-        assert_eq!(&fb[8 * FB_PITCH + 8 * 4..8 * FB_PITCH + 8 * 4 + 4], &[255, 0, 0, 255]);
+        assert_eq!(
+            &fb[8 * FB_PITCH + 8 * 4..8 * FB_PITCH + 8 * 4 + 4],
+            &[255, 0, 0, 255]
+        );
         // 窗口外一像素仍是哨兵 0xAB。
         assert_eq!(fb[0], 0xAB, "面板外首字节被改写");
         assert_eq!(fb[7 * FB_PITCH + 7 * 4], 0xAB, "窗口左上角外侧被改写");
@@ -771,10 +787,7 @@ mod tests {
             parent.fill_rect(Pixel::new(10, 11), 5, 4, Color::new(10, 200, 30));
         }
 
-        assert_eq!(
-            fb_sub, fb_ref,
-            "子视口绘制应与父视口偏移绘制逐字节一致"
-        );
+        assert_eq!(fb_sub, fb_ref, "子视口绘制应与父视口偏移绘制逐字节一致");
     }
 
     /// 子视口的填充不得越界写到窗口之外：用一个**远大于**窗口的矩形填充，
@@ -914,8 +927,14 @@ mod tests {
             "视口内的退化点应原样返回"
         );
         // 退化点恰好落在右边界外 / 下边界外。
-        assert_eq!(clip_line(Pixel::new(20, 7), Pixel::new(20, 7), 20, 15), None);
-        assert_eq!(clip_line(Pixel::new(7, 15), Pixel::new(7, 15), 20, 15), None);
+        assert_eq!(
+            clip_line(Pixel::new(20, 7), Pixel::new(20, 7), 20, 15),
+            None
+        );
+        assert_eq!(
+            clip_line(Pixel::new(7, 15), Pixel::new(7, 15), 20, 15),
+            None
+        );
     }
 
     /// 跨越边界时，返回端点必须落在可见区内，且**保留未越界的那个端点**。
@@ -957,7 +976,11 @@ mod tests {
         assert_in_bounds(result, 20, 15, "切左上角");
         // 只露一个点：两端都被裁到同一点，线段退化但仍为 Some。
         let result = clip_line(Pixel::new(0, 14), Pixel::new(3, 17), 20, 15);
-        assert_eq!(result, Some((Pixel::new(0, 14), Pixel::new(0, 14))), "擦过下角应收缩为单点");
+        assert_eq!(
+            result,
+            Some((Pixel::new(0, 14), Pixel::new(0, 14))),
+            "擦过下角应收缩为单点"
+        );
         // 切右下角。
         let result = clip_line(Pixel::new(16, 14), Pixel::new(20, 11), 20, 15);
         assert_in_bounds(result, 20, 15, "切右下角");
@@ -997,9 +1020,15 @@ mod tests {
             (Pixel::new(usize::MAX, 3), Pixel::new(4, 3)),
             (Pixel::new(3, usize::MAX), Pixel::new(3, 4)),
             // `i64::MAX`（`sat_i64` 的饱和上界）。
-            (Pixel::new(i64::MAX as usize, i64::MAX as usize), Pixel::new(2, 2)),
+            (
+                Pixel::new(i64::MAX as usize, i64::MAX as usize),
+                Pixel::new(2, 2),
+            ),
             // 巨大且完全在外：同码直接拒绝，不进入插值。
-            (Pixel::new(usize::MAX, usize::MAX), Pixel::new(usize::MAX, usize::MAX)),
+            (
+                Pixel::new(usize::MAX, usize::MAX),
+                Pixel::new(usize::MAX, usize::MAX),
+            ),
         ];
         for (p1, p2) in cases {
             let result = clip_line(p1, p2, 20, 15);
@@ -1037,7 +1066,11 @@ mod tests {
     #[test]
     fn intersect_axis_returns_a_when_denominator_is_zero() {
         assert_eq!(intersect_axis(7, 99, 123, 0), 7, "den == 0 应返回 a");
-        assert_eq!(intersect_axis(-5, 99, 3, 0), -5, "den == 0 应原样返回 a（含负值）");
+        assert_eq!(
+            intersect_axis(-5, 99, 3, 0),
+            -5,
+            "den == 0 应原样返回 a（含负值）"
+        );
         assert_eq!(intersect_axis(0, 0, 0, 0), 0);
         assert_eq!(intersect_axis(i64::MAX, i64::MIN, 5, 0), i64::MAX);
     }

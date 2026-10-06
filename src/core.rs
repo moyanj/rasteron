@@ -326,7 +326,7 @@ impl<'a> Renderer<'a> {
     /// 每个像素占用的字节数。
     #[inline(always)]
     pub fn pixel_size(&self) -> usize {
-        self.info.bytes_per_pixel() as usize
+        self.info.bytes_per_pixel()
     }
 
     /// 计算像素 `(x, y)` 在缓冲区中的字节偏移。
@@ -366,10 +366,7 @@ impl<'a> Renderer<'a> {
         if bpp == 2 {
             // 565：解码 → 混合（`blend_565` 内含 a == 255 的短路）→ 量化回写。
             let word = decode_565_bytes(dst, FMT_565_LITTLE_ENDIAN);
-            let bytes = encode_565_bytes(
-                blend_565(word, color, layout_565),
-                FMT_565_LITTLE_ENDIAN,
-            );
+            let bytes = encode_565_bytes(blend_565(word, color, layout_565), FMT_565_LITTLE_ENDIAN);
             dst[0] = bytes[0];
             dst[1] = bytes[1];
             return;
@@ -619,10 +616,7 @@ impl<'a> Renderer<'a> {
             });
         } else if pixel_size == 2 {
             // 565：先量化打包成 2 字节 pattern，再按 2 字节块批量填充。
-            let pattern = encode_565_bytes(
-                pack_565(color, layout_565),
-                FMT_565_LITTLE_ENDIAN,
-            );
+            let pattern = encode_565_bytes(pack_565(color, layout_565), FMT_565_LITTLE_ENDIAN);
             row.chunks_exact_mut(2).for_each(|pixel| {
                 pixel.copy_from_slice(&pattern);
             });
@@ -1466,12 +1460,7 @@ impl<'a> Renderer<'a> {
             // `k == 0` 时 `cy + 0 == cy - 0` 是同一行，只写一次。
             renderer.fill_visible_horizontal_span(left, right, cy.saturating_add(k), &color);
             if k != 0 {
-                renderer.fill_visible_horizontal_span(
-                    left,
-                    right,
-                    cy.saturating_sub(k),
-                    &color,
-                );
+                renderer.fill_visible_horizontal_span(left, right, cy.saturating_sub(k), &color);
             }
         });
     }
@@ -1720,7 +1709,6 @@ mod tests {
     /// 565 的两个变体：红在高位与蓝在高位（均为小端存储）。
     const FORMATS_565: [PixelFormat; 2] = [PixelFormat::Rgb565, PixelFormat::Bgr565];
 
-
     /// `Bgr24` 每像素字节数——本模块多数像素集合断言用它做固定步长。
     const BGR24_BYTES: usize = 3;
 
@@ -1903,7 +1891,9 @@ mod tests {
         // 按 `(y, x)` 行优先排序：`sort_unstable` 对 `(x, y)` 元组本就等价于
         // 先比较 x 再比较 y，故显式映射成 `(y, x)` 后排序以对齐被测路径。
         out.sort_by_key(|(x, y)| (*y, *x));
-        out.into_iter().map(|(x, y)| (x as usize, y as usize)).collect()
+        out.into_iter()
+            .map(|(x, y)| (x as usize, y as usize))
+            .collect()
     }
 
     // ————————————————————————————————— 缓冲辅助 —————————————————————————————————
@@ -1913,7 +1903,12 @@ mod tests {
     /// 调用方拿 Vec 自己造渲染器——**不能**在这里返回借用它的 `Renderer`：
     /// 渲染器借用的正是这个 Vec，二者不可能同时作为返回值交出（所有权自相矛盾）。
     /// 需要复用时，调用方直接 `Renderer::new(info, &mut fb)`。
-    fn scratch(w: usize, h: usize, format: PixelFormat, layout: Layout) -> (FramebufferInfo, Vec<u8>) {
+    fn scratch(
+        w: usize,
+        h: usize,
+        format: PixelFormat,
+        layout: Layout,
+    ) -> (FramebufferInfo, Vec<u8>) {
         let info = make_info(w, h, format, layout);
         let fb = vec![0u8; info.buffer_size()];
         (info, fb)
@@ -1931,9 +1926,13 @@ mod tests {
             .count()
     }
 
-
     /// 收集单缓冲渲染器里被着色为 `color` 的像素坐标（行优先序）。
-    fn drawn_pixels(renderer: &Renderer<'_>, w: usize, h: usize, color: &Color) -> Vec<(usize, usize)> {
+    fn drawn_pixels(
+        renderer: &Renderer<'_>,
+        w: usize,
+        h: usize,
+        color: &Color,
+    ) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         for y in 0..h {
             for x in 0..w {
@@ -2037,7 +2036,10 @@ mod tests {
         {
             let mut renderer = Renderer::new(make_info(), &mut front);
             assert!(!renderer.is_double_buffered());
-            assert_eq!(renderer.pixel_size(), PixelFormat::Rgba8888.bytes_per_pixel());
+            assert_eq!(
+                renderer.pixel_size(),
+                PixelFormat::Rgba8888.bytes_per_pixel()
+            );
             renderer.buffer_mut()[0] = 0x5A;
             assert_eq!(renderer.buffer()[0], 0x5A);
         }
@@ -2081,13 +2083,17 @@ mod tests {
     #[test]
     fn swap_buffers_on_single_buffer_is_noop() {
         let (info, mut fb) = scratch(4, 2, PixelFormat::Rgba8888, Layout::Tight);
-            let mut renderer = render_on(info, &mut fb);
+        let mut renderer = render_on(info, &mut fb);
         renderer.clear(Color::new(9, 9, 9));
         let before = renderer.buffer().to_vec();
 
         renderer.swap_buffers();
 
-        assert_eq!(renderer.buffer(), &before[..], "单缓冲下 present 不得改动任何字节");
+        assert_eq!(
+            renderer.buffer(),
+            &before[..],
+            "单缓冲下 present 不得改动任何字节"
+        );
     }
 
     /// 双缓冲：绘制只落后台，`swap_buffers` 后前台逐字节等于单缓冲直接绘制的结果。
@@ -2125,7 +2131,10 @@ mod tests {
         }
         // present 之后前台逐字节等于单缓冲直接绘制的结果。
         assert_eq!(single_fb, front);
-        assert!(front.iter().any(|b| *b != 0), "非平凡性：present 后前台确有内容");
+        assert!(
+            front.iter().any(|b| *b != 0),
+            "非平凡性：present 后前台确有内容"
+        );
     }
 
     /// `swap_buffers` 必须保留行填充字节——不得整段 `memcpy` 覆盖填充区。
@@ -2292,14 +2301,20 @@ mod tests {
     #[test]
     fn pixel_variant_api_matches_coordinate_api() {
         let (info, mut fb) = scratch(6, 4, PixelFormat::Rgba8888, Layout::Tight);
-            let mut renderer = render_on(info, &mut fb);
+        let mut renderer = render_on(info, &mut fb);
         let c1 = Color::new(11, 22, 33);
         let c2 = Color::with_alpha(44, 55, 66, 128);
 
         renderer.set_pixel_at(Pixel::new(2, 1), &c1);
         renderer.set_pixel(2, 1, &c2);
-        assert_eq!(renderer.get_pixel_at(Pixel::new(2, 1)), renderer.get_pixel(2, 1));
-        assert_eq!(renderer.get_pixel_at(Pixel::new(2, 1)), Some(blend_ref(&c2, &c1, c2.a)));
+        assert_eq!(
+            renderer.get_pixel_at(Pixel::new(2, 1)),
+            renderer.get_pixel(2, 1)
+        );
+        assert_eq!(
+            renderer.get_pixel_at(Pixel::new(2, 1)),
+            Some(blend_ref(&c2, &c1, c2.a))
+        );
 
         // 越界时两者同为 None / 静默忽略。
         assert_eq!(renderer.get_pixel_at(Pixel::new(6, 0)), None);
@@ -2310,8 +2325,14 @@ mod tests {
         // 注意未写入过的 4bpp 像素，其第 4 字节保持缓冲初值 0，
         // 故 `read_color` 解出的 alpha 是 0 而不是 255 —— 契约只保证
         // 「写过的像素第 4 字节是格式的 opaque_alpha」，不保证未写的像素。
-        assert_eq!(renderer.get_pixel(0, 0), Some(Color::with_alpha(0, 0, 0, 0)));
-        assert_eq!(renderer.get_pixel(5, 3), Some(Color::with_alpha(0, 0, 0, 0)));
+        assert_eq!(
+            renderer.get_pixel(0, 0),
+            Some(Color::with_alpha(0, 0, 0, 0))
+        );
+        assert_eq!(
+            renderer.get_pixel(5, 3),
+            Some(Color::with_alpha(0, 0, 0, 0))
+        );
     }
 
     /// `*_unchecked` 在界内必须与安全路径逐像素一致。
@@ -2320,7 +2341,7 @@ mod tests {
     #[test]
     fn unchecked_pixel_api_matches_safe_path_within_bounds() {
         let (info, mut fb) = scratch(5, 3, PixelFormat::Bgr24, Layout::Tight);
-            let mut renderer = render_on(info, &mut fb);
+        let mut renderer = render_on(info, &mut fb);
         let color = Color::new(0x12, 0x34, 0x56);
         let semi = Color::with_alpha(200, 100, 50, 77);
 
@@ -2334,14 +2355,20 @@ mod tests {
                 assert_eq!(got, color);
 
                 unsafe { renderer.set_pixel_at_unchecked(Pixel::new(x, y), &semi) };
-                assert_eq!(renderer.get_pixel_at(Pixel::new(x, y)), renderer.get_pixel(x, y));
+                assert_eq!(
+                    renderer.get_pixel_at(Pixel::new(x, y)),
+                    renderer.get_pixel(x, y)
+                );
                 // SAFETY: 同上。
                 let unchecked = unsafe { renderer.get_pixel_at_unchecked(Pixel::new(x, y)) };
                 assert_eq!(Some(unchecked), renderer.get_pixel(x, y));
             }
         }
         // 混合结果确实落盘（不是被覆盖成源色）。
-        assert_eq!(renderer.get_pixel(0, 0), Some(blend_ref(&semi, &color, semi.a)));
+        assert_eq!(
+            renderer.get_pixel(0, 0),
+            Some(blend_ref(&semi, &color, semi.a))
+        );
     }
 
     /// `set_pixel` 的 alpha 混合落盘结果必须与逐通道参考一致（`Rgba8888` / `Bgr24`）。
@@ -2391,7 +2418,11 @@ mod tests {
             let want = pack_565_ref(format, &blend_ref(&src, &dst, src.a));
             // 两个 565 变体都是小端：字节 0 是位域低字节。
             let bytes = [(want & 0xFF) as u8, ((want >> 8) & 0xFF) as u8];
-            assert_eq!(renderer.buffer()[..2], bytes, "{format:?} 的 565 混合落盘错误");
+            assert_eq!(
+                renderer.buffer()[..2],
+                bytes,
+                "{format:?} 的 565 混合落盘错误"
+            );
         }
     }
 
@@ -2412,13 +2443,15 @@ mod tests {
 
             for alpha in 1u8..255 {
                 let (info, mut fb) = scratch(1, 1, format, Layout::Tight);
-            let mut renderer = render_on(info, &mut fb);
+                let mut renderer = render_on(info, &mut fb);
                 renderer.set_pixel(0, 0, &Color::new(200, 100, 50));
                 renderer.set_pixel(0, 0, &Color::with_alpha(10, 20, 30, alpha));
 
                 match format {
                     // Xrgb8888 的保留字节恒 0。
-                    PixelFormat::Xrgb8888 => assert_eq!(renderer.buffer()[3], 0, "Xrgb8888 alpha={alpha}"),
+                    PixelFormat::Xrgb8888 => {
+                        assert_eq!(renderer.buffer()[3], 0, "Xrgb8888 alpha={alpha}")
+                    }
                     // 其余 4bpp 的第 4 字节恒 255，绝不是源的 alpha。
                     PixelFormat::Argb8888 | PixelFormat::Rgba8888 | PixelFormat::Bgra8888 => {
                         assert_eq!(renderer.buffer()[3], 255, "{format:?} alpha={alpha}")
@@ -2438,20 +2471,13 @@ mod tests {
     fn load_565_and_store_565_roundtrip_at_odd_offset() {
         let word = pack_565_ref(PixelFormat::Rgb565, &Color::new(0x12, 0x34, 0x56));
         // 565 恒为小端存储，故字节序参数只有一种取值。
-        assert!(
-            FMT_565_LITTLE_ENDIAN,
-            "两个 565 变体都必须是小端存储"
-        );
+        assert!(FMT_565_LITTLE_ENDIAN, "两个 565 变体都必须是小端存储");
         // 故意让 `src` 的起始偏移为奇数：任何 `u16` 解引用都是 UB。
         let mut storage = [0u8; 8];
         unsafe {
             let p = storage.as_mut_ptr().add(1);
             store_565(p, word, FMT_565_LITTLE_ENDIAN);
-            assert_eq!(
-                load_565(p, FMT_565_LITTLE_ENDIAN),
-                word,
-                "往返失败"
-            );
+            assert_eq!(load_565(p, FMT_565_LITTLE_ENDIAN), word, "往返失败");
         }
         // 存储字节序与 `encode_565_bytes` 一致（小端：字节 0 是低字节）。
         let expected = [(word & 0xFF) as u8, (word >> 8) as u8];
@@ -2838,12 +2864,12 @@ mod tests {
             // 参考：从饱和坐标跑**完整**递推再过滤越界。
             // 注意其主循环长度 = min(x2, x_hi_bound) + 1 ≤ max(width, height)，
             // 与 usize::MAX 无关——这正是收窄要达到的复杂度。
-            let expected =
-                reference_line_sorted((p1.x, p1.y), (p2.x, p2.y), w, h);
+            let expected = reference_line_sorted((p1.x, p1.y), (p2.x, p2.y), w, h);
 
             let drawn = drawn_pixels(&renderer, w, h, &color);
             assert_eq!(
-                drawn, expected,
+                drawn,
+                expected,
                 "({:?},{:?}) 的覆盖与饱和坐标下的参考不一致",
                 (p1.x, p1.y),
                 (p2.x, p2.y)
@@ -2923,10 +2949,7 @@ mod tests {
                 let covered = drawn_pixels(&renderer, w, h, &expect);
                 let expected = reference_line_sorted(a, b, w, h);
 
-                assert_eq!(
-                    covered, expected,
-                    "{a:?} -> {b:?} 的半透明覆盖集合错误"
-                );
+                assert_eq!(covered, expected, "{a:?} -> {b:?} 的半透明覆盖集合错误");
                 checked += covered.len();
             }
         }
@@ -3060,7 +3083,8 @@ mod tests {
                         Some(Color::new(0, 0, 0))
                     };
                     assert_eq!(
-                        renderer.get_pixel(x, y), want,
+                        renderer.get_pixel(x, y),
+                        want,
                         "起点 ({ox},{oy}) 的超大 fill_rect 在 ({x},{y}) 错误"
                     );
                 }
@@ -3100,7 +3124,11 @@ mod tests {
                 "pitch={pitch} 第 {y} 行的可见区填充错误"
             );
             // 行尾那 1 字节填充未被写入。
-            assert_eq!(buf[off + row_visible], 0xEE, "pitch={pitch} 第 {y} 行填充被污染");
+            assert_eq!(
+                buf[off + row_visible],
+                0xEE,
+                "pitch={pitch} 第 {y} 行填充被污染"
+            );
         }
         assert_eq!(renderer.get_pixel(0, 0), Some(color));
         assert_eq!(renderer.get_pixel(7, 3), Some(color));
@@ -3232,10 +3260,18 @@ mod tests {
         renderer.draw_rect(Pixel::new(1, 1), 3, 3, &color);
 
         let edges = [
-            (1, 1), (1, 2), (1, 3), (1, 4),
-            (4, 1), (4, 2), (4, 3), (4, 4),
-            (2, 1), (3, 1),
-            (2, 4), (3, 4),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (4, 1),
+            (4, 2),
+            (4, 3),
+            (4, 4),
+            (2, 1),
+            (3, 1),
+            (2, 4),
+            (3, 4),
         ];
         for y in 0..h {
             for x in 0..w {
@@ -3437,12 +3473,7 @@ mod tests {
             let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
             let blank = vec![0u8; w * h * 3];
             let mut renderer = render_on(info, &mut fb);
-            renderer.fill_triangle(
-                Pixel::new(0, 3),
-                Pixel::new(3, 3),
-                Pixel::new(7, 3),
-                &color,
-            );
+            renderer.fill_triangle(Pixel::new(0, 3), Pixel::new(3, 3), Pixel::new(7, 3), &color);
             assert_eq!(renderer.buffer(), &blank[..], "三点同高不应画任何像素");
         }
 
@@ -3450,12 +3481,7 @@ mod tests {
         {
             let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
             let mut renderer = render_on(info, &mut fb);
-            renderer.fill_triangle(
-                Pixel::new(0, 0),
-                Pixel::new(0, 0),
-                Pixel::new(5, 5),
-                &color,
-            );
+            renderer.fill_triangle(Pixel::new(0, 0), Pixel::new(0, 0), Pixel::new(5, 5), &color);
             // 期望 == 退化成 (0,0)→(5,5) 的单条线。
             let expected = reference_line_sorted((0, 0), (5, 5), w, h);
             assert_eq!(drawn_pixels(&renderer, w, h, &color), expected);
@@ -3465,17 +3491,9 @@ mod tests {
         {
             let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
             let mut renderer = render_on(info, &mut fb);
-            renderer.fill_triangle(
-                Pixel::new(0, 0),
-                Pixel::new(2, 2),
-                Pixel::new(4, 4),
-                &color,
-            );
-            let expected = triangle_pixels_ref(
-                [Pixel::new(0, 0), Pixel::new(2, 2), Pixel::new(4, 4)],
-                w,
-                h,
-            );
+            renderer.fill_triangle(Pixel::new(0, 0), Pixel::new(2, 2), Pixel::new(4, 4), &color);
+            let expected =
+                triangle_pixels_ref([Pixel::new(0, 0), Pixel::new(2, 2), Pixel::new(4, 4)], w, h);
             assert_eq!(drawn_pixels(&renderer, w, h, &color), expected);
         }
     }
@@ -3543,10 +3561,26 @@ mod tests {
         let (w, h) = (8usize, 8usize);
 
         let huge = [
-            [Pixel::new(0, 0), Pixel::new(usize::MAX, 0), Pixel::new(usize::MAX, usize::MAX)],
-            [Pixel::new(usize::MAX, usize::MAX), Pixel::new(0, 0), Pixel::new(usize::MAX, 0)],
-            [Pixel::new(1, 1), Pixel::new(usize::MAX - 1, 3), Pixel::new(4, usize::MAX)],
-            [Pixel::new(usize::MAX, 0), Pixel::new(usize::MAX, usize::MAX), Pixel::new(0, 7)],
+            [
+                Pixel::new(0, 0),
+                Pixel::new(usize::MAX, 0),
+                Pixel::new(usize::MAX, usize::MAX),
+            ],
+            [
+                Pixel::new(usize::MAX, usize::MAX),
+                Pixel::new(0, 0),
+                Pixel::new(usize::MAX, 0),
+            ],
+            [
+                Pixel::new(1, 1),
+                Pixel::new(usize::MAX - 1, 3),
+                Pixel::new(4, usize::MAX),
+            ],
+            [
+                Pixel::new(usize::MAX, 0),
+                Pixel::new(usize::MAX, usize::MAX),
+                Pixel::new(0, 7),
+            ],
         ];
 
         for tri in huge {
@@ -3596,7 +3630,12 @@ mod tests {
             let (info, mut fb2) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
             let blank = vec![0u8; w * h * 3];
             let mut r2 = render_on(info, &mut fb2);
-            r2.fill_triangle(Pixel::new(9, 5), Pixel::new(20, 5), Pixel::new(30, 5), &color);
+            r2.fill_triangle(
+                Pixel::new(9, 5),
+                Pixel::new(20, 5),
+                Pixel::new(30, 5),
+                &color,
+            );
             assert_eq!(r2.buffer(), &blank[..]);
         }
     }
@@ -3679,7 +3718,11 @@ mod tests {
                         "三角形 {tri:?} 的 ({x},{y})：参考写入 {times} 次，\
                          期望 {want:?}，实际 {got:?}"
                     );
-                    if times == 2 { total_doubled += 1 } else { total_once += 1 }
+                    if times == 2 {
+                        total_doubled += 1
+                    } else {
+                        total_once += 1
+                    }
                 }
             }
         }
@@ -3688,12 +3731,6 @@ mod tests {
         assert!(total_once > 100, "单次混合的像素过少（{total_once}）");
         assert!(total_doubled > 0, "双写像素一个都没覆盖到，断言失去意义");
     }
-
-
-
-
-
-
 
     // ——————————————————————— S15 · 圆 ———————————————————————
 
@@ -3729,7 +3766,15 @@ mod tests {
         let color = Color::new(0x12, 0x34, 0x56);
         let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
         let mut renderer = render_on(info, &mut fb);
-        circle_pixels(&mut renderer, w, h, Pixel::new(cx, cy), radius, kind, &color)
+        circle_pixels(
+            &mut renderer,
+            w,
+            h,
+            Pixel::new(cx, cy),
+            radius,
+            kind,
+            &color,
+        )
     }
 
     /// `fill_circle` 必须逐像素等于精确圆盘 `dx² + dy² <= radius²`。
@@ -3742,12 +3787,8 @@ mod tests {
         for scene in CIRCLE_SCENES {
             for radius in 1..=10usize {
                 let got = render_circle_pixels(scene, radius, CircleKind::Filled);
-                let expected = reference_disk_pixels(
-                    scene.0,
-                    scene.1,
-                    Pixel::new(scene.2, scene.3),
-                    radius,
-                );
+                let expected =
+                    reference_disk_pixels(scene.0, scene.1, Pixel::new(scene.2, scene.3), radius);
                 checked += expected.len();
                 assert_eq!(
                     got, expected,
@@ -3755,7 +3796,10 @@ mod tests {
                 );
             }
         }
-        assert!(checked > 2000, "参考圆盘覆盖的像素过少（{checked}），断言失去意义");
+        assert!(
+            checked > 2000,
+            "参考圆盘覆盖的像素过少（{checked}），断言失去意义"
+        );
     }
 
     /// `draw_circle` 必须逐像素等于精确圆盘边界（盘中且有 4 邻域在盘外）。
@@ -3767,12 +3811,8 @@ mod tests {
         for scene in CIRCLE_SCENES {
             for radius in 1..=10usize {
                 let got = render_circle_pixels(scene, radius, CircleKind::Outline);
-                let expected = reference_disk_boundary(
-                    scene.0,
-                    scene.1,
-                    Pixel::new(scene.2, scene.3),
-                    radius,
-                );
+                let expected =
+                    reference_disk_boundary(scene.0, scene.1, Pixel::new(scene.2, scene.3), radius);
                 checked += expected.len();
                 assert_eq!(
                     got, expected,
@@ -3780,7 +3820,10 @@ mod tests {
                 );
             }
         }
-        assert!(checked > 300, "参考边界覆盖的像素过少（{checked}），断言失去意义");
+        assert!(
+            checked > 300,
+            "参考边界覆盖的像素过少（{checked}），断言失去意义"
+        );
     }
 
     /// `draw_circle` 的像素必须是 `fill_circle` 的子集，且不含内部像素。
@@ -3835,7 +3878,11 @@ mod tests {
 
             let got = circle_pixels(&mut renderer, w, h, Pixel::new(3, 3), 0, kind, &color);
 
-            assert_eq!(got, Vec::<(usize, usize)>::new(), "{kind:?} 半径 0 画了像素");
+            assert_eq!(
+                got,
+                Vec::<(usize, usize)>::new(),
+                "{kind:?} 半径 0 画了像素"
+            );
             assert_eq!(renderer.buffer(), &blank[..]);
         }
     }
@@ -3986,8 +4033,7 @@ mod tests {
             // 半径 1 的精确圆盘像素数由参考实现给出，与被测实现无关。
             for radius in 1..=limit {
                 let got = render_circle_pixels(scene, radius, CircleKind::Filled);
-                let expected =
-                    reference_disk_pixels(w, h, Pixel::new(cx, cy), radius);
+                let expected = reference_disk_pixels(w, h, Pixel::new(cx, cy), radius);
                 assert_eq!(
                     got, expected,
                     "场景 {scene:?} 半径 {radius} 的像素数被钳制改变"
@@ -4027,9 +4073,8 @@ mod tests {
                 // 基准：Bgr24（可无损读回颜色）。
                 let (info, mut fb_ref) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
                 let mut ref_renderer = render_on(info, &mut fb_ref);
-                let reference = circle_pixels(
-                    &mut ref_renderer, w, h, center, radius, kind, &color,
-                );
+                let reference =
+                    circle_pixels(&mut ref_renderer, w, h, center, radius, kind, &color);
                 assert!(!reference.is_empty(), "{kind:?} 半径 {radius} 基准集为空");
 
                 for format in ALL_FORMATS {
@@ -4133,17 +4178,13 @@ mod tests {
             // 右下：dx >= 0 且 dy >= 0
             (Angle::ZERO, Angle::RIGHT_DOWN, |dx, dy| dx >= 0 && dy >= 0),
             // 左下：dx <= 0 且 dy >= 0
-            (
-                Angle::RIGHT_DOWN,
-                Angle::DOWN_LEFT,
-                |dx, dy| dx <= 0 && dy >= 0,
-            ),
+            (Angle::RIGHT_DOWN, Angle::DOWN_LEFT, |dx, dy| {
+                dx <= 0 && dy >= 0
+            }),
             // 左上：dx <= 0 且 dy <= 0
-            (
-                Angle::DOWN_LEFT,
-                Angle::LEFT_UP,
-                |dx, dy| dx <= 0 && dy <= 0,
-            ),
+            (Angle::DOWN_LEFT, Angle::LEFT_UP, |dx, dy| {
+                dx <= 0 && dy <= 0
+            }),
             // 右上：dx >= 0 且 dy <= 0
             (Angle::LEFT_UP, Angle::ZERO, |dx, dy| dx >= 0 && dy <= 0),
         ];
@@ -4358,13 +4399,7 @@ mod tests {
             let blank = vec![0u8; ARC_SIZE * ARC_SIZE * 3];
             let mut renderer = render_on(info, &mut fb);
 
-            let got = arc_pixels(
-                &mut renderer,
-                Angle::ZERO,
-                Angle::RIGHT_DOWN,
-                kind,
-                &ghost,
-            );
+            let got = arc_pixels(&mut renderer, Angle::ZERO, Angle::RIGHT_DOWN, kind, &ghost);
 
             assert_eq!(got, Vec::<(usize, usize)>::new(), "{kind:?} 透明色画了像素");
             assert_eq!(renderer.buffer(), &blank[..]);
@@ -4426,10 +4461,18 @@ mod tests {
             let mut renderer = render_on(info, &mut fb);
             match kind {
                 CircleKind::Outline => renderer.draw_arc(
-                    Pixel::new(ARC_CX, ARC_CY), 0, Angle::ZERO, Angle::RIGHT_DOWN, &color,
+                    Pixel::new(ARC_CX, ARC_CY),
+                    0,
+                    Angle::ZERO,
+                    Angle::RIGHT_DOWN,
+                    &color,
                 ),
                 CircleKind::Filled => renderer.fill_arc(
-                    Pixel::new(ARC_CX, ARC_CY), 0, Angle::ZERO, Angle::RIGHT_DOWN, color,
+                    Pixel::new(ARC_CX, ARC_CY),
+                    0,
+                    Angle::ZERO,
+                    Angle::RIGHT_DOWN,
+                    color,
                 ),
             }
             assert_eq!(renderer.buffer(), &blank[..], "{kind:?} 半径 0 画了像素");
@@ -4440,8 +4483,20 @@ mod tests {
             let (info, mut fb) = arc_scratch();
             let blank = vec![0u8; ARC_SIZE * ARC_SIZE * 3];
             let mut renderer = render_on(info, &mut fb);
-            renderer.draw_arc(Pixel::new(cx, cy), ARC_R, Angle::ZERO, Angle::RIGHT_DOWN, &color);
-            renderer.fill_arc(Pixel::new(cx, cy), ARC_R, Angle::ZERO, Angle::RIGHT_DOWN, color);
+            renderer.draw_arc(
+                Pixel::new(cx, cy),
+                ARC_R,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                &color,
+            );
+            renderer.fill_arc(
+                Pixel::new(cx, cy),
+                ARC_R,
+                Angle::ZERO,
+                Angle::RIGHT_DOWN,
+                color,
+            );
             assert_eq!(
                 renderer.buffer(),
                 &blank[..],
@@ -4463,7 +4518,11 @@ mod tests {
         for (start, end, kind) in [
             (Angle::ZERO, Angle::RIGHT_DOWN, CircleKind::Outline),
             (Angle::ZERO, Angle::RIGHT_DOWN, CircleKind::Filled),
-            (Angle::from_degrees(350), Angle::from_degrees(10), CircleKind::Filled),
+            (
+                Angle::from_degrees(350),
+                Angle::from_degrees(10),
+                CircleKind::Filled,
+            ),
         ] {
             let (info, mut fb_limit) = arc_scratch();
             let at_limit = arc_pixels(
@@ -4477,13 +4536,7 @@ mod tests {
 
             for huge in [usize::MAX, 1_000_000_000, 10 * limit, limit + 1] {
                 let (info, mut fb_big) = arc_scratch();
-                let big = arc_pixels(
-                    &mut render_on(info, &mut fb_big),
-                    start,
-                    end,
-                    kind,
-                    &color,
-                );
+                let big = arc_pixels(&mut render_on(info, &mut fb_big), start, end, kind, &color);
                 assert_eq!(big, at_limit, "{kind:?} 半径 {huge} 未被钳到 {limit}");
             }
         }
@@ -4568,24 +4621,14 @@ mod tests {
                 let mut renderer = render_on(info, &mut fb);
                 renderer.fill_circle(Pixel::new(cx, cy), 3, color);
                 renderer.draw_circle(Pixel::new(cx, cy), 3, &color);
-                assert_eq!(
-                    renderer.buffer(),
-                    &blank[..],
-                    "圆 ({cx},{cy})：圆图元越界"
-                );
+                assert_eq!(renderer.buffer(), &blank[..], "圆 ({cx},{cy})：圆图元越界");
             }
 
             // fill_arc / draw_arc
             {
                 let (info, mut fb) = scratch(w, h, PixelFormat::Bgr24, Layout::Tight);
                 let mut renderer = render_on(info, &mut fb);
-                renderer.fill_arc(
-                    Pixel::new(cx, cy),
-                    3,
-                    Angle::ZERO,
-                    Angle::RIGHT_DOWN,
-                    color,
-                );
+                renderer.fill_arc(Pixel::new(cx, cy), 3, Angle::ZERO, Angle::RIGHT_DOWN, color);
                 renderer.draw_arc(
                     Pixel::new(cx, cy),
                     3,
@@ -4747,17 +4790,26 @@ mod tests {
         );
 
         // 差异恰好一个像素，且位于下边界行。
-        let only_forward: Vec<(usize, usize)> =
-            forward.iter().copied().filter(|p| !backward.contains(p)).collect();
+        let only_forward: Vec<(usize, usize)> = forward
+            .iter()
+            .copied()
+            .filter(|p| !backward.contains(p))
+            .collect();
         assert_eq!(
             only_forward,
             [(0, 8)],
             "差异应恰为下边界行的 (0,8)，实际 {only_forward:?}"
         );
         // 其余像素完全一致。
-        let only_backward: Vec<(usize, usize)> =
-            backward.iter().copied().filter(|p| !forward.contains(p)).collect();
-        assert!(only_backward.is_empty(), "反序不应多画出像素：{only_backward:?}");
+        let only_backward: Vec<(usize, usize)> = backward
+            .iter()
+            .copied()
+            .filter(|p| !forward.contains(p))
+            .collect();
+        assert!(
+            only_backward.is_empty(),
+            "反序不应多画出像素：{only_backward:?}"
+        );
     }
 
     /// 私有内核 `disk_params` 的半径钳制口径。
@@ -4777,7 +4829,11 @@ mod tests {
             // 半径 ≤ 上界：恒等。
             for radius in [0usize, 1, 5, limit as usize] {
                 let (cx, cy, r) = renderer.disk_params(Pixel::new(3, 2), radius);
-                assert_eq!((cx, cy, r), (3, 2, radius as i64), "{layout:?} 半径 {radius}");
+                assert_eq!(
+                    (cx, cy, r),
+                    (3, 2, radius as i64),
+                    "{layout:?} 半径 {radius}"
+                );
             }
             // 半径 > 上界：收敛到上界。
             for radius in [limit as usize + 1, 1000, 1_000_000_000, usize::MAX] {
@@ -4786,7 +4842,11 @@ mod tests {
             }
             // 圆心走饱和转换：`usize::MAX as i64 == -1` 的陷阱。
             let (cx, cy, _) = renderer.disk_params(Pixel::new(usize::MAX, usize::MAX), 3);
-            assert_eq!((cx, cy), (i64::MAX, i64::MAX), "{layout:?} 圆心未被饱和转换");
+            assert_eq!(
+                (cx, cy),
+                (i64::MAX, i64::MAX),
+                "{layout:?} 圆心未被饱和转换"
+            );
         }
     }
 
@@ -4918,11 +4978,16 @@ mod tests {
 
         {
             let mut renderer = render_on(info, &mut fb);
-            renderer.blit(Pixel::new(1, 1), sw, sh, PixelFormat::Bgr24, &src, src_pitch);
+            renderer.blit(
+                Pixel::new(1, 1),
+                sw,
+                sh,
+                PixelFormat::Bgr24,
+                &src,
+                src_pitch,
+            );
         }
-        let expected = reference_blit(
-            &fb, pitch, w, h, 1, 1, bpp, &src, src_pitch, sw, sh,
-        );
+        let expected = reference_blit(&fb, pitch, w, h, 1, 1, bpp, &src, src_pitch, sw, sh);
         assert_eq!(fb, expected, "blit 结果与逐行拷贝参考不符");
 
         // 逐像素核对：源块的 R/G 通道应落在 (1+x, 1+y)。
@@ -4956,7 +5021,14 @@ mod tests {
         {
             let mut renderer = render_on(info, &mut fb);
             // 从 (3,3) 开始画 8×8，只有 2×2 可见。
-            renderer.blit(Pixel::new(3, 3), sw, sh, PixelFormat::Bgr24, &src, src_pitch);
+            renderer.blit(
+                Pixel::new(3, 3),
+                sw,
+                sh,
+                PixelFormat::Bgr24,
+                &src,
+                src_pitch,
+            );
         }
         let expected = reference_blit(&fb, pitch, w, h, 3, 3, bpp, &src, src_pitch, sw, sh);
         assert_eq!(fb, expected, "越界 blit 的裁剪结果不符");
@@ -5082,11 +5154,7 @@ mod tests {
         assert_eq!(renderer.get_pixel(1, 0), Some(bg), "掩码 0 应保留背景");
         assert_eq!(renderer.get_pixel(3, 0), Some(bg), "掩码 0 应保留背景");
         assert_eq!(renderer.get_pixel(4, 0), Some(fg), "掩码 255 应写入前景");
-        assert_eq!(
-            renderer.get_pixel(5, 0),
-            Some(bg),
-            "掩码 0 应保留背景"
-        );
+        assert_eq!(renderer.get_pixel(5, 0), Some(bg), "掩码 0 应保留背景");
         // 掩码 128：与 bg 混合。
         let expect = blend_ref(&fg, &bg, 128);
         assert_eq!(
@@ -5232,7 +5300,11 @@ mod tests {
         let mask = vec![255u8; 64];
         renderer.blit_mask(Pixel::new(2, 2), 8, 8, &mask, 8, Color::new(1, 2, 3));
 
-        assert_eq!(painted_pixels(renderer.buffer()), 4, "越界 blit_mask 应只画 4 个像素");
+        assert_eq!(
+            painted_pixels(renderer.buffer()),
+            4,
+            "越界 blit_mask 应只画 4 个像素"
+        );
         // 可见区之外仍是 0。
         assert_eq!(renderer.get_pixel(0, 0), Some(Color::new(0, 0, 0)));
         assert_eq!(renderer.get_pixel(1, 3), Some(Color::new(0, 0, 0)));

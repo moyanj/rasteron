@@ -142,6 +142,12 @@ unsafe fn memcpy_rvv(dst: *mut u8, src: *const u8, len: usize) -> usize {
     0
 }
 
+/// 使用 SIMD 优化的 memcpy。
+/// 运行时自动选择最合适的实现。
+///
+/// # Safety
+///
+/// 输入参数必须合法。
 pub unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 {
         return;
@@ -219,7 +225,9 @@ mod tests {
     /// 可辨识的源数据：用 `(i * 37 + 11) as u8`，保证相邻字节不同，
     /// 任何错位或漏拷贝都能被发现。
     fn source(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i.wrapping_mul(37).wrapping_add(11)) as u8).collect()
+        (0..len)
+            .map(|i| (i.wrapping_mul(37).wrapping_add(11)) as u8)
+            .collect()
     }
 
     /// 跑一次 `memcpy` 并返回目标切片。
@@ -263,9 +271,7 @@ mod tests {
     #[test]
     fn tail_remainder_is_copied_completely() {
         // 覆盖 SSE2(16) / AVX(32) / AVX-512(64) 各自的「整块 + 尾部」组合。
-        const LENGTHS: [usize; 14] = [
-            1, 5, 17, 33, 47, 65, 79, 97, 111, 129, 145, 193, 257, 1001,
-        ];
+        const LENGTHS: [usize; 14] = [1, 5, 17, 33, 47, 65, 79, 97, 111, 129, 145, 193, 257, 1001];
         for len in LENGTHS {
             assert_eq!(
                 run_memcpy(len),
@@ -339,11 +345,7 @@ mod tests {
         }
         // len > 128：至少进入一次 ISA 分支（末尾仍有 remainder 需补齐）。
         for len in [129usize, 160, 256, 1000, 4096] {
-            assert_eq!(
-                run_memcpy(len),
-                source(len),
-                "ISA 路径 len = {len} 不符"
-            );
+            assert_eq!(run_memcpy(len), source(len), "ISA 路径 len = {len} 不符");
         }
     }
 
@@ -381,8 +383,7 @@ mod tests {
             compiled.push("(scalar fallback: remainder = len)");
         }
         // 打印出来便于人工确认；断言仅保证逻辑自洽。
-        let joined: alloc::string::String =
-            compiled.iter().copied().collect::<Vec<_>>().join(", ");
+        let joined: alloc::string::String = compiled.iter().copied().collect::<Vec<_>>().join(", ");
         assert!(!joined.is_empty());
     }
 }

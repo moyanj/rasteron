@@ -110,7 +110,7 @@ fn write_bmp_bgra32(
             // RGBA → BGRA
             bmp.push(pixels[off + 2]); // B
             bmp.push(pixels[off + 1]); // G
-            bmp.push(pixels[off + 0]); // R
+            bmp.push(pixels[off]); // R
             bmp.push(pixels[off + 3]); // A
         }
     }
@@ -154,7 +154,11 @@ pub fn make_checkerboard(
         for x in 0..w {
             let tx = x / tile_w;
             let ty = y / tile_h;
-            let color = if (tx + ty) % 2 == 0 { color_a } else { color_b };
+            let color = if (tx + ty).is_multiple_of(2) {
+                color_a
+            } else {
+                color_b
+            };
             let off = (y * w + x) * bpp;
             let bytes = color.to_bytes(format);
             data[off..off + bpp].copy_from_slice(&bytes[..bpp]);

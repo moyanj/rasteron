@@ -2,6 +2,7 @@ use crate::utils::{ceil_to_usize, floor_to_usize, normalized_to_screen};
 use crate::{Renderer, color::Color, error::DrawError};
 pub mod cache;
 pub mod shader;
+pub mod texture;
 
 use crate::programmable::cache::VertexCache;
 
@@ -68,6 +69,33 @@ impl Interpolate for Color {
     }
 }
 
+impl Color {
+    /// 在 `from` 与 `to` 之间做线性插值，`t = 0` 取 `from`、`t = 1` 取 `to`。
+    ///
+    /// 这是 [`Interpolate::lerp`] 的 inherent 版本，仅为让「两点间插值颜色」这一
+    /// 常见操作无需 `use` trait 即可调用。取整口径与 varying 插值**完全一致**——
+    /// 四个通道（含 alpha）一并插值并四舍五入钳制到 `[0, 255]`，
+    /// 故程序化渐变与逐顶点 varying 渐变不会出现可见色差。
+    ///
+    /// `t` 超出 `[0, 1]` 不钳制参数本身，但结果仍被 `interpolate` 内部的
+    /// `clamp` 拉回端点色，因此端点行为安全。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use rasteron::color::{Color, BLACK, WHITE};
+    ///
+    /// assert_eq!(Color::lerp(BLACK, WHITE, 0.0), BLACK);
+    /// assert_eq!(Color::lerp(BLACK, WHITE, 1.0), WHITE);
+    /// // 中点落在两色之间。
+    /// assert_eq!(Color::lerp(BLACK, WHITE, 0.5).r, 128);
+    /// ```
+    #[inline]
+    pub fn lerp(from: Color, to: Color, t: f32) -> Self {
+        <Self as Interpolate>::lerp(from, to, t)
+    }
+}
+
 /// `f32` 的插值实现：单个标量属性的加权求和。
 impl Interpolate for f32 {
     fn interpolate(a: Self, b: Self, c: Self, w0: f32, w1: f32, w2: f32) -> Self {
@@ -108,6 +136,13 @@ impl Interpolate for Vec4 {
             a[3] * w0 + b[3] * w1 + c[3] * w2,
         ]
     }
+}
+
+/// 单元类型的插值实现：不携带任何属性，插值即恒等。
+///
+/// 供片元着色器只关心片元坐标、不需要任何 varying 的场景使用。
+impl Interpolate for () {
+    fn interpolate(_: Self, _: Self, _: Self, _: f32, _: f32, _: f32) -> Self {}
 }
 
 /// flat varying 包装器。
@@ -618,6 +653,25 @@ impl<'a> Renderer<'a> {
     /// 遍历 `bbox ∩ bound` 内的整数像素，用边函数判定覆盖并直接得到重心权重。
     /// 边函数是线性函数，其归一化值恰为重心坐标，因此覆盖判定与 varying 插值
     /// 共用同一组权重，无需另算。
+    ///
+    /// # 共享边：top-left 规则
+    ///
+    /// 三条边都采用闭区间判定会让**共享边被两个三角形各着色一次**：
+    /// 两个三角形拼正方形时，对角线上的像素被混合两遍，`Alpha` / `Add` /
+    /// `Multiply` / `PremultipliedAlpha` 下得到的结果依赖图元顺序（修复前实测
+    /// `(16, 15)` 处亮度从邻域的 16 突跳到 30）。因此覆盖判定必须给每条边
+    /// 一个明确的归属：恰在边上的像素归**左/上边**，不归**右/下边**。
+    ///
+    /// 关键性质是 `is_top_left` 对边方向的**反对称性**：两个共边三角形对
+    /// 同一条边的遍历方向必然相反（否则它们的内部会落在边的同一侧，即重叠），
+    /// 故恰有一方拥有该边上的像素，与双方绕向无关。因此任意两个共边三角形
+    /// 都不重叠，网格拼接（正方形拆两三角形、棋盘格）不会重复混合。
+    ///
+    /// 代价是半像素级的取舍差异：落在共享边上的像素归给哪一侧取决于边的方向，
+    /// 而非它在几何上「更靠近」哪个三角形。这与 GPU 的默认行为一致。
+    ///
+    /// 测试 `two_triangles_sharing_an_edge_never_shade_a_pixel_twice`
+    /// 与 `triangle_ownership_of_a_shared_edge_is_winding_independent` 守护该行为。
     fn rasterize_triangle<FS: FragmentShader>(
         &mut self,
         input: [FragmentInput<FS::Varying>; 3],
@@ -648,6 +702,23 @@ impl<'a> Renderer<'a> {
             return;
         }
 
+        // 规整绕向：`flip` 为真表示把 v1/v2 交换后面积变为正。此后所有边函数
+        // 在三角形内部都是正的，top-left 判定与覆盖判定都无需再按 `area` 的
+        // 符号分类，顺时针与逆时针也走完全相同的代码路径。
+        //
+        // `input` 必须与 `v` **同步交换**：`w_i` 是对 `v[i]` 的重心权重，
+        // 交换后 `w1` 对应的是原来的 v2。若只换 `v` 不换 `input`，varying 会
+        // 插到错误的顶点上。
+        let (v, input) = if area < 0.0 {
+            (
+                [v[0], v[2], v[1]],
+                [input[0], input[2], input[1]],
+            )
+        } else {
+            (v, input)
+        };
+        let area = area.abs();
+
         // bbox 必须先与 bound 求交，迭代量才与顶点坐标解耦
         let min_x = v[0][0].min(v[1][0]).min(v[2][0]);
         let max_x = v[0][0].max(v[1][0]).max(v[2][0]);
@@ -662,6 +733,29 @@ impl<'a> Renderer<'a> {
             return;
         }
 
+        // top-left 判定。
+        //
+        // 内部恒满足 `edge(a, b, p) > 0`，即内部在有向边 `a → b` 的
+        // `(p - a) × (b - a) > 0` 一侧；该侧的**内向法线**是 `(-dy, dx)`。
+        // 于是（Y 轴向下，`y` 小 = 上、`x` 小 = 左）：
+        //
+        // * 上边：`dy == 0` 且内向法线的 y 分量为正（内部在其下方）⟹ `dx > 0`；
+        // * 左边：内向法线的 x 分量为正（内部在其右方）⟹ `dy < 0`。
+        //
+        // 本谓词对边方向的反对称性 `f(b, a) == !f(a, b)`（`dx`、`dy` 同时反号）
+        // 正是「共享边不重复」的全部依据：任意两个共边三角形对同一条边的
+        // 遍历方向必然相反，故恰有一方拥有它，与双方的绕向无关。
+        let is_top_left = |a: Vec2, b: Vec2| -> bool {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            dy == 0.0 && dx > 0.0 || dy < 0.0
+        };
+        // 每条边预先算出「闭合」属性，热循环里只剩一次比较。
+        let top_left = [
+            is_top_left(v[1], v[2]),
+            is_top_left(v[2], v[0]),
+            is_top_left(v[0], v[1]),
+        ];
+
         for y in y0..y1 {
             for x in x0..x1 {
                 // 采样点取像素中心，否则覆盖判定会整体偏移半像素
@@ -670,9 +764,15 @@ impl<'a> Renderer<'a> {
                 let w0 = edge(v[1], v[2], p);
                 let w1 = edge(v[2], v[0], p);
                 let w2 = edge(v[0], v[1], p);
-                // 三条边全同号即在内部。用 area 的符号统一两方向，
-                // 顺时针的三角形不会只填出半个。
-                if (w0 * area < 0.0) || (w1 * area < 0.0) || (w2 * area < 0.0) {
+                // 三条边同号即在内部。恰在边上时（w == 0）按 top-left 归属：
+                // 左/上边归本三角形，右/下边不归——这排除了共享边的重复着色。
+                if (w0 < 0.0)
+                    || (w1 < 0.0)
+                    || (w2 < 0.0)
+                    || (w0 == 0.0 && !top_left[0])
+                    || (w1 == 0.0 && !top_left[1])
+                    || (w2 == 0.0 && !top_left[2])
+                {
                     continue;
                 }
 
@@ -916,8 +1016,8 @@ mod tests {
     use super::*;
     use crate::color::{Color as C, PixelFormat as Fmt};
     use crate::framebuffer::FramebufferInfo;
-    use crate::programmable::shader::Passthrough2D;
     use crate::programmable::Vertex2D;
+    use crate::programmable::shader::Passthrough2D;
 
     /// 容差常量：光栅化用 f32 累加重心坐标，插值后允许极小的舍入偏差。
     const EPS: f32 = 1e-4;
@@ -1293,13 +1393,16 @@ mod tests {
             renderer
                 .draw_arrays(
                     PrimitiveType::Lines,
-                    &[Vertex2D {
-                        position: [-0.5, 0.5],
-                        varying: C::new(0, 0, 0),
-                    }, Vertex2D {
-                        position: [1.5, 0.5],
-                        varying: C::new(255, 255, 255),
-                    }],
+                    &[
+                        Vertex2D {
+                            position: [-0.5, 0.5],
+                            varying: C::new(0, 0, 0),
+                        },
+                        Vertex2D {
+                            position: [1.5, 0.5],
+                            varying: C::new(255, 255, 255),
+                        },
+                    ],
                     &pipeline,
                 )
                 .unwrap();
@@ -1322,7 +1425,12 @@ mod tests {
         // varying 沿线段线性：最左像素最暗、最右最亮。
         let left = read_pixel(&buffer, 64, 0, 32);
         let right = read_pixel(&buffer, 64, 63, 32);
-        assert!(left.r < right.r, "varying 应沿线段递增（左 {} 右 {}）", left.r, right.r);
+        assert!(
+            left.r < right.r,
+            "varying 应沿线段递增（左 {} 右 {}）",
+            left.r,
+            right.r
+        );
     }
 
     // ————————————————————————————— S25 · 三角形光栅化 —————————————————————————————
@@ -1376,10 +1484,7 @@ mod tests {
         let forward = render(&full_triangle());
         let reversed = render(&cw);
         assert!(!forward.is_empty(), "正向三角形应画出像素");
-        assert_eq!(
-            forward, reversed,
-            "顺时针与逆时针必须填出同一像素集合"
-        );
+        assert_eq!(forward, reversed, "顺时针与逆时针必须填出同一像素集合");
     }
 
     #[test]
@@ -1387,15 +1492,33 @@ mod tests {
         let size = 32usize;
         // 三点共线：沿对角线。
         let collinear = [
-            Vertex2D { position: [0.0, 0.0], varying: C::new(255, 0, 0) },
-            Vertex2D { position: [0.5, 0.5], varying: C::new(0, 255, 0) },
-            Vertex2D { position: [1.0, 1.0], varying: C::new(0, 0, 255) },
+            Vertex2D {
+                position: [0.0, 0.0],
+                varying: C::new(255, 0, 0),
+            },
+            Vertex2D {
+                position: [0.5, 0.5],
+                varying: C::new(0, 255, 0),
+            },
+            Vertex2D {
+                position: [1.0, 1.0],
+                varying: C::new(0, 0, 255),
+            },
         ];
         // 两点重合。
         let degenerate = [
-            Vertex2D { position: [0.2, 0.2], varying: C::new(255, 0, 0) },
-            Vertex2D { position: [0.2, 0.2], varying: C::new(0, 255, 0) },
-            Vertex2D { position: [0.8, 0.8], varying: C::new(0, 0, 255) },
+            Vertex2D {
+                position: [0.2, 0.2],
+                varying: C::new(255, 0, 0),
+            },
+            Vertex2D {
+                position: [0.2, 0.2],
+                varying: C::new(0, 255, 0),
+            },
+            Vertex2D {
+                position: [0.8, 0.8],
+                varying: C::new(0, 0, 255),
+            },
         ];
         for (name, vs) in [("共线", collinear), ("两点重合", degenerate)] {
             let (info, mut buffer) = make_renderer(size);
@@ -1428,9 +1551,18 @@ mod tests {
         let (info, mut buffer) = make_renderer(size);
         let constant = C::new(128, 64, 32);
         let vertices = [
-            Vertex2D { position: [0.0, 0.0], varying: constant },
-            Vertex2D { position: [1.0, 0.0], varying: constant },
-            Vertex2D { position: [0.0, 1.0], varying: constant },
+            Vertex2D {
+                position: [0.0, 0.0],
+                varying: constant,
+            },
+            Vertex2D {
+                position: [1.0, 0.0],
+                varying: constant,
+            },
+            Vertex2D {
+                position: [0.0, 1.0],
+                varying: constant,
+            },
         ];
         let pipeline = Pipeline::new(
             Passthrough2D::<C>::new(),
@@ -1462,9 +1594,18 @@ mod tests {
         let size = 64usize;
         let (info, mut buffer) = make_renderer(size);
         let vertices = [
-            Vertex2D { position: [0.0, 0.0], varying: C::new(255, 0, 0) },
-            Vertex2D { position: [1.0, 0.0], varying: C::new(0, 255, 0) },
-            Vertex2D { position: [0.0, 1.0], varying: C::new(0, 0, 255) },
+            Vertex2D {
+                position: [0.0, 0.0],
+                varying: C::new(255, 0, 0),
+            },
+            Vertex2D {
+                position: [1.0, 0.0],
+                varying: C::new(0, 255, 0),
+            },
+            Vertex2D {
+                position: [0.0, 1.0],
+                varying: C::new(0, 0, 255),
+            },
         ];
         let pipeline = Pipeline::new(
             Passthrough2D::<C>::new(),
@@ -1486,15 +1627,23 @@ mod tests {
         // 顶点 (0,0)：像素中心 (0.5, 0.5) 非常靠近该顶点 → 红色占主导。
         let near_v0 = sample(1, 1);
         assert!(near_v0.r > 200, "顶点 0 附近应以红色为主，实得 {near_v0:?}");
-        assert!(near_v0.g < 60 && near_v0.b < 60, "顶点 0 附近不应混入其它通道：{near_v0:?}");
+        assert!(
+            near_v0.g < 60 && near_v0.b < 60,
+            "顶点 0 附近不应混入其它通道：{near_v0:?}"
+        );
 
         // 顶点 (size, 0)：靠近右上的像素 → 绿色占主导。
-        let near_v1 = sample(size - 2, 1);
+        //
+        // 用 `size - 3` 而非 `size - 2`：三角形是「边缘空间」的，右上角 (size, 0)
+        // 位于半开区间 `[0, size)` **之外**（见 `Viewport` 文档），顶点本身不产生
+        // 片元；离它最近的可覆盖像素已让给了右上斜边另一侧（top-left 规则的必然
+        // 结果），故 `size - 2` 整列落在三角形外。
+        let near_v1 = sample(size - 3, 1);
         assert!(near_v1.g > 200, "顶点 1 附近应以绿色为主，实得 {near_v1:?}");
         assert!(near_v1.r < 60, "顶点 1 附近不应混入红色：{near_v1:?}");
 
-        // 顶点 (0, size)：靠近左下 → 蓝色占主导。
-        let near_v2 = sample(1, size - 2);
+        // 顶点 (0, size)：靠近左下 → 蓝色占主导，同理用 `size - 3`。
+        let near_v2 = sample(1, size - 3);
         assert!(near_v2.b > 200, "顶点 2 附近应以蓝色为主，实得 {near_v2:?}");
         assert!(near_v2.r < 60, "顶点 2 附近不应混入红色：{near_v2:?}");
     }
@@ -1506,9 +1655,18 @@ mod tests {
         let (info, mut buffer) = make_renderer(size);
         // 所有顶点都在屏幕外很远处。
         let vertices = [
-            Vertex2D { position: [100.0, 100.0], varying: C::new(255, 0, 0) },
-            Vertex2D { position: [200.0, 100.0], varying: C::new(0, 255, 0) },
-            Vertex2D { position: [100.0, 200.0], varying: C::new(0, 0, 255) },
+            Vertex2D {
+                position: [100.0, 100.0],
+                varying: C::new(255, 0, 0),
+            },
+            Vertex2D {
+                position: [200.0, 100.0],
+                varying: C::new(0, 255, 0),
+            },
+            Vertex2D {
+                position: [100.0, 200.0],
+                varying: C::new(0, 0, 255),
+            },
         ];
         let pipeline = Pipeline::new(
             Passthrough2D::<C>::new(),
@@ -1541,11 +1699,19 @@ mod tests {
         let size = 8usize;
         let (info, mut buffer) = make_renderer(size);
         // 顶点屏幕坐标 (0,0)、(4,0)、(0,4)：对角线 x + y = 4。
-        // 像素中心满足 (x+0.5) + (y+0.5) <= 4 → x + y <= 3 的像素被覆盖。
         let vertices = [
-            Vertex2D { position: [0.0, 0.0], varying: C::new(255, 0, 0) },
-            Vertex2D { position: [4.0 / size as f32, 0.0], varying: C::new(0, 255, 0) },
-            Vertex2D { position: [0.0, 4.0 / size as f32], varying: C::new(0, 0, 255) },
+            Vertex2D {
+                position: [0.0, 0.0],
+                varying: C::new(255, 0, 0),
+            },
+            Vertex2D {
+                position: [4.0 / size as f32, 0.0],
+                varying: C::new(0, 255, 0),
+            },
+            Vertex2D {
+                position: [0.0, 4.0 / size as f32],
+                varying: C::new(0, 0, 255),
+            },
         ];
         let pipeline = Pipeline::new(
             Passthrough2D::<C>::new(),
@@ -1562,21 +1728,161 @@ mod tests {
                 .draw_arrays(PrimitiveType::Triangles, &vertices, &pipeline)
                 .unwrap();
         }
-        for (x, y) in painted_pixels(size, &buffer) {
-            assert!(
-                x + y <= 3,
-                "像素 ({x}, {y}) 的中心 (x+0.5, y+0.5) 超出三角形对角线 x+y=4"
-            );
-        }
-        // (3, 0) 的中心是 (3.5, 0.5)，和为 4.0，恰在边界上 → 被覆盖（含边界）。
-        assert!(
-            painted_pixels(size, &buffer).contains(&(3, 0)),
-            "边界像素 (3, 0) 应被覆盖"
+        // 对角线 x + y = 4 的边是 `v[2] → v[0]` 的反向，即从 (0,4) 走向 (0,0)…
+        // 逐条核对：(0,0)→(4,0) 上边（dy == 0, dx > 0）归本三角形；
+        // (4,0)→(0,4) 斜边 dy > 0，不归；(0,4)→(0,0) 左边 dy < 0，归。
+        // 于是斜边上的像素归给**右侧那个**三角形，本三角形在此处止步于 x+y == 3。
+        assert_eq!(
+            painted_pixels(size, &buffer),
+            vec![(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (0, 2)],
+            "覆盖集合应为所有满足 x + y <= 3 的像素（含斜边归属侧的排除）"
         );
-        // (4, 0) 的中心是 (4.5, 0.5)，和为 5.0，在三角形外。
-        assert!(
-            !painted_pixels(size, &buffer).contains(&(4, 0)),
-            "边界外的像素 (4, 0) 不应被覆盖"
+    }
+
+    // ————————————————————— S25b · 共享边的 top-left 归属 —————————————————————
+
+    /// 半透明灰阶渐变的片元着色器 + 调用计数器。
+    ///
+    /// 色值与内建 `GradientFs::new(黑(α=64), 白(α=64), [1, 0])` 完全一致
+    /// （沿 normalized x 线性插值），但额外记录调用次数——「共享边上的像素是否
+    /// 被着色两次」只有调用计数能直接回答，读回的像素值只能间接佐证。
+    ///
+    /// 计数用 [`core::cell::Cell`] 而非 `Rc<Cell<_>>`：`Cell` 是 `Copy`，
+    /// **克隆不会共享计数**，故本类型只在 [`Pipeline`] 内按值存放，渲染后经
+    /// `pipeline.fragment_shader.calls` 读回（同 `CountingFs` 的用法）。
+    struct CountingGradientFs {
+        calls: core::cell::Cell<usize>,
+    }
+
+    impl CountingGradientFs {
+        fn new() -> Self {
+            Self {
+                calls: core::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl FragmentShader for CountingGradientFs {
+        type Varying = ();
+        fn shade_fragment(&self, input: FragmentInput<Self::Varying>) -> FragmentOutput {
+            self.calls.set(self.calls.get() + 1);
+            let t = input.position[0].clamp(0.0, 1.0);
+            let level = (t * 255.0) as u8;
+            FragmentOutput::Color(C::with_alpha(level, level, level, 64))
+        }
+    }
+
+    /// 把视口左上一角的 `[0, 0.5]²` 区域拆成两个**共边**三角形画一遍。
+    ///
+    /// 返回 `(帧缓冲, 片元着色器调用次数)`。
+    ///
+    /// 共享边是 normalized 空间的对角线 `(0, 0.5) — (0.5, 0)`，屏幕坐标
+    /// `size / 2` 级别。`flip_second` 控制第二个三角形的绕向。
+    ///
+    /// 两个三角形的绕向刻意相反。取 `size = 64` 时屏幕顶点分别是：
+    ///
+    /// * 正向 `[(0,0), (0.5,0), (0,0.5)]` → `(0,0), (32,0), (0,32)`，
+    ///   `area = (32-0)·(32-0) − (0-0)·(0-0) = 1024 > 0`；
+    /// * 反向 `[(0,0.5), (0.5,0), (0.5,0.5)]` → `(0,32), (32,0), (32,32)`，
+    ///   `area = (32-0)·(32-32) − (0-32)·(32-0) = −1024 < 0`。
+    ///
+    /// 两者对共享边 `(0,32) — (32,0)` 的遍历方向相反，正是要验证的场景。
+    fn render_shared_edge_pair(size: usize, flip_second: bool) -> (Vec<u8>, usize) {
+        let (info, mut buffer) = make_renderer(size);
+        let pipeline = Pipeline::new(
+            Passthrough2D::<()>::new(),
+            CountingGradientFs::new(),
+            PipelineState {
+                blend: BlendMode::Alpha,
+                scissor: None,
+                viewport: Viewport::new(0, 0, size, size),
+            },
+        );
+        let half = 0.5f32;
+        // 共享边从 (0.5, 0) 出发，两个三角形在此处顺序相反。
+        let second = if flip_second {
+            [
+                Vertex2D { position: [0.0, half], varying: () },
+                Vertex2D { position: [half, 0.0], varying: () },
+                Vertex2D { position: [half, half], varying: () },
+            ]
+        } else {
+            [
+                Vertex2D { position: [half, 0.0], varying: () },
+                Vertex2D { position: [0.0, half], varying: () },
+                Vertex2D { position: [half, half], varying: () },
+            ]
+        };
+        let vertices = [
+            Vertex2D { position: [0.0, 0.0], varying: () },
+            Vertex2D { position: [half, 0.0], varying: () },
+            Vertex2D { position: [0.0, half], varying: () },
+            second[0],
+            second[1],
+            second[2],
+        ];
+        {
+            let mut renderer = Renderer::new(info, &mut buffer);
+            renderer
+                .draw_arrays(PrimitiveType::Triangles, &vertices, &pipeline)
+                .unwrap();
+        }
+        let calls = pipeline.fragment_shader.calls.get();
+        (buffer, calls)
+    }
+
+    #[test]
+    fn two_triangles_sharing_an_edge_never_shade_a_pixel_twice() {
+        // 回归：三条边都做闭区间判定时，共享边上的像素被两个三角形各着色一次，
+        // Alpha 混合下形成一条可见亮缝（修复前 `(16, 15)` 处亮度 30，邻域仅 16）。
+        //
+        // 两条独立口径交叉验证：
+        //
+        // 1. 片元着色器调用总数 == 覆盖像素数 —— 重复着色的直接证据；
+        // 2. 同一行内亮度沿 x 单调不减 —— 重复混合会在某处形成亮度跳变。
+        let size = 64usize;
+        let (buffer, calls) = render_shared_edge_pair(size, false);
+        let painted = painted_pixels(size, &buffer);
+        assert!(!painted.is_empty(), "两个三角形应画出像素，测试前提不成立");
+        assert_eq!(
+            calls,
+            painted.len(),
+            "每个覆盖像素只应着色一次（共享边上的像素被两个三角形各着色了一次）"
+        );
+
+        // 渐变沿 x 递增，故同一 y 上亮度应随 x 单调不减；
+        // 若某列被混合两次，该列亮度会越过左邻列一倍以上。
+        for y in 0..size / 2 {
+            let mut previous = read_pixel(&buffer, size, 0, y).r;
+            for x in 1..size / 2 {
+                let current = read_pixel(&buffer, size, x, y).r;
+                assert!(
+                    current >= previous,
+                    "第 {y} 行 x={x} 处亮度 {current} < 左邻 {previous}：共享边被重复混合了"
+                );
+                previous = current;
+            }
+        }
+    }
+
+    #[test]
+    fn triangle_ownership_of_a_shared_edge_is_winding_independent() {
+        // 第二个三角形换成反向绕向后，覆盖像素集合与片元着色次数都必须完全相同。
+        // 这是 top-left 谓词对边方向反对称的直接后果：两个共边三角形对共享边的
+        // 遍历方向必然相反（否则内部落在同一侧即重叠），故恰有一方拥有它。
+        let size = 32usize;
+        let (forward_buffer, forward_calls) = render_shared_edge_pair(size, false);
+        let (flipped_buffer, flipped_calls) = render_shared_edge_pair(size, true);
+        let forward = painted_pixels(size, &forward_buffer);
+        assert!(!forward.is_empty(), "正向应画出像素");
+        assert_eq!(
+            forward,
+            painted_pixels(size, &flipped_buffer),
+            "共享边上的像素归属不应随图元绕向改变"
+        );
+        assert_eq!(
+            forward_calls, flipped_calls,
+            "反向绕向下片元着色次数应相同"
         );
     }
 
@@ -1660,9 +1966,18 @@ mod tests {
         let size = 16usize;
         let (info, mut buffer) = make_renderer(size);
         let vertices = [
-            Vertex2D { position: [0.0, 0.0], varying: C::new(255, 0, 0) },
-            Vertex2D { position: [1.0, 0.0], varying: C::new(0, 255, 0) },
-            Vertex2D { position: [0.0, 1.0], varying: C::new(0, 0, 255) },
+            Vertex2D {
+                position: [0.0, 0.0],
+                varying: C::new(255, 0, 0),
+            },
+            Vertex2D {
+                position: [1.0, 0.0],
+                varying: C::new(0, 255, 0),
+            },
+            Vertex2D {
+                position: [0.0, 1.0],
+                varying: C::new(0, 0, 255),
+            },
         ];
         let pipeline = Pipeline::new(
             Passthrough2D::<C>::new(),
@@ -1711,10 +2026,16 @@ mod tests {
         );
         let mut renderer = Renderer::new(info, &mut buffer);
         let empty: [Vertex2D<C>; 0] = [];
-        assert!(renderer
-            .draw_arrays(PrimitiveType::Triangles, &empty, &pipeline)
-            .is_ok());
-        assert_eq!(pipeline.vertex_shader.calls.get(), 0, "空顶点集不应调用顶点着色器");
+        assert!(
+            renderer
+                .draw_arrays(PrimitiveType::Triangles, &empty, &pipeline)
+                .is_ok()
+        );
+        assert_eq!(
+            pipeline.vertex_shader.calls.get(),
+            0,
+            "空顶点集不应调用顶点着色器"
+        );
         assert!(painted_pixels(size, &buffer).is_empty());
     }
 
@@ -1733,12 +2054,15 @@ mod tests {
             },
         );
         let mut renderer = Renderer::new(info, &mut buffer);
-        let vertices = [
-            Vertex2D { position: [0.0, 0.0], varying: C::new(255, 0, 0) },
-        ];
-        assert!(renderer
-            .draw_arrays(PrimitiveType::Points, &vertices, &pipeline)
-            .is_ok());
+        let vertices = [Vertex2D {
+            position: [0.0, 0.0],
+            varying: C::new(255, 0, 0),
+        }];
+        assert!(
+            renderer
+                .draw_arrays(PrimitiveType::Points, &vertices, &pipeline)
+                .is_ok()
+        );
         assert_eq!(
             pipeline.vertex_shader.calls.get(),
             0,
@@ -1754,10 +2078,22 @@ mod tests {
         let render = |indices: &[u16]| -> Vec<(usize, usize)> {
             let (info, mut buffer) = make_renderer(size);
             let vertices = [
-                Vertex2D { position: [0.0, 0.0], varying: C::new(255, 0, 0) },
-                Vertex2D { position: [0.5, 0.0], varying: C::new(0, 255, 0) },
-                Vertex2D { position: [0.0, 0.5], varying: C::new(0, 0, 255) },
-                Vertex2D { position: [0.5, 0.5], varying: C::new(255, 255, 255) },
+                Vertex2D {
+                    position: [0.0, 0.0],
+                    varying: C::new(255, 0, 0),
+                },
+                Vertex2D {
+                    position: [0.5, 0.0],
+                    varying: C::new(0, 255, 0),
+                },
+                Vertex2D {
+                    position: [0.0, 0.5],
+                    varying: C::new(0, 0, 255),
+                },
+                Vertex2D {
+                    position: [0.5, 0.5],
+                    varying: C::new(255, 255, 255),
+                },
             ];
             let pipeline = Pipeline::new(
                 Passthrough2D::<C>::new(),
@@ -1840,8 +2176,14 @@ mod tests {
                 .draw_arrays(
                     PrimitiveType::Points,
                     &[
-                        Vertex2D { position: [0.5, 0.5], varying: C::new(255, 0, 0) },
-                        Vertex2D { position: [0.25, 0.25], varying: C::new(0, 255, 0) },
+                        Vertex2D {
+                            position: [0.5, 0.5],
+                            varying: C::new(255, 0, 0),
+                        },
+                        Vertex2D {
+                            position: [0.25, 0.25],
+                            varying: C::new(0, 255, 0),
+                        },
                     ],
                     &pipeline,
                 )
@@ -1870,9 +2212,18 @@ mod tests {
             )
         };
         let vertices = [
-            Vertex2D { position: [0.1, 0.1], varying: C::with_alpha(255, 0, 0, 128) },
-            Vertex2D { position: [0.9, 0.1], varying: C::with_alpha(0, 255, 0, 128) },
-            Vertex2D { position: [0.1, 0.9], varying: C::with_alpha(0, 0, 255, 128) },
+            Vertex2D {
+                position: [0.1, 0.1],
+                varying: C::with_alpha(255, 0, 0, 128),
+            },
+            Vertex2D {
+                position: [0.9, 0.1],
+                varying: C::with_alpha(0, 255, 0, 128),
+            },
+            Vertex2D {
+                position: [0.1, 0.9],
+                varying: C::with_alpha(0, 0, 255, 128),
+            },
         ];
 
         // 两次绘制叠加在同一个渲染器上。
@@ -1992,10 +2343,20 @@ mod tests {
         // 权重取一组明显不同且非平凡的值，确保实现真的做了加权求和。
         let (w0, w1, w2) = (0.25f32, 0.35f32, 0.40f32);
         // f32
-        assert_eq!(<f32 as Interpolate>::interpolate(1.5, 1.5, 1.5, w0, w1, w2), 1.5);
+        assert_eq!(
+            <f32 as Interpolate>::interpolate(1.5, 1.5, 1.5, w0, w1, w2),
+            1.5
+        );
         // Color
         assert_eq!(
-            <Color as Interpolate>::interpolate(C::new(10, 20, 30), C::new(10, 20, 30), C::new(10, 20, 30), w0, w1, w2),
+            <Color as Interpolate>::interpolate(
+                C::new(10, 20, 30),
+                C::new(10, 20, 30),
+                C::new(10, 20, 30),
+                w0,
+                w1,
+                w2
+            ),
             C::new(10, 20, 30)
         );
         // Vec2 / Vec3 / Vec4
@@ -2004,11 +2365,25 @@ mod tests {
             [1.0, 2.0]
         );
         assert_eq!(
-            <Vec3 as Interpolate>::interpolate([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0], w0, w1, w2),
+            <Vec3 as Interpolate>::interpolate(
+                [1.0, 2.0, 3.0],
+                [1.0, 2.0, 3.0],
+                [1.0, 2.0, 3.0],
+                w0,
+                w1,
+                w2
+            ),
             [1.0, 2.0, 3.0]
         );
         assert_eq!(
-            <Vec4 as Interpolate>::interpolate([1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0], w0, w1, w2),
+            <Vec4 as Interpolate>::interpolate(
+                [1.0, 2.0, 3.0, 4.0],
+                [1.0, 2.0, 3.0, 4.0],
+                [1.0, 2.0, 3.0, 4.0],
+                w0,
+                w1,
+                w2
+            ),
             [1.0, 2.0, 3.0, 4.0]
         );
         // Flat：恒取 provoking vertex。
@@ -2026,9 +2401,7 @@ mod tests {
         // 向量逐分量。
         let mid = <Vec3 as Interpolate>::lerp([0.0, 10.0, -10.0], [10.0, 20.0, 10.0], 0.5);
         assert!(
-            (mid[0] - 5.0).abs() < EPS
-                && (mid[1] - 15.0).abs() < EPS
-                && mid[2].abs() < EPS,
+            (mid[0] - 5.0).abs() < EPS && (mid[1] - 15.0).abs() < EPS && mid[2].abs() < EPS,
             "lerp 中点不符: {mid:?}"
         );
     }
@@ -2077,9 +2450,18 @@ mod tests {
 
     #[test]
     fn flat_ignores_weights_and_lerp_returns_a() {
-        assert_eq!(<Flat<u32> as Interpolate>::lerp(Flat(42), Flat(99), 0.0), Flat(42));
-        assert_eq!(<Flat<u32> as Interpolate>::lerp(Flat(42), Flat(99), 0.5), Flat(42));
-        assert_eq!(<Flat<u32> as Interpolate>::lerp(Flat(42), Flat(99), 1.0), Flat(42));
+        assert_eq!(
+            <Flat<u32> as Interpolate>::lerp(Flat(42), Flat(99), 0.0),
+            Flat(42)
+        );
+        assert_eq!(
+            <Flat<u32> as Interpolate>::lerp(Flat(42), Flat(99), 0.5),
+            Flat(42)
+        );
+        assert_eq!(
+            <Flat<u32> as Interpolate>::lerp(Flat(42), Flat(99), 1.0),
+            Flat(42)
+        );
         // interpolate 完全忽略权重，即便全部权重给了 c。
         assert_eq!(
             <Flat<u32> as Interpolate>::interpolate(Flat(42), Flat(7), Flat(9), 0.0, 0.0, 1.0),
@@ -2148,8 +2530,14 @@ mod tests {
         // 核心陷阱：`f32 as usize` 是饱和转换，负坐标会变成 0，从而误通过
         // min_x == 0 的下界检查。`contains_normalized` 必须在浮点域判定。
         let bounds = Bounds::from(Rect::new(0, 0, 64, 64));
-        assert!(!bounds.contains_normalized(-0.5, 32.0), "负 x 不得被误判为可见");
-        assert!(!bounds.contains_normalized(32.0, -0.5), "负 y 不得被误判为可见");
+        assert!(
+            !bounds.contains_normalized(-0.5, 32.0),
+            "负 x 不得被误判为可见"
+        );
+        assert!(
+            !bounds.contains_normalized(32.0, -0.5),
+            "负 y 不得被误判为可见"
+        );
         // 正常坐标仍可见。
         assert!(bounds.contains_normalized(0.0, 0.0));
         assert!(bounds.contains_normalized(63.5, 63.5));
@@ -2189,8 +2577,14 @@ mod tests {
         let bounds = Bounds::from(Rect::new(0, 0, 100, 100));
         // 从 (50, 50) 向左走到 (-50, 50)：进入区间的是 x 下降方向。
         let (t_enter, t_exit) = bounds.clip_segment_t([50.0, 50.0], [-100.0, 0.0]).unwrap();
-        assert!((t_enter - 0.0).abs() < EPS, "起点已在区间内，t_enter 应为 0");
-        assert!((t_exit - 0.5).abs() < EPS, "走到 x=0 需半程，t_exit 应为 0.5");
+        assert!(
+            (t_enter - 0.0).abs() < EPS,
+            "起点已在区间内，t_enter 应为 0"
+        );
+        assert!(
+            (t_exit - 0.5).abs() < EPS,
+            "走到 x=0 需半程，t_exit 应为 0.5"
+        );
         // 从 (-10, 50) 向右走到 (10, 50)：t_enter = 0.5，t_exit = 1。
         let (t_enter, t_exit) = bounds.clip_segment_t([-10.0, 50.0], [20.0, 0.0]).unwrap();
         assert!((t_enter - 0.5).abs() < EPS);
@@ -2214,11 +2608,11 @@ mod tests {
     fn clip_segment_t_returns_ordered_parameters_in_range() {
         let bounds = Bounds::from(Rect::new(10, 20, 30, 40));
         let cases: [([f32; 2], [f32; 2]); 5] = [
-            ([15.0, 25.0], [10.0, 20.0]),     // 向左上，完全在内 → (0, 1)
-            ([5.0, 25.0], [20.0, 0.0]),      // 斜穿区间
-            ([0.0, 30.0], [60.0, 20.0]),     // 横向穿过
-            ([25.0, 10.0], [25.0, 60.0]),    // 纵向穿过
-            ([100.0, 0.0], [-100.0, 60.0]),  // 反向斜穿
+            ([15.0, 25.0], [10.0, 20.0]),   // 向左上，完全在内 → (0, 1)
+            ([5.0, 25.0], [20.0, 0.0]),     // 斜穿区间
+            ([0.0, 30.0], [60.0, 20.0]),    // 横向穿过
+            ([25.0, 10.0], [25.0, 60.0]),   // 纵向穿过
+            ([100.0, 0.0], [-100.0, 60.0]), // 反向斜穿
         ];
         for (origin, delta) in cases {
             if let Some((t_enter, t_exit)) = bounds.clip_segment_t(origin, delta) {
@@ -2232,7 +2626,10 @@ mod tests {
                 // origin=[0,30] delta=[60,20] 得到的 t_exit 端点恰好落在
                 // x == max_x 上——半开区间会把它判为界外，但裁剪的数学定义
                 // 允许区间端点正好抵达边界。因此这里显式用闭区间比较。
-                let a = [origin[0] + delta[0] * t_enter, origin[1] + delta[1] * t_enter];
+                let a = [
+                    origin[0] + delta[0] * t_enter,
+                    origin[1] + delta[1] * t_enter,
+                ];
                 let b = [origin[0] + delta[0] * t_exit, origin[1] + delta[1] * t_exit];
                 for point in [a, b] {
                     assert!(
@@ -2262,8 +2659,16 @@ mod tests {
         assert!((t_exit - 2.0 / 3.0).abs() < EPS, "t_exit = {t_exit}");
         let a = [0.0 + 60.0 * t_enter, 30.0 + 20.0 * t_enter];
         let b = [0.0 + 60.0 * t_exit, 30.0 + 20.0 * t_exit];
-        assert!((a[0] - 10.0).abs() < EPS, "t_enter 端点 x 应为下界 10，实际 {}", a[0]);
-        assert!((b[0] - 40.0).abs() < EPS, "t_exit 端点 x 应为上界 40，实际 {}", b[0]);
+        assert!(
+            (a[0] - 10.0).abs() < EPS,
+            "t_enter 端点 x 应为下界 10，实际 {}",
+            a[0]
+        );
+        assert!(
+            (b[0] - 40.0).abs() < EPS,
+            "t_exit 端点 x 应为上界 40，实际 {}",
+            b[0]
+        );
     }
 
     // ————————————————————————————— S23 · BlendMode —————————————————————————————
@@ -2300,7 +2705,10 @@ mod tests {
 
         // 调用点补偿：`None` 落盘前被强制为不透明，故「无条件覆盖」语义成立。
         let transparent = Color::with_alpha(200, 100, 50, 0);
-        assert_eq!(BlendMode::None.blend(transparent.mix_alpha(255), dst), Color::new(200, 100, 50));
+        assert_eq!(
+            BlendMode::None.blend(transparent.mix_alpha(255), dst),
+            Color::new(200, 100, 50)
+        );
     }
 
     #[test]
@@ -2322,7 +2730,10 @@ mod tests {
         let dst = Color::new(100, 10, 10);
         assert_eq!(BlendMode::Add.blend(src, dst), Color::new(255, 20, 15));
         // 与黑色相加得源色（不透明化后的 RGB）。
-        assert_eq!(BlendMode::Add.blend(src, Color::new(0, 0, 0)), Color::new(200, 10, 5));
+        assert_eq!(
+            BlendMode::Add.blend(src, Color::new(0, 0, 0)),
+            Color::new(200, 10, 5)
+        );
     }
 
     #[test]
@@ -2345,7 +2756,11 @@ mod tests {
         let dst = Color::new(10, 20, 30);
         let premul = BlendMode::PremultipliedAlpha.blend(src, dst);
         // 语义是 src + dst × (1 - src.a)，不再乘一次 src.a。
-        assert_ne!(premul, BlendMode::Alpha.blend(src, dst), "预乘不应等同于普通 alpha 混合");
+        assert_ne!(
+            premul,
+            BlendMode::Alpha.blend(src, dst),
+            "预乘不应等同于普通 alpha 混合"
+        );
         // a = 255 时退化为纯源色。
         let opaque = Color::with_alpha(9, 8, 7, 255);
         assert_eq!(

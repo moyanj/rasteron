@@ -90,11 +90,17 @@ fn gradient_triangle_interpolates_across_the_screen() {
     assert!(near_red.r > 200, "顶点附近应以红色为主，实得 {near_red:?}");
     assert!(near_red.g < 60 && near_red.b < 60, "不应混入其它通道：{near_red:?}");
 
-    let near_green = read(&buffer, SIZE - 3, 2);
+    // 绿、蓝两个顶点的探测点取 y = 1 / x = 1 而非 2：斜边 `x + y = SIZE` 的
+    // 归属按 top-left 规则给了邻侧三角形，`(61, 2)` 的中心 (61.5, 2.5) 和恰为
+    // 64.0 正落在斜边上，因而**不归**本三角形（`(2, 61)` 同理）。
+    // 这一条也顺带证明：共边三角形不会重复着色，斜边上的像素不会两边都算。
+    let near_green = read(&buffer, SIZE - 3, 1);
     assert!(near_green.g > 200, "顶点附近应以绿色为主，实得 {near_green:?}");
+    assert!(near_green.r < 60, "不应混入红色：{near_green:?}");
 
-    let near_blue = read(&buffer, 2, SIZE - 3);
+    let near_blue = read(&buffer, 1, SIZE - 3);
     assert!(near_blue.b > 200, "顶点附近应以蓝色为主，实得 {near_blue:?}");
+    assert!(near_blue.r < 60, "不应混入红色：{near_blue:?}");
 
     // 三角形之外的像素（左下角）不应被着色。
     assert_eq!(
