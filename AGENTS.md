@@ -128,7 +128,9 @@ rasteron/
   `Bgr24` 因跨字节错位**始终**逐通道回退（基准中作为对照组）；565 无 SWAR 路径。
   新增格式时须明确它落在哪一侧。
 - **`Angle` 用圈值而非毫度**：为了 `>> 30` 即得象限号、加减自动环绕。
-- **示例即基准图**：`examples/gallery` 排布全部图元成带编号网格，供人工比对。
+- **示例即基准图**：`examples/gallery` 把全部能力排成 28 格编号网格（图元、双缓冲、
+  子视口、字体排版、可编程管线、8 种像素格式），供人工比对；标题与注释文字由库
+  自己的 `draw_text` + 内置 8×16 点阵字体绘制（不维护手写字库）。
 - **基准的帧缓冲只在一处 `unsafe`**：`benches/shared/mod.rs` 的 `PixFb`
   用 `from_raw_parts_mut` 造 `'static`，让 `Renderer<'static>` 能跨
   `b.iter()` 复用。该处同时断言切片 ≥ `pitch × height`（`Renderer::new`

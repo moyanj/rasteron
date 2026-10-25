@@ -6,7 +6,8 @@
 
 ![rasteron gallery](docs/images/gallery.png)
 
-> 上图由 `cargo run --example gallery` 生成：12 格编号网格，每格一个图元，右下角是全部 8 种像素格式的色条。
+> 上图由 `cargo run --example gallery` 生成：28 格编号网格，覆盖固定功能图元、双缓冲与子视口、
+> 字体排版、可编程管线与 8 种像素格式。格子标题与说明文字都由库自己的 `draw_text` 绘制。
 
 ## 30 秒上手
 
@@ -79,8 +80,7 @@ rasteron = { path = "../rasteron" }   # 或 git = "<仓库地址>"
 | `simd` | ✅ | SIMD 内存操作优化。不影响正确性，只影响速度。 |
 | `alloc` | ✅ | 允许库内堆分配，提供 `draw_char_owned` / `draw_text_owned` 免 scratch 方法。关闭后库内**绝不分配**。 |
 | `font_bitmap` | ✅ | 内置 8×16 点阵字体（ASCII），零分配、不碰浮点。 |
-| `font_truetype` | ✅ | TrueType / OpenType 抗锯齿字体。**会引入 `fontdue` 依赖与
-  `alloc`**，且光栅化内部用浮点——内核态目标须关闭。 |
+| `font_truetype` | ✅ | TrueType / OpenType 抗锯齿字体。**会引入 `fontdue` 依赖与`alloc`**，且光栅化内部用浮点——内核态目标须关闭。 |
 
 除 `font_truetype` 外全部组合零运行时依赖；它依赖 `fontdue`（`no_std` + `alloc`）。
 纯整数渲染：

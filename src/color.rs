@@ -273,8 +273,9 @@ impl Color {
 /// 前六种格式的通道都是 8 位且按字节对齐，通道位置由
 /// [`red_shift`](PixelFormat::red_shift) 等以**位**为单位描述（对它们而言恰好
 /// 等于字节位移 × 8）。`Rgb565` / `Bgr565` 的通道宽度分别是 5/6/5 位，故写入时
-/// 需要量化、读取时需要扩展，由 [`Color::to_bytes`] / [`Color::read_color`] 等
-/// 入口统一处理；两者的位域差异见 [`Layout565`]。
+/// 需要量化、读取时需要扩展，由 [`Color::to_bytes`] /
+/// [`read_color`](PixelFormat::read_color) 等入口统一处理；两者的位域差异见
+/// `Layout565`（私有，仅内部使用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     /// 3 字节小端序：R, G, B。

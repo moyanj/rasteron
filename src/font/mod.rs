@@ -70,8 +70,18 @@ use crate::{Pixel, Renderer, color::Color};
 mod font_8x16;
 #[cfg(feature = "font_truetype")]
 pub mod ttf;
+/// 内置 8×16 点阵 ASCII 字体。
+///
+/// [`Renderer::draw_char`] 传 `font: None` 时会解析到它，但那**只能逐字绘制**
+/// （没有公开的 `layout` 入口可查步进宽度），因此无法排多字符的一行文本。
+/// 本再导出让调用方能把它交给 [`Renderer::draw_text`] /
+/// [`Renderer::draw_char`]，零成本、无状态（它是 `static` 且逐字形都是编译期
+/// 常量表）。
+///
+/// 需要可变字号时改用 [`ttf::TtfFont`]：点阵字体只有 8×16 这一份位图，
+/// `px` 参数只做合法性检查，不缩放。
 #[cfg(feature = "font_bitmap")]
-use font_8x16::DEFAULT_FONT;
+pub use font_8x16::DEFAULT_FONT;
 
 // Hand-drawn 1bpp replacement glyph: a framed X, expanded at compile time.
 const UNKNOWN_BITMAP: [u8; 16] = [

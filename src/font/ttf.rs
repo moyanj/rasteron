@@ -22,7 +22,7 @@
 //! |----------|-------------|
 //! | `width` / `height` | `metrics.width` / `metrics.height` |
 //! | `bearing_x` | `metrics.xmin`（**原样保留负值**，见 [`TtfFont::layout`]） |
-//! | `bearing_y` | `metrics.height - metrics.ymin`（`ymin` 自基线向下为负） |
+//! | `bearing_y` | `metrics.ymin + metrics.height`（位图顶沿相对基线） |
 //! | `advance` | `metrics.advance_width` |
 //!
 //! # 浮点
@@ -84,9 +84,11 @@ impl TtfFont {
             width: m.width,
             height: m.height,
             bearing_x: m.xmin,
-            // `ymin` 自基线向下为负（如 -3 表示低于基线 3px），故顶沿到基线
-            // 的距离是 `height - ymin`。
-            bearing_y: m.height as i32 - m.ymin,
+            // fontdue 的 `ymin` 是位图**底沿**相对基线的偏移：下伸部为负，
+            // 普通字身为 0，重音等可越过基线的部分为正。顶沿相对基线的距离
+            // 因而是 `ymin + height`。这里不能写成 `height - ymin`：那会让
+            // 下伸部越深，位图反而越向上移动，并在基线上方画出错误字形。
+            bearing_y: m.ymin + m.height as i32,
             advance: m.advance_width,
         })
     }
@@ -272,8 +274,8 @@ mod tests {
     #[test]
     fn layout_bearing_is_consistent_with_metrics() {
         let font = font();
-        // 负 bearing_x（悬挂部）在本字体中未必出现，但转换公式必须恒成立：
-        // bearing_y = height - ymin，故 bearing_y >= height。
+        // 负 bearing_x（悬挂部）在本字体中未必出现，但垂直方向必须满足：
+        // `bearing_y = ymin + height`，即位图顶沿相对基线的距离。
         for c in GLYPHS.chars() {
             let Some(layout) = font.layout(c, 32.0) else {
                 continue;
@@ -374,10 +376,9 @@ mod tests {
         assert_eq!(i.advance, j.advance);
     }
 
-    /// `g` / `p` / `y` 类下伸部的字形高度大于无下伸部的字形，
-    /// 这是 `bearing_y = height - ymin` 转换公式的直接后果。
+    /// 下伸部的底沿必须落在基线下方，不能因换算错误而被抬到字身内部。
     #[test]
-    fn descender_glyph_is_taller_than_cap_height_glyph() {
+    fn descender_extends_below_baseline() {
         let font = font();
         let cap = font.layout('A', 64.0).expect("'A'");
         let descender = font.layout('g', 64.0).expect("'g'");
@@ -386,6 +387,13 @@ mod tests {
             "下伸字形应比大写更高：{} vs {}",
             descender.height,
             cap.height
+        );
+        let cap_bottom = cap.bearing_y - cap.height as i32;
+        let descender_bottom = descender.bearing_y - descender.height as i32;
+        assert_eq!(cap_bottom, 0, "'A' 的底沿应位于基线");
+        assert!(
+            descender_bottom < 0,
+            "'g' 的下伸部应低于基线，实得底沿 {descender_bottom}"
         );
     }
 
