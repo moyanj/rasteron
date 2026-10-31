@@ -17,6 +17,7 @@
 | `simd.rs` | 389 | 5 条 ISA 分支的 `memcpy`（AVX-512/AVX2/SSE2/NEON/RVV） | `pub unsafe fn memcpy` |
 | `framebuffer.rs` | 283 | 布局元数据 + 尺寸溢出断言 | `pub struct FramebufferInfo` |
 | `pixel.rs` | 49 | 二维坐标 + `pixel!` 宏 | `pub struct Pixel` |
+| `core/ssaa.rs` | 388 | 超采样抗锯齿：`Renderer::ssaa` / `ssaa_owned` + 面积平均降采样 | `pub enum SsaaFactor` |
 | `font/` | — | 字体 trait + 位图/TrueType 实现 | `pub trait Font` / `pub mod ttf` |
 | `main.rs` | 39 | **bin 目标**：1280×720 BGR24 画一条线后落盘 | — |
 | `programmable/` | 3507 | feature 门控的 f32 可编程管线 | 见 `programmable/AGENTS.md` |
@@ -24,10 +25,14 @@
 `core.rs` 的 5891 行里约 4061 行是 `#[cfg(test)]`（96 个测试，从 `:1831` 起），
 实际实现约 1830 行——读它时先跳过测试模块。
 
-全库测试分布（`cargo test --lib` = 393 passed）：
-`core` 96、`programmable`（含 cache/shader）125、`utils` 40、`color` 39、
-`angle` 27、`framebuffer` 16、`simd` 7、`error` 7、`font` 36，
+全库测试分布（`cargo test --lib` = 431 passed）：
+`core` 96、`core::ssaa` 6、`programmable`（含 cache/shader）125、`utils` 40、
+`color` 39、`angle` 27、`framebuffer` 16、`simd` 7、`error` 7、`font` 36，
 另有 `pixel` 的 doctest。
+
+`core/ssaa.rs` 的 `ssaa_owned_matches_scratch_version` 必须带
+`#[cfg(feature = "alloc")]`——`ssaa_owned` 本身被该 feature 门控，
+漏了它 `--no-default-features` 的测试构建会直接编译失败。
 
 ## 内部依赖图
 
@@ -105,8 +110,8 @@ pixel ───────┘    ├─ programmable (feature)
 
 ```bash
 cargo check --no-default-features      # 唯一能验证「无浮点契约」的门径
-cargo test --lib                       # 396 passed
-cargo test --lib --no-default-features # 216 passed（验证 feature 门控）
+cargo test --lib                       # 431 passed
+cargo test --lib --no-default-features # 250 passed（验证 feature 门控）
 cargo build --bins                     # 验证 src/main.rs 这个 bin 目标
 ```
 

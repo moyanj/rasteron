@@ -6,6 +6,9 @@ use crate::pixel::Pixel;
 use crate::simd;
 use crate::utils::{clip_line, pattern_fill, sat_i64};
 
+mod ssaa;
+pub use ssaa::SsaaFactor;
+
 /// 根据字节序写入 RGB 三通道到目标切片。
 ///
 /// `$is_rgb_order` 为 `true` 时按 R,G,B 写入，为 `false` 时按 B,G,R 写入。
