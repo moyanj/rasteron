@@ -19,9 +19,10 @@
 ```
 rasteron/
 ├── src/                    # 全部实现，见 src/AGENTS.md
+│   ├── core/               # Renderer 的附加能力子模块（目前只有 ssaa.rs）
 │   └── programmable/       # feature 门控的 f32 可编程管线
 ├── src/font/               # 字体 trait + 位图/TrueType 实现
-├── examples/               # 4 个示例 + 跨目录共享的 BMP 落盘工具
+├── examples/               # 5 个示例 + 跨目录共享的 BMP 落盘工具
 ├── tests/fixtures/         # minimal_ascii.ttf（DejaVu 子集，10768 B，7 字形）
 ├── benches/                # 5 个 criterion 目标 + shared/ 共享脚手架
 ├── Cargo.toml              # 无 [dependencies]；feature 与 profile 全在此
@@ -41,6 +42,7 @@ rasteron/
 | 改可编程管线 | `src/programmable/mod.rs` | `draw_arrays` / `draw_indexed` 在此 |
 | 加/改纹理与采样 | `src/programmable/texture.rs` | `Texture2D` + `sample(uv, filter, wrap)` |
 | 改子视口裁剪 | `src/utils.rs` | `sub_view` 系列 |
+| 改超采样抗锯齿 | `src/core/ssaa.rs` | `Renderer::ssaa` / `ssaa_owned` + 面积平均降采样 |
 | 改 SIMD memcpy | `src/simd.rs` | 仅 `memcpy`，feature = `simd` |
 | 加/改字体接口 | `src/font/mod.rs` | `Font` trait + `draw_char` / `draw_text` |
 | 改 TrueType 支持 | `src/font/ttf.rs` | `TtfFont`；度量来自 fontdue，光栅化写调用方缓冲 |
@@ -71,6 +73,7 @@ rasteron/
 | `Char<'a>` | struct | `src/font/mod.rs` | 已光栅化字形（尺寸 + 掩码借用），供调用方缓存 |
 | `TtfFont` | struct | `src/font/ttf.rs:44` | fontdue 后端；`new` 解析失败即 panic |
 | `DefaultFont` | struct | `src/font/font_8x16.rs:628` | 内置 8×16 ASCII；基线第 12 行，零分配 |
+| `SsaaFactor` | enum | `src/core/ssaa.rs` | `X2`/`X3`/`X4` 线性放大倍数；`multiplier()` 返回 2/3/4 |
 
 ## 约定
 
@@ -92,6 +95,10 @@ rasteron/
 - **安全边界分层**：安全 API 用 `width`/`height` 做边界判断，底层写入用
   `get_unchecked_mut`。`Renderer::new` 断言切片 ≥ `pitch × height` 是这套
   方案不越界的前提，不可移除。
+- **抗锯齿只有超采样一条路**：`src/core/ssaa.rs` 的 `Renderer::ssaa` /
+  `ssaa_owned` 以 `factor` 倍分辨率重绘再面积平均降采样，**不改动任何绘制路径**。
+  屏幕空间后处理（FXAA 一类）曾实现过但对 1px 细线抹出灰带、对薄结构无法正确判定
+  边缘，未达可交付质量，已移除——重新引入前须先解决该缺陷并补视觉回归对照。
 - **不做分配**：所有缓冲区由调用方提供；双缓冲的后台缓冲区同样由调用方传入
   （`Renderer::with_back_buffer`）。**`alloc` feature 是显式放弃这条契约的唯一
   出口**——它只新增 `draw_char_owned` / `draw_text_owned` 两个便利方法，
@@ -160,10 +167,10 @@ cargo check --no-default-features --features programmable,simd
 cargo check --all-features
 
 # 测试
-cargo test                # 459 passed（lib 396 + 集成 22 + doctest 41）
-cargo test --lib          # 396 passed
-cargo test --lib --no-default-features   # 216 passed（验证 feature 门控）
-cargo test --doc          # 41 passed, 0 ignored
+cargo test                # 468 passed（lib 402 + 集成 22 + doctest 44）
+cargo test --lib          # 402 passed
+cargo test --lib --no-default-features   # 221 passed（验证 feature 门控）
+cargo test --doc          # 44 passed, 0 ignored
 
 # ⚠️ 不要跑 bench！仅维护基准代码，不主动执行。需要数据时由用户本人运行。
 #
@@ -187,6 +194,7 @@ cargo run --example basic
 cargo run --example gallery
 cargo run --example programmable
 cargo run --example subviewport
+cargo run --example antialias      # 无 AA 与 SSAA 4× 两列对比图
 ```
 
 ## 注意事项

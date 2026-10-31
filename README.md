@@ -48,15 +48,17 @@ rasteron = { path = "../rasteron" }   # 或 git = "<仓库地址>"
 
 - **写内核 GUI / bootloader 的**：能在 `no_std` 下用，没有依赖包袱，不要求 FPU。
 - **自建图形栈的**：需要精确控制帧缓冲布局，且不想被某个框架的抽象绑住。
-- **做底层绘图的 Rust 学习者**：全部实现可读，458 个测试护栏，几何与内存契约都写进了文档。
+- **做底层绘图的 Rust 学习者**：全部实现可读，468 个测试护栏，几何与内存契约都写进了文档。
 
 ## 不适合谁
 
-- **要 3D、抗锯齿、变换矩阵**——这是纯 2D 光栅化器，不含投影、深度、光照。
+- **要 3D、变换矩阵**——这是纯 2D 光栅化器，不含投影、深度、光照。
 - **纹理密集的场景**——纹理采样只有 nearest / bilinear，无 mipmap，缩小会走样。
 - **要完整的 Unicode 排版**——文本层有基线 / bearing / 换行，但**不做 kerning、
   连字、双向文字与断行**，这些得在调用方或 `Font` 实现里补。
-- **图元数量极多且需抗锯齿**——固定功能图元是硬边整数光栅化，没有 AA。
+- **每帧都要抗锯齿的动画**——固定功能图元是硬边整数光栅化；抗锯齿只能通过
+  `Renderer::ssaa` 以 `factor²` 倍代价换得，适合静态画面而非逐帧重绘。
+  需要实时 AA 的动画不在当前能力范围内。
 
 ## 特性
 
@@ -67,6 +69,9 @@ rasteron = { path = "../rasteron" }   # 或 git = "<仓库地址>"
 - **双缓冲与子视口**：前后台缓冲区都由你提供；子视口让每个 UI 面板拥有独立坐标系，无需全局 scissor。
 - **可选可编程管线**：顶点着色器 + varying 重心插值 + 片元着色器 + viewport/scissor + 索引绘制 + 2D 纹理采样。
 - **可选 SIMD**：AVX-512 / AVX2 / SSE2 / NEON / RISC-V Vector 上的内存操作优化，未对齐自动回退标量。
+- **抗锯齿**：`Renderer::ssaa` 超采样（2× / 3× / 4×）——按 `factor` 倍分辨率绘制后
+  面积平均降采样。纯定点运算、不碰浮点，对任意图元组合都成立；代价是内存与填充率
+  均为 `factor²` 倍。
 - **可选字体**：内置 8×16 点阵 ASCII（零分配），或 TrueType/OpenType 抗锯齿字体
   （`fontdue` 后端）。`draw_char` / `draw_text` 通用，字号、基线、bearing 全部走
   度量接口，排版累加用 26.16 定点，长串不漂移。
@@ -163,13 +168,13 @@ cargo run --example programmable  # 可编程管线画点阵
 
 - **`docs/design.md`** — 架构决策、内存契约、错误分层、feature 门控规则等实现细节
 - **源码文档** — 每个公开 API 都有带可运行示例的 `///` 文档，`cargo doc --open` 即可
-- **`examples/`** — 四个可运行的完整程序
+- **`examples/`** — 五个可运行的完整程序（含 `antialias` 抗锯齿对比）
 
 ## 开发
 
 ```bash
-cargo test                                          # 458 项：lib 396 + 集成 22 + doctest 41
-cargo test --lib --no-default-features              # 216 项，验证 feature 门控
+cargo test                                          # 468 项：lib 402 + 集成 22 + doctest 44
+cargo test --lib --no-default-features              # 221 项，验证 feature 门控
 cargo check --all-features
 cargo bench                                         # 16 组 criterion 基准，耗时较长
 ```
