@@ -791,6 +791,28 @@ pub(crate) fn encode_565_bytes(word: u16, little_endian: bool) -> [u8; 2] {
     }
 }
 
+// ———————————————————————————— BMP 编解码用的通道助手 ————————————————————————————
+
+/// 把 `bits` 位（`bits ∈ {5, 6, 8}`）的通道值扩展回 8 位。
+///
+/// 只是 [`expand_channel`] 的 crate 内别名，供 `image::bmp` 使用。BMP 的
+/// `BI_BITFIELDS` 解码按文件头给出的**任意**掩码取位，{5, 6, 5} 只是最常见的一档，
+/// 因此不能复用只认 565 两段布局的 [`unpack_565`]；但「位复制扩展」这一步的
+/// 语义必须与它完全一致。
+#[inline(always)]
+pub(crate) const fn expand_channel_to_8(value: u16, bits: u8) -> u8 {
+    expand_channel(value, bits)
+}
+
+/// 把 8 位通道量化到 `bits` 位（`bits ∈ {5, 6}`）。
+///
+/// 只是 [`quantize_channel`] 的 crate 内别名，供 BMP 编码器复用「+127 四舍五入」
+/// 的公式，避免在 `image::bmp` 里再抄一份量化规则。
+#[inline(always)]
+pub(crate) const fn quantize_channel_to_bits(value: u8, bits: u8) -> u16 {
+    quantize_channel(value, bits)
+}
+
 // ———————————————————————————————— SWAR Alpha 混合 ————————————————————————————————
 
 /// 面向 4bpp 像素格式的 SWAR（SIMD Within A Register）Alpha 混合内核。

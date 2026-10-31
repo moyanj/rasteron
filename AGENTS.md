@@ -19,7 +19,8 @@
 ```
 rasteron/
 ├── src/                    # 全部实现，见 src/AGENTS.md
-│   └── programmable/       # feature 门控的 f32 可编程管线
+│   ├── programmable/       # feature 门控的 f32 可编程管线
+│   └── image/              # 图像编解码（目前只有 BMP）
 ├── src/font/               # 字体 trait + 位图/TrueType 实现
 ├── examples/               # 4 个示例 + 跨目录共享的 BMP 落盘工具
 ├── tests/fixtures/         # minimal_ascii.ttf（DejaVu 子集，10768 B，7 字形）
@@ -45,6 +46,7 @@ rasteron/
 | 加/改字体接口 | `src/font/mod.rs` | `Font` trait + `draw_char` / `draw_text` |
 | 改 TrueType 支持 | `src/font/ttf.rs` | `TtfFont`；度量来自 fontdue，光栅化写调用方缓冲 |
 | 加错误类型 | `src/error.rs` | 全库错误唯一定义处 |
+| 加/改 BMP 编解码 | `src/image/bmp.rs` | 解码到调用方缓冲 / 编码到调用方切片，零分配；调色板逻辑在 `src/image/bmp/palette.rs` |
 | 加基准 | `benches/<子系统>.rs` | 按被测子系统选文件；复用 `benches/shared/mod.rs` 的 `criterion_config()` / `PixFb` |
 | 加示例 | `examples/<name>/main.rs` | 复用 `examples/shared/bmp.rs` |
 
@@ -145,7 +147,7 @@ rasteron/
 cargo build
 cargo check --release
 
-# 全部 feature 组合都必须能编译（已验证 8 种全 PASS）
+# 全部 feature 组合都必须能编译（已验证 10 种全 PASS）
 # 注：`alloc` 曾是死 feature 已删除，本次重构重新引入——它现在是
 # `draw_char_owned` / `draw_text_owned` 两个免 scratch 方法的门控。
 cargo check --no-default-features
@@ -160,10 +162,10 @@ cargo check --no-default-features --features programmable,simd
 cargo check --all-features
 
 # 测试
-cargo test                # 459 passed（lib 396 + 集成 22 + doctest 41）
-cargo test --lib          # 396 passed
-cargo test --lib --no-default-features   # 216 passed（验证 feature 门控）
-cargo test --doc          # 41 passed, 0 ignored
+cargo test                # 494 passed（lib 425 + 集成 22 + doctest 47）
+cargo test --lib          # 425 passed
+cargo test --lib --no-default-features   # 245 passed（验证 feature 门控）
+cargo test --doc          # 47 passed, 0 ignored
 
 # ⚠️ 不要跑 bench！仅维护基准代码，不主动执行。需要数据时由用户本人运行。
 #

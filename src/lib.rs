@@ -140,6 +140,7 @@ pub mod error;
 #[cfg(any(feature = "font_truetype", feature = "font_bitmap"))]
 pub mod font;
 pub mod framebuffer;
+pub mod image;
 pub mod pixel;
 #[cfg(feature = "programmable")]
 pub mod programmable;

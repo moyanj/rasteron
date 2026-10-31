@@ -70,6 +70,9 @@ rasteron = { path = "../rasteron" }   # 或 git = "<仓库地址>"
 - **可选字体**：内置 8×16 点阵 ASCII（零分配），或 TrueType/OpenType 抗锯齿字体
   （`fontdue` 后端）。`draw_char` / `draw_text` 通用，字号、基线、bearing 全部走
   度量接口，排版累加用 26.16 定点，长串不漂移。
+- **BMP 编解码**：`image::bmp` 模块把 BMP 字节流就地解码到你提供的帧缓冲
+  （任意像素格式），或把像素数据编码成 BMP 字节流。两个方向都**零分配**；
+  支持 1/4/8/16/24/32 位、`BI_RGB` 与 `BI_BITFIELDS`、自底向上与自上而下。
 
 ## Feature 标志
 

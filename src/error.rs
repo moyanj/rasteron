@@ -152,12 +152,152 @@ impl fmt::Display for TextureError {
     }
 }
 
+/// BMP 解码失败的原因。
+///
+/// 由 [`crate::image::bmp::decode`] 返回（编码侧 [`crate::image::bmp::encode`]
+/// 不产生错误——参数矛盾一律是调用方的构造期错误，按本库的惯例 panic）。
+///
+/// 所有变体都对应**调用方无法在此之前得知**的输入数据问题：字节流的内容在解码
+/// 之前是未知的，因此这里全部是 `Result` 而非 panic。唯一的例外是
+/// [`Unencodeable`](BmpError::Unencodeable)——调用方选什么格式编码是自己知道
+/// 的，但「换格式或换库」同样是可恢复语义，故也留在 `Result` 里。
+///
+/// # 示例
+///
+/// ```
+/// use rasteron::error::BmpError;
+///
+/// assert_eq!(
+///     BmpError::NotBmp.to_string(),
+///     "文件头前两字节不是 `BM`，不是 BMP 文件"
+/// );
+/// assert_eq!(
+///     BmpError::Truncated { need: 64, have: 32 }.to_string(),
+///     "BMP 数据被截断：需要 64 字节，实际 32 字节"
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BmpError {
+    /// 数据长度不足以包含固定头部（文件头 14 字节 + DIB 头至少 40 字节）。
+    Truncated {
+        /// 本解码步骤需要的总字节数。
+        need: usize,
+        /// 实际拿到的切片长度。
+        have: usize,
+    },
+    /// 文件头前两个字节不是 `BM`。
+    NotBmp,
+    /// DIB 头大小不是 `BITMAPINFOHEADER`（40）或 `BITMAPV4HEADER`（108）。
+    ///
+    /// `BITMAPCOREHEADER`（12）与 `BITMAPV5HEADER`（124）同样被拒绝：前者的
+    /// 尺寸字段是 `u16`，后者的色彩空间字段本库不解释。
+    UnsupportedDibHeader {
+        /// 文件里实际的 DIB 头大小。
+        size: u32,
+    },
+    /// 像素位深不受支持（只接受 1 / 4 / 8 / 16 / 24 / 32）。
+    UnsupportedBitDepth {
+        /// 文件里实际的位深。
+        bits: u16,
+    },
+    /// 压缩方式不受支持：`BI_RLE8` / `BI_RLE4` / `BI_JPEG` / `BI_PNG` /
+    /// `BI_ALPHABITFIELDS` 等。
+    UnsupportedCompression {
+        /// 文件里实际的 `biCompression` 值。
+        compression: u32,
+    },
+    /// 调色板颜色数超出 256（1/4/8 位格式的调色板上限）。
+    ///
+    /// 更大的调色板只可能出现在大于 8 位的位深上，而那些位深必须带掩码，
+    /// 因此这条检查等价于「调色板尺寸与位深不匹配」。
+    UnsupportedPaletteSize {
+        /// 文件头声明的调色板颜色数。
+        colors: u32,
+    },
+    /// 位域掩码不是本库支持的形状。
+    ///
+    /// 支持的情形：{5,6,5}（任意红蓝顺序）、32 位下的 8/8/8（可选 alpha 掩码）；
+    /// 16 位下与掩码不匹配的位深（例如 32 位图的掩码只有 5 位）也走这条。
+    UnsupportedBitfields,
+
+    /// **解码专用**：目标缓冲不足以容纳 `width × height × bytes_per_pixel`。
+    ///
+    /// 这是调用方侧的尺寸错误。仍用 `Result` 而非 panic：目标缓冲可能来自
+    /// 固定容量的静态数组，而图像尺寸要到解析完文件头才知道，两者不匹配
+    /// 属于可恢复的运行期状况（换图或换缓冲），不是构造期不变量被破坏。
+    BufferTooSmall {
+        /// 容纳整幅图需要的字节数（按目标格式与声明的 pitch 计算）。
+        need: usize,
+        /// 调用方实际提供的切片长度。
+        have: usize,
+    },
+    /// **解码专用**：调用方提供的 `pitch` 小于 `width × bytes_per_pixel`。
+    InvalidPitch {
+        /// 每行至少需要的字节数。
+        need: usize,
+        /// 调用方提供的 `pitch`。
+        have: usize,
+    },
+    /// 图像尺寸 × 目标像素字节数在 `usize` 中溢出。
+    DimensionOverflow,
+    /// **解码专用**：像素数组的偏移或长度与声明的尺寸不自洽。
+    ///
+    /// 例：`bmp_write` 写入的行数据不足 `height` 行，或 `data_offset` 指向
+    /// 像素数据之外的区域。
+    TruncatedPixels,
+    /// **编码专用**：试图用某种像素格式编码，而 BMP 没有对应的原生表示。
+    ///
+    /// 目前只有 [`crate::color::PixelFormat::Bgr565`] 触发：BMP 没有记录红蓝
+    /// 位段顺序的字段（`BI_BITFIELDS` 的掩码固定按红→绿→蓝排），故只能写成
+    /// `Rgb565`。显式拒绝而不是悄悄换格式，是因为 565 的红蓝互换在视觉上就是
+    /// 一张反色图。
+    Unencodeable {
+        /// 被拒绝的像素格式。
+        format: crate::color::PixelFormat,
+    },
+}
+
+impl fmt::Display for BmpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated { need, have } => {
+                write!(f, "BMP 数据被截断：需要 {need} 字节，实际 {have} 字节")
+            }
+            Self::NotBmp => f.write_str("文件头前两字节不是 `BM`，不是 BMP 文件"),
+            Self::UnsupportedDibHeader { size } => {
+                write!(f, "不支持的 DIB 头大小 {size}（仅支持 40 / 108 字节）")
+            }
+            Self::UnsupportedBitDepth { bits } => {
+                write!(f, "不支持的 BMP 位深 {bits}（仅支持 1/4/8/16/24/32）")
+            }
+            Self::UnsupportedCompression { compression } => {
+                write!(f, "不支持的 BMP 压缩方式 {compression}")
+            }
+            Self::UnsupportedPaletteSize { colors } => {
+                write!(f, "不支持的调色板颜色数 {colors}（上限 256）")
+            }
+            Self::UnsupportedBitfields => f.write_str("不支持的位域掩码组合"),
+            Self::BufferTooSmall { need, have } => {
+                write!(f, "目标缓冲过小：需要 {need} 字节，实际提供 {have} 字节")
+            }
+            Self::InvalidPitch { need, have } => {
+                write!(f, "pitch {have} 小于每行像素所需的 {need} 字节")
+            }
+            Self::DimensionOverflow => f.write_str("BMP 尺寸 × 目标像素字节数溢出 usize"),
+            Self::TruncatedPixels => f.write_str("BMP 像素数据不完整：偏移或长度与声明尺寸不自洽"),
+            Self::Unencodeable { format } => {
+                write!(f, "像素格式 {format:?} 没有 BMP 原生表示")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // `#![no_std]` 下 `alloc` 不在 extern prelude，即使只在 `#[cfg(test)]` 里也须显式引入。
     extern crate alloc;
 
-    use super::{ColorParseError, DrawError, TextureError};
+    use super::{BmpError, ColorParseError, DrawError, TextureError};
     use alloc::string::String;
     use alloc::format;
     use core::fmt::Write;
@@ -195,6 +335,55 @@ mod tests {
         assert_eq!(
             display_of(TextureError::LengthMismatch),
             "texels 长度与 width × height 不匹配"
+        );
+        assert_eq!(
+            display_of(BmpError::NotBmp),
+            "文件头前两字节不是 `BM`，不是 BMP 文件"
+        );
+        assert_eq!(
+            display_of(BmpError::UnsupportedDibHeader { size: 12 }),
+            "不支持的 DIB 头大小 12（仅支持 40 / 108 字节）"
+        );
+        assert_eq!(
+            display_of(BmpError::UnsupportedBitDepth { bits: 2 }),
+            "不支持的 BMP 位深 2（仅支持 1/4/8/16/24/32）"
+        );
+        assert_eq!(
+            display_of(BmpError::UnsupportedCompression { compression: 1 }),
+            "不支持的 BMP 压缩方式 1"
+        );
+        assert_eq!(
+            display_of(BmpError::UnsupportedPaletteSize { colors: 300 }),
+            "不支持的调色板颜色数 300（上限 256）"
+        );
+        assert_eq!(
+            display_of(BmpError::UnsupportedBitfields),
+            "不支持的位域掩码组合"
+        );
+        assert_eq!(
+            display_of(BmpError::BufferTooSmall {
+                need: 12,
+                have: 8
+            }),
+            "目标缓冲过小：需要 12 字节，实际提供 8 字节"
+        );
+        assert_eq!(
+            display_of(BmpError::InvalidPitch { need: 12, have: 9 }),
+            "pitch 9 小于每行像素所需的 12 字节"
+        );
+        assert_eq!(
+            display_of(BmpError::DimensionOverflow),
+            "BMP 尺寸 × 目标像素字节数溢出 usize"
+        );
+        assert_eq!(
+            display_of(BmpError::TruncatedPixels),
+            "BMP 像素数据不完整：偏移或长度与声明尺寸不自洽"
+        );
+        assert_eq!(
+            display_of(BmpError::Unencodeable {
+                format: crate::color::PixelFormat::Bgr565
+            }),
+            "像素格式 Bgr565 没有 BMP 原生表示"
         );
     }
 
@@ -310,6 +499,20 @@ mod tests {
             }),
             display_of(TextureError::DimensionOverflow),
             display_of(TextureError::LengthMismatch),
+            display_of(BmpError::NotBmp),
+            display_of(BmpError::Truncated { need: 54, have: 10 }),
+            display_of(BmpError::UnsupportedDibHeader { size: 12 }),
+            display_of(BmpError::UnsupportedBitDepth { bits: 2 }),
+            display_of(BmpError::UnsupportedCompression { compression: 1 }),
+            display_of(BmpError::UnsupportedPaletteSize { colors: 300 }),
+            display_of(BmpError::UnsupportedBitfields),
+            display_of(BmpError::BufferTooSmall { need: 12, have: 8 }),
+            display_of(BmpError::InvalidPitch { need: 12, have: 9 }),
+            display_of(BmpError::DimensionOverflow),
+            display_of(BmpError::TruncatedPixels),
+            display_of(BmpError::Unencodeable {
+                format: crate::color::PixelFormat::Bgr565,
+            }),
         ];
         for (i, message) in messages.iter().enumerate() {
             assert!(!message.is_empty(), "第 {i} 条文案为空");
